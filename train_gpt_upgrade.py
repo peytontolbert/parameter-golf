@@ -2281,7 +2281,16 @@ def main() -> None:
         if args.enable_torch_compile
         else base_model
     )
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = (
+        DDP(
+            compiled_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
+        if distributed
+        else compiled_model
+    )
     ema_state = init_ema_state(base_model) if args.ema_decay > 0.0 else None
     teacher_model = maybe_build_teacher(args, device)
     if distributed and teacher_model is not None:
