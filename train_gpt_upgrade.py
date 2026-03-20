@@ -29,6 +29,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    import zstandard
+    HAS_ZSTD = True
+except ImportError:
+    zstandard = None
+    HAS_ZSTD = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -54,11 +61,19 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))
     training_preset = os.environ.get("TRAINING_PRESET", "").strip().lower()
+    recipe_family = os.environ.get("RECIPE_FAMILY", "").strip().lower()
+    curriculum_policy = os.environ.get("CURRICULUM_POLICY", "").strip().lower()
+    data_policy = os.environ.get("DATA_POLICY", "").strip().lower()
+    optimizer_policy = os.environ.get("OPTIMIZER_POLICY", "").strip().lower()
+    precision_policy = os.environ.get("PRECISION_POLICY", "").strip().lower()
+    eval_policy = os.environ.get("EVAL_POLICY", "").strip().lower()
+    runtime_policy = os.environ.get("RUNTIME_POLICY", "").strip().lower()
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "1")))
@@ -102,6 +117,12 @@ class Hyperparameters:
     retention_layers = int(os.environ.get("RETENTION_LAYERS", "0"))
     retention_decay_init = float(os.environ.get("RETENTION_DECAY_INIT", "1.5"))
     retention_output_gate = bool(int(os.environ.get("RETENTION_OUTPUT_GATE", "1")))
+    dynamic_head_layers = int(os.environ.get("DYNAMIC_HEAD_LAYERS", "0"))
+    dynamic_head_top_k = int(os.environ.get("DYNAMIC_HEAD_TOP_K", "0"))
+    dynamic_head_temperature = float(os.environ.get("DYNAMIC_HEAD_TEMPERATURE", "1.0"))
+    dynamic_head_aux_loss_coeff = float(os.environ.get("DYNAMIC_HEAD_AUX_LOSS_COEFF", "0.0"))
+    use_subln = bool(int(os.environ.get("USE_SUBLN", "0")))
+    use_deepnorm = bool(int(os.environ.get("USE_DEEPNORM", "0")))
     moe_every_n_layers = int(os.environ.get("MOE_EVERY_N_LAYERS", "0"))
     moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "4"))
     moe_top_k = int(os.environ.get("MOE_TOP_K", "1"))
@@ -115,6 +136,19 @@ class Hyperparameters:
     distill_temperature = float(os.environ.get("DISTILL_TEMPERATURE", "1.0"))
     fake_quant_tail_steps = int(os.environ.get("FAKE_QUANT_TAIL_STEPS", "0"))
     fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", "8"))
+    fake_quant_full_run = bool(int(os.environ.get("FAKE_QUANT_FULL_RUN", "0")))
+    use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", "0"))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))
+    orthogonal_init = bool(int(os.environ.get("ORTHOGONAL_INIT", "0")))
+    mup_proj_init = bool(int(os.environ.get("MUP_PROJ_INIT", "0")))
+    export_quant_bits = int(os.environ.get("EXPORT_QUANT_BITS", "8"))
+    export_codec = os.environ.get("EXPORT_CODEC", "zlib").strip().lower()
+    export_zstd_level = int(os.environ.get("EXPORT_ZSTD_LEVEL", "22"))
+    export_high_precision_bits = int(os.environ.get("EXPORT_HIGH_PRECISION_BITS", "8"))
+    export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "0"))
+    export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "0"))
+    export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -123,7 +157,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    mlp_hidden = int(os.environ.get("MLP_HIDDEN", "0"))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", "1536"))
     num_register_tokens = int(os.environ.get("NUM_REGISTER_TOKENS", "0"))
     num_shared_layers = int(os.environ.get("NUM_SHARED_LAYERS", "0"))
     shared_layer_repeats = int(os.environ.get("SHARED_LAYER_REPEATS", "0"))
@@ -135,53 +169,253 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.0"))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.04"))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
     def __init__(self):
+        self._apply_policy_schema()
         self._apply_training_preset()
+
+    def _env_override_map(self) -> dict[str, str]:
+        return {
+            "train_seq_len": "TRAIN_SEQ_LEN",
+            "eval_seq_len": "EVAL_SEQ_LEN",
+            "eval_stride": "EVAL_STRIDE",
+            "eval_batch_seqs": "EVAL_BATCH_SEQS",
+            "train_batch_tokens": "TRAIN_BATCH_TOKENS",
+            "num_layers": "NUM_LAYERS",
+            "mlp_hidden": "MLP_HIDDEN",
+            "tied_embed_lr": "TIED_EMBED_LR",
+            "matrix_lr": "MATRIX_LR",
+            "scalar_lr": "SCALAR_LR",
+            "muon_momentum": "MUON_MOMENTUM",
+            "muon_momentum_warmup_start": "MUON_MOMENTUM_WARMUP_START",
+            "muon_momentum_warmup_steps": "MUON_MOMENTUM_WARMUP_STEPS",
+            "warmdown_iters": "WARMDOWN_ITERS",
+            "grad_clip_norm": "GRAD_CLIP_NORM",
+            "muon_weight_decay": "MUON_WEIGHT_DECAY",
+            "overtone_embed_init": "OVERTONE_EMBED_INIT",
+            "resid_mix_phase_init": "RESID_MIX_PHASE_INIT",
+            "force_fp16_tied_embed_export": "FORCE_FP16_TIED_EMBED_EXPORT",
+            "fake_quant_tail_steps": "FAKE_QUANT_TAIL_STEPS",
+            "fake_quant_bits": "FAKE_QUANT_BITS",
+            "fake_quant_full_run": "FAKE_QUANT_FULL_RUN",
+            "int8_auto_keep_budget_bytes": "INT8_AUTO_KEEP_BUDGET_BYTES",
+            "int8_auto_keep_max_tensors": "INT8_AUTO_KEEP_MAX_TENSORS",
+            "int8_auto_keep_row_budget_bytes": "INT8_AUTO_KEEP_ROW_BUDGET_BYTES",
+            "int8_auto_keep_row_group_size": "INT8_AUTO_KEEP_ROW_GROUP_SIZE",
+            "use_smear_gate": "USE_SMEAR_GATE",
+            "bigram_vocab_size": "BIGRAM_VOCAB_SIZE",
+            "bigram_dim": "BIGRAM_DIM",
+            "orthogonal_init": "ORTHOGONAL_INIT",
+            "mup_proj_init": "MUP_PROJ_INIT",
+            "export_quant_bits": "EXPORT_QUANT_BITS",
+            "export_codec": "EXPORT_CODEC",
+            "export_high_precision_bits": "EXPORT_HIGH_PRECISION_BITS",
+            "export_high_precision_budget_bytes": "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
+            "export_high_precision_max_tensors": "EXPORT_HIGH_PRECISION_MAX_TENSORS",
+            "export_high_precision_min_numel": "EXPORT_HIGH_PRECISION_MIN_NUMEL",
+        }
+
+    def _apply_schema_values(self, values: dict[str, object]) -> None:
+        env_overrides = self._env_override_map()
+        for attr, value in values.items():
+            env_name = env_overrides.get(attr)
+            if env_name is not None and env_name in os.environ:
+                continue
+            setattr(self, attr, value)
+
+    def _apply_policy_schema(self) -> None:
+        recipe_families: dict[str, dict[str, object]] = {
+            "long_context_2048": {"train_seq_len": 2048, "eval_seq_len": 2048, "eval_batch_seqs": 256},
+            "winner_int6": {
+                "train_seq_len": 2048,
+                "eval_seq_len": 2048,
+                "train_batch_tokens": 786432,
+                "mlp_hidden": 1536,
+                "use_smear_gate": True,
+                "bigram_vocab_size": 4096,
+                "bigram_dim": 128,
+                "orthogonal_init": True,
+                "mup_proj_init": True,
+            },
+            "top_recipe_10l": {
+                "num_layers": 10,
+                "mlp_hidden": 992,
+                "muon_weight_decay": 0.02,
+                "overtone_embed_init": True,
+                "resid_mix_phase_init": True,
+                "force_fp16_tied_embed_export": True,
+            },
+        }
+        curriculum_policies: dict[str, dict[str, object]] = {
+            "baseline": {},
+            "long_context_2048": {"eval_batch_seqs": 256},
+            "winner_int6": {"warmdown_iters": 3000, "grad_clip_norm": 0.3},
+            "top_recipe_8k": {
+                "warmdown_iters": 20000,
+                "tied_embed_lr": 0.07,
+                "matrix_lr": 0.06,
+                "scalar_lr": 0.06,
+                "muon_momentum": 0.95,
+                "muon_momentum_warmup_start": 0.85,
+                "muon_momentum_warmup_steps": 500,
+                "grad_clip_norm": 1.0,
+            },
+            "top_recipe_8k_relaxed": {
+                "warmdown_iters": 16000,
+                "tied_embed_lr": 0.07,
+                "matrix_lr": 0.06,
+                "scalar_lr": 0.06,
+                "muon_momentum": 0.95,
+                "muon_momentum_warmup_start": 0.85,
+                "muon_momentum_warmup_steps": 500,
+                "grad_clip_norm": 0.7,
+            },
+        }
+        data_policies: dict[str, dict[str, object]] = {
+            "sequential": {},
+            "random_offset_8k": {"train_random_offset_tokens": 8192},
+            "random_offset_32k": {"train_random_offset_tokens": 32768},
+            "random_offset_64k": {"train_random_offset_tokens": 65536},
+        }
+        precision_policies: dict[str, dict[str, object]] = {
+            "baseline": {},
+            "winner_int6": {
+                "fake_quant_bits": 6,
+                "fake_quant_full_run": True,
+                "export_quant_bits": 6,
+                "export_codec": "zstd",
+            },
+            "fake_quant_tail": {
+                "fake_quant_tail_steps": 768,
+                "fake_quant_bits": 8,
+            },
+            "export_plus_light": {
+                "fake_quant_tail_steps": 768,
+                "fake_quant_bits": 8,
+                "int8_auto_keep_budget_bytes": 16384,
+                "int8_auto_keep_max_tensors": 1,
+                "int8_auto_keep_row_budget_bytes": 65536,
+                "int8_auto_keep_row_group_size": 32,
+            },
+            "export_plus": {
+                "fake_quant_tail_steps": 1024,
+                "fake_quant_bits": 8,
+                "int8_auto_keep_budget_bytes": 32768,
+                "int8_auto_keep_max_tensors": 2,
+                "int8_auto_keep_row_budget_bytes": 131072,
+                "int8_auto_keep_row_group_size": 32,
+            },
+            "export_plus_aggressive": {
+                "fake_quant_tail_steps": 1536,
+                "fake_quant_bits": 8,
+                "int8_auto_keep_budget_bytes": 65536,
+                "int8_auto_keep_max_tensors": 4,
+                "int8_auto_keep_row_budget_bytes": 196608,
+                "int8_auto_keep_row_group_size": 16,
+            },
+        }
+        eval_policies: dict[str, dict[str, object]] = {
+            "standard": {"eval_stride": 0},
+            "sliding32": {"eval_stride": 32, "eval_batch_seqs": 512},
+            "sliding64": {"eval_stride": 64, "eval_batch_seqs": 512},
+            "sliding64_2048": {"eval_stride": 64, "eval_batch_seqs": 256},
+            "sliding128": {"eval_stride": 128, "eval_batch_seqs": 512},
+            "sliding256": {"eval_stride": 256, "eval_batch_seqs": 512},
+        }
+        optimizer_policies: dict[str, dict[str, object]] = {
+            "baseline": {},
+            "winner_int6": {
+                "muon_momentum": 0.99,
+                "muon_momentum_warmup_start": 0.92,
+                "muon_momentum_warmup_steps": 1500,
+                "muon_weight_decay": 0.04,
+            },
+            "top_recipe": {"muon_momentum": 0.95, "muon_momentum_warmup_start": 0.85, "muon_momentum_warmup_steps": 500},
+        }
+        runtime_policies: dict[str, dict[str, object]] = {
+            "compiled": {"enable_torch_compile": True},
+            "eager": {"enable_torch_compile": False},
+        }
+
+        for value, table, label in (
+            (self.recipe_family, recipe_families, "RECIPE_FAMILY"),
+            (self.curriculum_policy, curriculum_policies, "CURRICULUM_POLICY"),
+            (self.data_policy, data_policies, "DATA_POLICY"),
+            (self.optimizer_policy, optimizer_policies, "OPTIMIZER_POLICY"),
+            (self.precision_policy, precision_policies, "PRECISION_POLICY"),
+            (self.eval_policy, eval_policies, "EVAL_POLICY"),
+            (self.runtime_policy, runtime_policies, "RUNTIME_POLICY"),
+        ):
+            if not value:
+                continue
+            if value not in table:
+                valid = ", ".join(sorted(table))
+                raise ValueError(f"Unknown {label}={value!r}; expected one of: {valid}")
+            self._apply_schema_values(table[value])
 
     def _apply_training_preset(self) -> None:
         if not self.training_preset:
             return
-        presets: dict[str, dict[str, object]] = {
-            "long_context_2048": {
-                "train_seq_len": 2048,
-                "eval_batch_seqs": 256,
+        preset_aliases: dict[str, dict[str, str]] = {
+            "long_context_2048": {"recipe_family": "long_context_2048"},
+            "long_context_2048_standard_eval": {"recipe_family": "long_context_2048", "eval_policy": "standard"},
+            "long_context_2048_sliding_eval": {"recipe_family": "long_context_2048", "eval_policy": "sliding64_2048"},
+            "winner_2048_int6": {
+                "recipe_family": "winner_int6",
+                "curriculum_policy": "winner_int6",
+                "optimizer_policy": "winner_int6",
+                "precision_policy": "winner_int6",
+                "eval_policy": "sliding64_2048",
             },
-            "long_context_2048_standard_eval": {
-                "train_seq_len": 2048,
-                "eval_stride": 0,
-                "eval_batch_seqs": 256,
+            "top_recipe_10l": {
+                "recipe_family": "top_recipe_10l",
+                "curriculum_policy": "top_recipe_8k",
+                "data_policy": "sequential",
+                "optimizer_policy": "top_recipe",
+                "eval_policy": "sliding64",
+                "runtime_policy": "compiled",
             },
-            "long_context_2048_sliding_eval": {
-                "train_seq_len": 2048,
-                "eval_stride": 64,
-                "eval_batch_seqs": 256,
+            "top_recipe_10l_export_plus": {
+                "recipe_family": "top_recipe_10l",
+                "curriculum_policy": "top_recipe_8k",
+                "data_policy": "sequential",
+                "optimizer_policy": "top_recipe",
+                "precision_policy": "export_plus",
+                "eval_policy": "sliding64",
+                "runtime_policy": "compiled",
+            },
+            "top_recipe_10l_export_plus_8k": {
+                "recipe_family": "top_recipe_10l",
+                "curriculum_policy": "top_recipe_8k",
+                "data_policy": "sequential",
+                "optimizer_policy": "top_recipe",
+                "precision_policy": "export_plus",
+                "eval_policy": "sliding64",
+                "runtime_policy": "compiled",
             },
         }
-        if self.training_preset not in presets:
-            valid = ", ".join(sorted(presets))
+        if self.training_preset not in preset_aliases:
+            valid = ", ".join(sorted(preset_aliases))
             raise ValueError(f"Unknown TRAINING_PRESET={self.training_preset!r}; expected one of: {valid}")
-        env_overrides = {
-            "train_seq_len": "TRAIN_SEQ_LEN",
-            "eval_stride": "EVAL_STRIDE",
-            "eval_batch_seqs": "EVAL_BATCH_SEQS",
-        }
-        for attr, value in presets[self.training_preset].items():
-            if env_overrides[attr] not in os.environ:
+        # Explicit schema env vars win over legacy preset aliases.
+        for attr, value in preset_aliases[self.training_preset].items():
+            env_name = attr.upper()
+            if env_name not in os.environ and not getattr(self, attr):
                 setattr(self, attr, value)
+        self._apply_policy_schema()
 
 
 TRACKED_CONFIG_ENV_VARS = [
@@ -197,7 +431,15 @@ TRACKED_CONFIG_ENV_VARS = [
     "WARMUP_STEPS",
     "TRAIN_BATCH_TOKENS",
     "TRAIN_SEQ_LEN",
+    "EVAL_SEQ_LEN",
     "TRAINING_PRESET",
+    "RECIPE_FAMILY",
+    "CURRICULUM_POLICY",
+    "DATA_POLICY",
+    "OPTIMIZER_POLICY",
+    "PRECISION_POLICY",
+    "EVAL_POLICY",
+    "RUNTIME_POLICY",
     "MAX_WALLCLOCK_SECONDS",
     "QK_GAIN_INIT",
     "ENABLE_TORCH_COMPILE",
@@ -241,6 +483,12 @@ TRACKED_CONFIG_ENV_VARS = [
     "RETENTION_LAYERS",
     "RETENTION_DECAY_INIT",
     "RETENTION_OUTPUT_GATE",
+    "DYNAMIC_HEAD_LAYERS",
+    "DYNAMIC_HEAD_TOP_K",
+    "DYNAMIC_HEAD_TEMPERATURE",
+    "DYNAMIC_HEAD_AUX_LOSS_COEFF",
+    "USE_SUBLN",
+    "USE_DEEPNORM",
     "MOE_EVERY_N_LAYERS",
     "MOE_NUM_EXPERTS",
     "MOE_TOP_K",
@@ -254,6 +502,19 @@ TRACKED_CONFIG_ENV_VARS = [
     "DISTILL_TEMPERATURE",
     "FAKE_QUANT_TAIL_STEPS",
     "FAKE_QUANT_BITS",
+    "FAKE_QUANT_FULL_RUN",
+    "USE_SMEAR_GATE",
+    "BIGRAM_VOCAB_SIZE",
+    "BIGRAM_DIM",
+    "ORTHOGONAL_INIT",
+    "MUP_PROJ_INIT",
+    "EXPORT_QUANT_BITS",
+    "EXPORT_CODEC",
+    "EXPORT_ZSTD_LEVEL",
+    "EXPORT_HIGH_PRECISION_BITS",
+    "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
+    "EXPORT_HIGH_PRECISION_MAX_TENSORS",
+    "EXPORT_HIGH_PRECISION_MIN_NUMEL",
     "VOCAB_SIZE",
     "NUM_LAYERS",
     "NUM_KV_HEADS",
@@ -468,6 +729,32 @@ def build_sentencepiece_luts(
     )
 
 
+def build_tokenizers_json_luts(tokenizer_path: str, vocab_size: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(tokenizer_path)
+    tok_vocab_size = int(tok.get_vocab_size())
+    table_size = max(tok_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    special_tokens = {"[PAD]", "[BOS]", "[EOS]", "[UNK]"}
+    for token_id in range(tok_vocab_size):
+        piece = tok.id_to_token(token_id)
+        if piece is None or piece in special_tokens:
+            continue
+        decoded = tok.decode([token_id], skip_special_tokens=False)
+        if not decoded:
+            continue
+        base_bytes_np[token_id] = len(decoded.encode("utf-8"))
+        is_boundary_token_np[token_id] = False
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -478,6 +765,10 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
+
+
+def get_eval_seq_len(args: Hyperparameters) -> int:
+    return args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
 
 
 def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
@@ -521,20 +812,22 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    seq_len_override: int = 0,
     max_seqs: int = 0,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    seq_len = seq_len_override if seq_len_override > 0 else args.train_seq_len
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens < seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, EVAL_SEQ_LEN={seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    local_batch_seqs = local_batch_tokens // seq_len
+    total_seqs = (val_tokens.numel() - 1) // seq_len
     if max_seqs > 0:
         total_seqs = min(total_seqs, max_seqs)
     seq_start = (total_seqs * rank) // world_size
@@ -544,18 +837,31 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    # Rotary caches persist across eval and training; inference_mode would cache
+    # inference tensors here and then autograd would reject them on the next step.
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
+            raw_start = batch_seq_start * seq_len
+            raw_end = batch_seq_end * seq_len + 1
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
+            if seq_len == args.train_seq_len:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                val_loss_sum += batch_loss.to(torch.float64) * float(y.numel())
+            else:
+                logits_model = model.module if hasattr(model, "module") else model
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = logits_model.forward_logits(x)
+                batch_loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y.reshape(-1),
+                    reduction="sum",
+                )
+                val_loss_sum += batch_loss.to(torch.float64)
             batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
@@ -587,11 +893,12 @@ def eval_val_sliding(
     is_boundary_token_lut: Tensor,
     stride: int,
     batch_seqs: int,
+    seq_len_override: int = 0,
     max_seqs: int = 0,
 ) -> tuple[float, float]:
     if batch_seqs <= 0:
         raise ValueError(f"EVAL_BATCH_SEQS must be positive for sliding eval, got {batch_seqs}")
-    seq_len = args.train_seq_len
+    seq_len = seq_len_override if seq_len_override > 0 else args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     if max_seqs > 0:
         total_tokens = min(total_tokens, max_seqs * seq_len)
@@ -606,7 +913,8 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     base_model.eval()
-    with torch.inference_mode():
+    # Keep cached RoPE tensors compatible with the subsequent training phase.
+    with torch.no_grad():
         for batch_idx in range(0, len(my_windows), batch_seqs):
             batch_windows = my_windows[batch_idx : batch_idx + batch_seqs]
             batch_size = len(batch_windows)
@@ -654,6 +962,61 @@ def eval_val_sliding(
     base_model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+
+def uses_sliding_eval(args: Hyperparameters) -> bool:
+    return 0 < args.eval_stride < get_eval_seq_len(args)
+
+
+def run_validation(
+    args: Hyperparameters,
+    model: nn.Module,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    seq_len_override: int = 0,
+    max_seqs: int = 0,
+) -> tuple[float, float, str]:
+    eval_seq_len = seq_len_override if seq_len_override > 0 else get_eval_seq_len(args)
+    if uses_sliding_eval(args):
+        val_loss, val_bpb = eval_val_sliding(
+            args,
+            base_model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            seq_len_override=eval_seq_len,
+            stride=args.eval_stride,
+            batch_seqs=args.eval_batch_seqs,
+            max_seqs=max_seqs,
+        )
+        return val_loss, val_bpb, "sliding"
+
+    val_loss, val_bpb = eval_val(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        seq_len_override=eval_seq_len,
+        max_seqs=max_seqs,
+    )
+    return val_loss, val_bpb, "standard"
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -666,7 +1029,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram",
     ).split(",")
     if pattern
 )
@@ -681,12 +1044,22 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
     pattern for pattern in os.environ.get("INT8_KEEP_FLOAT_NAME_PATTERNS", "").split(",") if pattern
 )
+MIXED_PRECISION_KEEP_FP16_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "MIXED_PRECISION_KEEP_FP16_NAME_PATTERNS",
+        "tok_emb.weight,blocks.7.attn.c_k.weight,blocks.8.attn.c_k.weight",
+    ).split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 FORCE_FP16_TIED_EMBED_EXPORT = bool(int(os.environ.get("FORCE_FP16_TIED_EMBED_EXPORT", "1")))
+LATE_K_FP16_LAYERS = int(os.environ.get("LATE_K_FP16_LAYERS", "2"))
+LARGE_MATRIX_QUANT_BITS = int(os.environ.get("LARGE_MATRIX_QUANT_BITS", "6"))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -703,9 +1076,23 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def should_keep_float_tensor(name: str, t: Tensor) -> bool:
     if FORCE_FP16_TIED_EMBED_EXPORT and name == "tok_emb.weight":
         return True
+    if (
+        LATE_K_FP16_LAYERS > 0
+        and name.endswith("c_k.weight")
+        and name.startswith("blocks.")
+        and t.ndim == 2
+    ):
+        try:
+            block_idx = int(name.split(".")[1])
+            num_layers = Hyperparameters.num_layers
+            if block_idx >= max(num_layers - LATE_K_FP16_LAYERS, 0):
+                return True
+        except (IndexError, ValueError):
+            pass
     return t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or any(pattern in name for pattern in INT8_KEEP_FLOAT_NAME_PATTERNS)
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
+    max_val = 127 if bits == 8 else (2 ** (bits - 1)) - 1
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
@@ -716,14 +1103,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / float(max_val)).clamp_min(1.0 / float(max_val))
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / float(max_val) if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
 
@@ -768,6 +1155,134 @@ def dequantize_int8_tensor(q: Tensor, s: Tensor, dtype: torch.dtype) -> Tensor:
     return (q.float() * float(s.item())).to(dtype=dtype).contiguous()
 
 
+def quantize_mixed_precision_tensor(t: Tensor, bits: int) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    qmax = float((1 << (bits - 1)) - 1)
+    qmin = -float(1 << (bits - 1))
+    if t32.ndim == 2:
+        clip_abs = t32.abs().amax(dim=1)
+        scale = (clip_abs / qmax).clamp_min(1e-12)
+        q = torch.clamp(torch.round(t32 / scale[:, None]), qmin, qmax).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    clip_abs = float(t32.abs().amax().item()) if t32.numel() else 0.0
+    scale = torch.tensor(max(clip_abs / qmax, 1e-12), dtype=torch.float32)
+    q = torch.clamp(torch.round(t32 / scale), qmin, qmax).to(torch.int8).contiguous()
+    return q, scale
+
+
+def _classify_quant_target(name: str) -> str:
+    if "tok_emb" in name or "lm_head" in name:
+        return "embed"
+    if ".mlp." in name:
+        return "mlp"
+    if ".attn." in name or ".proj." in name:
+        return "attn"
+    return "other"
+
+
+def compress_blob(payload: bytes, codec: str, zstd_level: int) -> tuple[bytes, str]:
+    normalized = codec.strip().lower()
+    if normalized == "zstd" and HAS_ZSTD:
+        return zstandard.ZstdCompressor(level=zstd_level).compress(payload), "zstd"
+    return zlib.compress(payload, level=9), "zlib"
+
+
+def decompress_blob(payload: bytes, codec: str) -> bytes:
+    if codec == "zstd":
+        if not HAS_ZSTD:
+            raise RuntimeError("EXPORT_CODEC=zstd requested but zstandard is not installed")
+        return zstandard.ZstdDecompressor().decompress(payload)
+    return zlib.decompress(payload)
+
+
+def select_mixed_precision_high_precision_tensors(
+    state_dict: dict[str, Tensor], low_bits: int, high_bits: int
+) -> tuple[set[str], dict[str, object]]:
+    budget_bytes = Hyperparameters.export_high_precision_budget_bytes
+    max_tensors = Hyperparameters.export_high_precision_max_tensors
+    min_numel = Hyperparameters.export_high_precision_min_numel
+    enabled = low_bits < high_bits and (budget_bytes > 0 or max_tensors > 0)
+    info: dict[str, object] = {
+        "enabled": enabled,
+        "low_bits": int(low_bits),
+        "high_bits": int(high_bits),
+        "budget_bytes": int(budget_bytes),
+        "max_tensors": int(max_tensors),
+        "min_numel": int(min_numel),
+        "selected_names": [],
+        "selected_count": 0,
+        "selected_extra_bytes": 0,
+        "top_candidates": [],
+    }
+    if not enabled:
+        return set(), info
+
+    candidates: list[dict[str, object]] = []
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        if (
+            not t.is_floating_point()
+            or should_keep_float_tensor(name, t)
+            or any(pattern in name for pattern in MIXED_PRECISION_KEEP_FP16_NAME_PATTERNS)
+            or (_classify_quant_target(name) == "embed" and FORCE_FP16_TIED_EMBED_EXPORT)
+            or t.numel() < min_numel
+        ):
+            continue
+        if _classify_quant_target(name) not in {"mlp", "attn"}:
+            continue
+        q_low, s_low = quantize_mixed_precision_tensor(t, low_bits)
+        q_high, s_high = quantize_mixed_precision_tensor(t, high_bits)
+        deq_low = dequantize_int8_tensor(q_low, s_low, t.dtype)
+        deq_high = dequantize_int8_tensor(q_high, s_high, t.dtype)
+        diff_low = deq_low.float() - t.float()
+        diff_high = deq_high.float() - t.float()
+        mse_low = float(diff_low.square().mean().item()) if diff_low.numel() else 0.0
+        mse_high = float(diff_high.square().mean().item()) if diff_high.numel() else 0.0
+        ref = float(t.float().square().mean().item()) if t.numel() else 0.0
+        rel_mse_gain = (mse_low - mse_high) / max(ref, 1e-12)
+        low_bytes = tensor_nbytes(q_low) + tensor_nbytes(s_low)
+        high_bytes = tensor_nbytes(q_high) + tensor_nbytes(s_high)
+        extra_bytes = max(high_bytes - low_bytes, 0)
+        if extra_bytes <= 0 or rel_mse_gain <= 0.0:
+            continue
+        benefit = rel_mse_gain * float(t.numel())
+        candidates.append(
+            {
+                "name": str(name),
+                "numel": int(t.numel()),
+                "extra_bytes": int(extra_bytes),
+                "rel_mse_gain": float(rel_mse_gain),
+                "benefit_per_extra_byte": float(benefit / max(extra_bytes, 1)),
+            }
+        )
+
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            float(item["benefit_per_extra_byte"]),
+            float(item["rel_mse_gain"]),
+            int(item["numel"]),
+        ),
+        reverse=True,
+    )
+    selected_names: list[str] = []
+    used_extra_bytes = 0
+    for item in ranked:
+        if max_tensors > 0 and len(selected_names) >= max_tensors:
+            break
+        extra_bytes = int(item["extra_bytes"])
+        if budget_bytes > 0 and used_extra_bytes + extra_bytes > budget_bytes:
+            continue
+        selected_names.append(str(item["name"]))
+        used_extra_bytes += extra_bytes
+
+    info["selected_names"] = selected_names
+    info["selected_count"] = len(selected_names)
+    info["selected_extra_bytes"] = int(used_extra_bytes)
+    info["top_candidates"] = ranked[:8]
+    return set(selected_names), info
+
+
 def select_auto_keep_float_tensors(state_dict: dict[str, Tensor]) -> tuple[set[str], dict[str, object]]:
     budget_bytes = Hyperparameters.int8_auto_keep_budget_bytes
     max_tensors = Hyperparameters.int8_auto_keep_max_tensors
@@ -792,7 +1307,8 @@ def select_auto_keep_float_tensors(state_dict: dict[str, Tensor]) -> tuple[set[s
         t = tensor.detach().to("cpu").contiguous()
         if not t.is_floating_point() or should_keep_float_tensor(name, t) or t.numel() < min_numel:
             continue
-        q, s = quantize_float_tensor(t)
+        q_bits = LARGE_MATRIX_QUANT_BITS if t.ndim == 2 else 8
+        q, s = quantize_float_tensor(t, bits=q_bits)
         deq = dequantize_int8_tensor(q, s, t.dtype)
         diff = deq.float() - t.float()
         mse = float(diff.square().mean().item()) if diff.numel() else 0.0
@@ -1045,6 +1561,90 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def quantize_state_dict_mixed_precision(state_dict: dict[str, Tensor], bits: int):
+    high_bits = min(max(int(Hyperparameters.export_high_precision_bits), bits), 8)
+    high_precision_names, high_precision_info = select_mixed_precision_high_precision_tensors(
+        state_dict, low_bits=bits, high_bits=high_bits
+    )
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "payload_bytes",
+            "high_precision_tensor_count",
+            "high_precision_extra_bytes",
+        ),
+        0,
+    )
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["payload_bytes"] += tensor_nbytes(t)
+            continue
+        if (
+            should_keep_float_tensor(name, t)
+            or any(pattern in name for pattern in MIXED_PRECISION_KEEP_FP16_NAME_PATTERNS)
+            or (_classify_quant_target(name) == "embed" and FORCE_FP16_TIED_EMBED_EXPORT)
+        ):
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["payload_bytes"] += tensor_nbytes(kept)
+            continue
+        stats["num_float_tensors"] += 1
+        target_bits = bits if _classify_quant_target(name) in {"mlp", "attn"} else 8
+        if name in high_precision_names:
+            target_bits = high_bits
+            stats["high_precision_tensor_count"] += 1
+        q, s = quantize_mixed_precision_tensor(t, target_bits)
+        qmeta[name] = {"scheme": "per_row" if s.ndim > 0 else "per_tensor", "axis": 0, "bits": int(target_bits)}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    stats["high_precision_extra_bytes"] = int(high_precision_info["selected_extra_bytes"])
+    return {
+        "__quant_format__": f"mixed_precision_{bits}bit_v2",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+        "qmeta": qmeta,
+        "passthrough_orig_dtypes": passthrough_orig_dtypes,
+    }, stats, high_precision_info
+
+
+def dequantize_state_dict_mixed_precision(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dtype = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name]
+        out[name] = dequantize_int8_tensor(q, s, dtype)
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
 # -----------------------------
 # DATA LOADING
 # -----------------------------
@@ -1158,12 +1758,19 @@ def fake_quantize_tensor(t: Tensor, bits: int) -> Tensor:
     if bits <= 0:
         return t
     t32 = t.float()
+    if t32.numel() == 0:
+        return t
     qmax = float((1 << (bits - 1)) - 1)
     if qmax <= 0:
         return t
-    clip_abs = t32.abs().amax()
+    if t32.ndim == 2:
+        clip_abs = t32.abs().amax(dim=1, keepdim=True)
+    else:
+        clip_abs = t32.abs().amax()
     scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
-    return (torch.clamp(torch.round(t32 / scale), -qmax, qmax) * scale).to(dtype=t.dtype)
+    clipped = torch.clamp(t32, -clip_abs, clip_abs)
+    quantized = torch.clamp(torch.round(clipped / scale), -qmax, qmax) * scale
+    return (t32 + (quantized - t32).detach()).to(dtype=t.dtype)
 
 
 def row_norm_regularization(module: nn.Module) -> Tensor:
@@ -1320,6 +1927,9 @@ class CausalSelfAttention(nn.Module):
         attention_variant: str = "attention",
         retention_decay_init: float = 1.5,
         retention_output_gate: bool = True,
+        dynamic_head_top_k: int = 0,
+        dynamic_head_temperature: float = 1.0,
+        use_subln: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1335,6 +1945,8 @@ class CausalSelfAttention(nn.Module):
         self.relative_bias_num_buckets = relative_bias_num_buckets
         self.relative_bias_max_distance = relative_bias_max_distance
         self.attention_variant = attention_variant
+        self.dynamic_head_top_k = max(0, min(int(dynamic_head_top_k), num_heads))
+        self.dynamic_head_temperature = max(float(dynamic_head_temperature), 1e-4)
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -1344,14 +1956,24 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.residual_attention_gain = nn.Parameter(
-            torch.full((num_heads,), residual_attention_gain_init, dtype=torch.float32)
+        self.dynamic_head_router = (
+            CastedLinear(dim, num_heads, bias=False) if 0 < self.dynamic_head_top_k < num_heads else None
         )
-        self.retention_decay = nn.Parameter(torch.full((num_heads,), retention_decay_init, dtype=torch.float32))
+        self.inner_attn_norm = nn.LayerNorm(dim) if use_subln else None
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.residual_attention_gain = (
+            nn.Parameter(torch.full((num_heads,), residual_attention_gain_init, dtype=torch.float32))
+            if use_residual_attention
+            else None
+        )
+        self.retention_decay = (
+            nn.Parameter(torch.full((num_heads,), retention_decay_init, dtype=torch.float32))
+            if attention_variant == "retention"
+            else None
+        )
         self.retention_gate = (
             nn.Parameter(torch.zeros(num_heads, self.head_dim, dtype=torch.float32)) if retention_output_gate else None
-        )
+        ) if attention_variant == "retention" else None
         self.rotary = Rotary(self.head_dim, base=rope_base, use_xpos=use_xpos, xpos_scale_base=xpos_scale_base)
         self.register_buffer("alibi_slopes", _get_alibi_slopes(num_heads), persistent=False)
         self.relative_attention_bias = (
@@ -1371,8 +1993,11 @@ class CausalSelfAttention(nn.Module):
         )
         self._alibi_bias_cache: Tensor | None = None
         self._alibi_bias_seq_len = 0
+        self.last_dynamic_head_aux_loss = torch.tensor(0.0)
 
     def _get_retention_bias(self, seq_len: int, total_k: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if self.retention_decay is None:
+            raise RuntimeError("retention bias requested for a non-retention attention block")
         mem = max(total_k - seq_len, 0)
         q_pos = torch.arange(seq_len, device=device)[:, None]
         k_pos = torch.arange(seq_len, device=device)[None, :]
@@ -1429,7 +2054,7 @@ class CausalSelfAttention(nn.Module):
                 mem_bias = torch.zeros((1, self.num_heads, seqlen, self.memory_kv_slots), device=q.device, dtype=dtype)
                 rel_bias = torch.cat((mem_bias, rel_bias), dim=-1)
             logits = logits + rel_bias
-        if prev_attn_logits is not None and self.use_residual_attention:
+        if prev_attn_logits is not None and self.use_residual_attention and self.residual_attention_gain is not None:
             gain = torch.sigmoid(self.residual_attention_gain).to(dtype=dtype)[None, :, None, None]
             logits = logits + gain * prev_attn_logits
         mem = self.memory_kv_slots
@@ -1449,6 +2074,20 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, prev_attn_logits: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         bsz, seqlen, dim = x.shape
+        head_gate = None
+        if self.dynamic_head_router is not None:
+            gate_logits = self.dynamic_head_router(x).float() / self.dynamic_head_temperature
+            gate_probs = torch.softmax(gate_logits, dim=-1)
+            top_vals, top_idx = torch.topk(gate_probs, k=self.dynamic_head_top_k, dim=-1)
+            head_gate = torch.zeros_like(gate_probs).scatter(-1, top_idx, top_vals)
+            head_gate = head_gate / head_gate.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            mean_probs = gate_probs.mean(dim=(0, 1))
+            top1 = top_idx[..., 0].reshape(-1)
+            load = torch.bincount(top1, minlength=self.num_heads).to(dtype=mean_probs.dtype, device=mean_probs.device)
+            load = load / max(int(top1.numel()), 1)
+            self.last_dynamic_head_aux_loss = self.num_heads * torch.sum(mean_probs * load)
+        else:
+            self.last_dynamic_head_aux_loss = x.new_zeros(())
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -1483,22 +2122,65 @@ class CausalSelfAttention(nn.Module):
                 attn_mask=attn_bias,
                 is_causal=True,
             )
+        if head_gate is not None:
+            y = y * head_gate.transpose(1, 2).unsqueeze(-1).to(dtype=y.dtype)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        if self.inner_attn_norm is not None:
+            y = self.inner_attn_norm(y)
         return self.proj(y), next_attn_logits
 
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, hidden_dim: int = 0):
+    def __init__(self, dim: int, mlp_mult: int, hidden_dim: int = 0, use_subln: bool = False):
         super().__init__()
         inner_dim = hidden_dim if hidden_dim > 0 else mlp_mult * dim
         self.fc = CastedLinear(dim, inner_dim, bias=False)
+        self.inner_norm = nn.LayerNorm(inner_dim) if use_subln else None
         self.proj = CastedLinear(inner_dim, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
+        if self.inner_norm is not None:
+            x = self.inner_norm(x)
         return self.proj(x.square())
+
+
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1.0 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.vocab_size = max(int(vocab_size), 1)
+        self.embed = nn.Embedding(self.vocab_size, bigram_dim)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def _hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        if mod <= 0:
+            return out.long()
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self._hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
 
 
 class MoEMLP(nn.Module):
@@ -1554,6 +2236,10 @@ class Block(nn.Module):
         attention_variant: str,
         retention_decay_init: float,
         retention_output_gate: bool,
+        dynamic_head_top_k: int,
+        dynamic_head_temperature: float,
+        use_subln: bool,
+        residual_alpha: float,
         moe_every_n_layers: int,
         moe_num_experts: int,
         moe_top_k: int,
@@ -1564,6 +2250,7 @@ class Block(nn.Module):
         self.macaron_layout = macaron_layout
         self.layer_idx = layer_idx
         self.attention_variant = attention_variant
+        self.residual_alpha = float(residual_alpha)
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.pre_mlp_norm = RMSNorm()
@@ -1585,30 +2272,36 @@ class Block(nn.Module):
             attention_variant=attention_variant,
             retention_decay_init=retention_decay_init,
             retention_output_gate=retention_output_gate,
+            dynamic_head_top_k=dynamic_head_top_k,
+            dynamic_head_temperature=dynamic_head_temperature,
+            use_subln=use_subln,
         )
         use_moe = moe_every_n_layers > 0 and ((layer_idx + 1) % moe_every_n_layers == 0)
         moe_inner_dim = moe_hidden if moe_hidden > 0 else (mlp_hidden if mlp_hidden > 0 else mlp_mult * dim)
         self.mlp = (
-            MoEMLP(dim, moe_num_experts, moe_top_k, hidden_dim=moe_inner_dim) if use_moe else MLP(dim, mlp_mult, hidden_dim=mlp_hidden)
+            MoEMLP(dim, moe_num_experts, moe_top_k, hidden_dim=moe_inner_dim)
+            if use_moe
+            else MLP(dim, mlp_mult, hidden_dim=mlp_hidden, use_subln=use_subln)
         )
-        self.pre_mlp = MLP(dim, mlp_mult, hidden_dim=mlp_hidden) if macaron_layout else None
+        self.pre_mlp = MLP(dim, mlp_mult, hidden_dim=mlp_hidden, use_subln=use_subln) if macaron_layout else None
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.pre_mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.pre_mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if macaron_layout else None
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, prev_attn_logits: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        if self.pre_mlp is not None:
+        if self.pre_mlp is not None and self.pre_mlp_scale is not None:
             pre_mlp_in = apply_token_shift(x) if self.token_shift else x
-            x = x + 0.5 * self.pre_mlp_scale.to(dtype=x.dtype)[None, None, :] * self.pre_mlp(self.pre_mlp_norm(pre_mlp_in))
+            pre_mlp_out = 0.5 * self.pre_mlp_scale.to(dtype=x.dtype)[None, None, :] * self.pre_mlp(self.pre_mlp_norm(pre_mlp_in))
+            x = x * self.residual_alpha + pre_mlp_out
         x_in = apply_token_shift(x) if self.token_shift else x
         attn_out, next_attn_logits = self.attn(self.attn_norm(x_in), prev_attn_logits=prev_attn_logits)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_in = apply_token_shift(x) if self.token_shift else x
         mlp_scale = 0.5 if self.pre_mlp is not None else 1.0
-        x = x + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
+        x = x * self.residual_alpha + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
         return x, next_attn_logits
 
 
@@ -1650,6 +2343,11 @@ class GPT(nn.Module):
         retention_layers: int,
         retention_decay_init: float,
         retention_output_gate: bool,
+        dynamic_head_layers: int,
+        dynamic_head_top_k: int,
+        dynamic_head_temperature: float,
+        use_subln: bool,
+        use_deepnorm: bool,
         moe_every_n_layers: int,
         moe_num_experts: int,
         moe_top_k: int,
@@ -1657,6 +2355,11 @@ class GPT(nn.Module):
         use_hyper_connections: bool,
         hyper_connection_layers: int,
         hyper_connection_gate_init: float,
+        use_smear_gate: bool,
+        bigram_vocab_size: int,
+        bigram_dim: int,
+        orthogonal_init: bool,
+        mup_proj_init: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1683,6 +2386,11 @@ class GPT(nn.Module):
         self.retention_layers = max(int(retention_layers), 0)
         self.retention_decay_init = retention_decay_init
         self.retention_output_gate = retention_output_gate
+        self.dynamic_head_layers = max(int(dynamic_head_layers), 0)
+        self.dynamic_head_top_k = max(int(dynamic_head_top_k), 0)
+        self.dynamic_head_temperature = max(float(dynamic_head_temperature), 1e-4)
+        self.use_subln = use_subln
+        self.use_deepnorm = use_deepnorm
         self.moe_every_n_layers = max(int(moe_every_n_layers), 0)
         self.moe_num_experts = max(int(moe_num_experts), 1)
         self.moe_top_k = max(int(moe_top_k), 1)
@@ -1690,13 +2398,20 @@ class GPT(nn.Module):
         self.use_hyper_connections = use_hyper_connections
         self.hyper_connection_layers = max(int(hyper_connection_layers), 0)
         self.hyper_connection_gate_init = hyper_connection_gate_init
+        self.use_smear_gate = use_smear_gate
+        self.orthogonal_init = orthogonal_init
+        self.mup_proj_init = mup_proj_init
         self.fake_quant_bits = 0
         self.num_register_tokens = max(int(num_register_tokens), 0)
         self.num_shared_layers = max(int(num_shared_layers), 0)
         self.shared_layer_repeats = max(int(shared_layer_repeats), 0)
         self.shared_loop_gate_init = shared_loop_gate_init
         retention_start = max(num_layers - self.retention_layers, 0)
+        dynamic_head_start = max(num_layers - self.dynamic_head_layers, 0)
+        residual_alpha = math.pow(2.0 * num_layers, 0.25) if self.use_deepnorm and num_layers > 0 else 1.0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim) if use_smear_gate else None
         self.register_tokens = (
             nn.Parameter(torch.zeros(self.num_register_tokens, model_dim, dtype=torch.float32))
             if self.num_register_tokens > 0
@@ -1728,9 +2443,13 @@ class GPT(nn.Module):
                     relative_bias_num_buckets,
                     relative_bias_max_distance,
                     macaron_layout,
-                    attention_variant="retention" if i >= max(num_layers - self.retention_layers, 0) else "attention",
+                    attention_variant="retention" if i >= retention_start else "attention",
                     retention_decay_init=retention_decay_init,
                     retention_output_gate=retention_output_gate,
+                    dynamic_head_top_k=self.dynamic_head_top_k if i >= dynamic_head_start else 0,
+                    dynamic_head_temperature=self.dynamic_head_temperature,
+                    use_subln=self.use_subln,
+                    residual_alpha=residual_alpha,
                     moe_every_n_layers=self.moe_every_n_layers,
                     moe_num_experts=self.moe_num_experts,
                     moe_top_k=self.moe_top_k,
@@ -1764,6 +2483,10 @@ class GPT(nn.Module):
                     attention_variant="attention",
                     retention_decay_init=retention_decay_init,
                     retention_output_gate=retention_output_gate,
+                    dynamic_head_top_k=0,
+                    dynamic_head_temperature=self.dynamic_head_temperature,
+                    use_subln=self.use_subln,
+                    residual_alpha=residual_alpha,
                     moe_every_n_layers=self.moe_every_n_layers,
                     moe_num_experts=self.moe_num_experts,
                     moe_top_k=self.moe_top_k,
@@ -1801,8 +2524,33 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        if self.bigram is not None:
+            nn.init.zeros_(self.bigram.embed.weight)
+            if self.bigram.proj is not None:
+                nn.init.zeros_(self.bigram.proj.weight)
+        if self.orthogonal_init:
+            self._apply_orthogonal_init()
         if self.resid_mix_phase_init:
             self._init_resid_mix_phase_schedule()
+
+    def _apply_orthogonal_init(self) -> None:
+        proj_scale = 1.0 / math.sqrt(max(2 * len(self.blocks), 1)) if self.mup_proj_init else 1.0
+        for name, module in self.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            if getattr(module, "_zero_init", False):
+                continue
+            if module.weight.ndim != 2 or min(module.weight.shape) < 64:
+                continue
+            nn.init.orthogonal_(module.weight, gain=1.0)
+            if self.mup_proj_init and (
+                name.endswith(".proj")
+                or name.endswith(".attn.proj")
+                or name.endswith(".mlp.proj")
+                or name.endswith("bigram.proj")
+            ):
+                with torch.no_grad():
+                    module.weight.mul_(proj_scale)
 
     def _init_overtone_embedding(self) -> None:
         rows, cols = self.tok_emb.weight.shape
@@ -1853,6 +2601,16 @@ class GPT(nn.Module):
             return self.tok_emb.weight.new_zeros(())
         return aux
 
+    def _dynamic_head_aux_loss(self) -> Tensor:
+        aux = None
+        for module in self.modules():
+            if isinstance(module, CausalSelfAttention) and module.dynamic_head_router is not None:
+                value = module.last_dynamic_head_aux_loss
+                aux = value if aux is None else aux + value
+        if aux is None:
+            return self.tok_emb.weight.new_zeros(())
+        return aux
+
     def _loss_from_logits(
         self,
         logits: Tensor,
@@ -1861,6 +2619,7 @@ class GPT(nn.Module):
         z_loss_coeff: float = 0.0,
         logit_var_loss_coeff: float = 0.0,
         moe_aux_loss_coeff: float = 0.0,
+        dynamic_head_aux_loss_coeff: float = 0.0,
         teacher_logits: Tensor | None = None,
         distill_weight: float = 0.0,
         distill_temperature: float = 1.0,
@@ -1879,6 +2638,8 @@ class GPT(nn.Module):
             loss = loss + logit_var_loss_coeff * (logit_std - target_std).square().mean()
         if moe_aux_loss_coeff > 0.0:
             loss = loss + moe_aux_loss_coeff * self._moe_aux_loss()
+        if dynamic_head_aux_loss_coeff > 0.0:
+            loss = loss + dynamic_head_aux_loss_coeff * self._dynamic_head_aux_loss()
         if teacher_logits is not None and distill_weight > 0.0:
             temp = max(distill_temperature, 1e-4)
             student_log_probs = F.log_softmax(flat_logits.float() / temp, dim=-1)
@@ -1909,8 +2670,12 @@ class GPT(nn.Module):
 
     def _forward_features(self, input_ids: Tensor) -> Tensor:
         x = F.embedding(input_ids, self._embedding_weight())
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = self._prepend_register_tokens(x)
         x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
         prev_attn_logits = None
@@ -1937,6 +2702,7 @@ class GPT(nn.Module):
         z_loss_coeff: float = 0.0,
         logit_var_loss_coeff: float = 0.0,
         moe_aux_loss_coeff: float = 0.0,
+        dynamic_head_aux_loss_coeff: float = 0.0,
     ) -> Tensor:
         features = self._forward_features(input_ids)
         if self.tie_embeddings:
@@ -1953,6 +2719,7 @@ class GPT(nn.Module):
             z_loss_coeff=z_loss_coeff,
             logit_var_loss_coeff=logit_var_loss_coeff,
             moe_aux_loss_coeff=moe_aux_loss_coeff,
+            dynamic_head_aux_loss_coeff=dynamic_head_aux_loss_coeff,
         )
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -2015,6 +2782,11 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         retention_layers=args.retention_layers,
         retention_decay_init=args.retention_decay_init,
         retention_output_gate=args.retention_output_gate,
+        dynamic_head_layers=args.dynamic_head_layers,
+        dynamic_head_top_k=args.dynamic_head_top_k,
+        dynamic_head_temperature=args.dynamic_head_temperature,
+        use_subln=args.use_subln,
+        use_deepnorm=args.use_deepnorm,
         moe_every_n_layers=args.moe_every_n_layers,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
@@ -2022,6 +2794,11 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         use_hyper_connections=args.use_hyper_connections,
         hyper_connection_layers=args.hyper_connection_layers,
         hyper_connection_gate_init=args.hyper_connection_gate_init,
+        use_smear_gate=args.use_smear_gate,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        orthogonal_init=args.orthogonal_init,
+        mup_proj_init=args.mup_proj_init,
     ).to(device).bfloat16()
     state = torch.load(args.distill_teacher_checkpoint, map_location="cpu")
     teacher.load_state_dict(state, strict=True)
@@ -2031,8 +2808,12 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
     return teacher
 
 
-def fake_quant_tail_active(args: Hyperparameters, step: int, elapsed_ms: float) -> bool:
-    if args.fake_quant_tail_steps <= 0 or args.fake_quant_bits <= 0:
+def fake_quant_active(args: Hyperparameters, step: int, elapsed_ms: float) -> bool:
+    if args.fake_quant_bits <= 0:
+        return False
+    if args.fake_quant_full_run:
+        return True
+    if args.fake_quant_tail_steps <= 0:
         return False
     if step >= max(args.iterations - args.fake_quant_tail_steps, 0):
         return True
@@ -2186,22 +2967,37 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
+    tokenizer_kind = ""
+    if args.tokenizer_path.endswith(".model"):
+        tokenizer_kind = "sentencepiece"
+        sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+        tokenizer_vocab_size = int(sp.vocab_size())
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            sp, args.vocab_size, device
+        )
+    elif args.tokenizer_path.endswith(".json"):
+        from tokenizers import Tokenizer
+
+        tokenizer_kind = "tokenizers_json"
+        tok = Tokenizer.from_file(args.tokenizer_path)
+        tokenizer_vocab_size = int(tok.get_vocab_size())
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_tokenizers_json_luts(
+            args.tokenizer_path, args.vocab_size, device
+        )
+    else:
+        raise ValueError(f"Unsupported tokenizer format for TOKENIZER_PATH={args.tokenizer_path!r}; expected .model or .json")
+    if tokenizer_vocab_size != args.vocab_size:
         raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={tokenizer_vocab_size}"
         )
     dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
         args.data_path,
         args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    eval_seq_len = get_eval_seq_len(args)
+    val_tokens_eval = val_tokens if eval_seq_len == args.train_seq_len else load_validation_tokens(args.val_files, eval_seq_len)
+    log0(f"val_bpb:enabled tokenizer_kind={tokenizer_kind} tokenizer_path={args.tokenizer_path}")
     if expected_train_files is None:
         log0(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}")
     elif actual_train_files < expected_train_files:
@@ -2212,7 +3008,10 @@ def main() -> None:
         )
     else:
         log0(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
-    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"val_loader:shards pattern={args.val_files} train_tokens:{val_tokens.numel() - 1} "
+        f"final_eval_tokens:{val_tokens_eval.numel() - 1} eval_seq_len:{eval_seq_len}"
+    )
     if master_process:
         manifest_payload["dataset"] = {
             "name": dataset_name,
@@ -2221,6 +3020,8 @@ def main() -> None:
             "tokenizer_path": args.tokenizer_path,
             "val_pattern": args.val_files,
             "val_tokens": int(val_tokens.numel() - 1),
+            "final_eval_tokens": int(val_tokens_eval.numel() - 1),
+            "eval_seq_len": int(eval_seq_len),
         }
         write_json(run_manifest_path, manifest_payload)
 
@@ -2264,6 +3065,11 @@ def main() -> None:
         retention_layers=args.retention_layers,
         retention_decay_init=args.retention_decay_init,
         retention_output_gate=args.retention_output_gate,
+        dynamic_head_layers=args.dynamic_head_layers,
+        dynamic_head_top_k=args.dynamic_head_top_k,
+        dynamic_head_temperature=args.dynamic_head_temperature,
+        use_subln=args.use_subln,
+        use_deepnorm=args.use_deepnorm,
         moe_every_n_layers=args.moe_every_n_layers,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
@@ -2271,6 +3077,11 @@ def main() -> None:
         use_hyper_connections=args.use_hyper_connections,
         hyper_connection_layers=args.hyper_connection_layers,
         hyper_connection_gate_init=args.hyper_connection_gate_init,
+        use_smear_gate=args.use_smear_gate,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        orthogonal_init=args.orthogonal_init,
+        mup_proj_init=args.mup_proj_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -2284,10 +3095,8 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     ema_state = init_ema_state(base_model) if args.ema_decay > 0.0 else None
     teacher_model = maybe_build_teacher(args, device)
-    if distributed and teacher_model is not None:
-        if master_process:
-            log0("WARNING: distillation disabled on distributed path; current implementation is local-only.")
-        teacher_model = None
+    if distributed and teacher_model is not None and master_process:
+        log0("distillation_mode:distributed_local_teacher enabled on every rank")
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -2297,6 +3106,8 @@ def main() -> None:
     embed_params = [base_model.tok_emb.weight]
     if base_model.register_tokens is not None:
         embed_params.append(base_model.register_tokens)
+    if base_model.bigram is not None:
+        embed_params.append(base_model.bigram.embed.weight)
     block_named_params = (
         [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
         + [(f"shared_blocks.{name}", p) for name, p in base_model.shared_blocks.named_parameters()]
@@ -2315,6 +3126,12 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.shared_loop_gates is not None:
         scalar_params.append(base_model.shared_loop_gates)
+    if base_model.smear is not None:
+        scalar_params.append(base_model.smear.gate)
+    if base_model.bigram is not None:
+        scalar_params.append(base_model.bigram.scale)
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
@@ -2354,8 +3171,8 @@ def main() -> None:
     log0(f"torch_compile:{args.enable_torch_compile}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"eval_mode:{'sliding' if 0 < args.eval_stride < args.train_seq_len else 'standard'} "
-        f"eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs}"
+        f"eval_mode:{'sliding' if uses_sliding_eval(args) else 'standard'} "
+        f"eval_seq_len:{eval_seq_len} eval_stride:{args.eval_stride} eval_batch_seqs:{args.eval_batch_seqs}"
     )
     log0(f"val_max_seqs:{args.val_max_seqs} final_eval_max_seqs:{args.final_eval_max_seqs}")
     log0(
@@ -2369,6 +3186,15 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"training_preset:{args.training_preset or 'none'}")
+    log0(
+        f"policy_schema:recipe_family:{args.recipe_family or 'none'} "
+        f"curriculum_policy:{args.curriculum_policy or 'none'} "
+        f"data_policy:{args.data_policy or 'none'} "
+        f"optimizer_policy:{args.optimizer_policy or 'none'} "
+        f"precision_policy:{args.precision_policy or 'none'} "
+        f"eval_policy:{args.eval_policy or 'none'} "
+        f"runtime_policy:{args.runtime_policy or 'none'}"
+    )
     log0(f"train_random_offset_tokens:{args.train_random_offset_tokens}")
     log0(f"num_register_tokens:{args.num_register_tokens}")
     if args.mlp_hidden > 0:
@@ -2402,7 +3228,13 @@ def main() -> None:
         f"relative_bias_num_buckets:{args.relative_bias_num_buckets} "
         f"relative_bias_max_distance:{args.relative_bias_max_distance} "
         f"retention_layers:{args.retention_layers} retention_decay_init:{args.retention_decay_init} "
-        f"retention_output_gate:{args.retention_output_gate}"
+        f"retention_output_gate:{args.retention_output_gate} "
+        f"dynamic_head_layers:{args.dynamic_head_layers} dynamic_head_top_k:{args.dynamic_head_top_k} "
+        f"dynamic_head_temperature:{args.dynamic_head_temperature}"
+    )
+    log0(
+        f"torchscale_ext:use_subln:{args.use_subln} use_deepnorm:{args.use_deepnorm} "
+        f"dynamic_head_aux_loss_coeff:{args.dynamic_head_aux_loss_coeff}"
     )
     log0(
         f"capacity_ext:moe_every_n_layers:{args.moe_every_n_layers} "
@@ -2418,7 +3250,22 @@ def main() -> None:
         f"distill:weight:{args.distill_weight} temperature:{args.distill_temperature} "
         f"teacher_checkpoint:{args.distill_teacher_checkpoint or 'none'}"
     )
-    log0(f"fake_quant_tail:steps:{args.fake_quant_tail_steps} bits:{args.fake_quant_bits}")
+    log0(
+        f"fake_quant:bits:{args.fake_quant_bits} tail_steps:{args.fake_quant_tail_steps} "
+        f"full_run:{args.fake_quant_full_run}"
+    )
+    log0(
+        f"token_enrich:use_smear_gate:{args.use_smear_gate} "
+        f"bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim}"
+    )
+    log0(
+        f"init_export:orthogonal_init:{args.orthogonal_init} mup_proj_init:{args.mup_proj_init} "
+        f"export_quant_bits:{args.export_quant_bits} export_codec:{args.export_codec} "
+        f"export_high_precision_bits:{args.export_high_precision_bits} "
+        f"export_high_precision_budget_bytes:{args.export_high_precision_budget_bytes} "
+        f"export_high_precision_max_tensors:{args.export_high_precision_max_tensors} "
+        f"export_high_precision_min_numel:{args.export_high_precision_min_numel}"
+    )
     log0(
         f"quant_auto_keep:budget_bytes:{args.int8_auto_keep_budget_bytes} "
         f"max_tensors:{args.int8_auto_keep_max_tensors} "
@@ -2438,6 +3285,13 @@ def main() -> None:
         train_batch_tokens=args.train_batch_tokens,
         iterations=args.iterations,
         training_preset=args.training_preset,
+        recipe_family=args.recipe_family,
+        curriculum_policy=args.curriculum_policy,
+        data_policy=args.data_policy,
+        optimizer_policy=args.optimizer_policy,
+        precision_policy=args.precision_policy,
+        eval_policy=args.eval_policy,
+        runtime_policy=args.runtime_policy,
         torch_compile=args.enable_torch_compile,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -2465,6 +3319,11 @@ def main() -> None:
         macaron_layout=args.macaron_layout,
         use_relative_bias=args.use_relative_bias,
         retention_layers=args.retention_layers,
+        dynamic_head_layers=args.dynamic_head_layers,
+        dynamic_head_top_k=args.dynamic_head_top_k,
+        dynamic_head_aux_loss_coeff=args.dynamic_head_aux_loss_coeff,
+        use_subln=args.use_subln,
+        use_deepnorm=args.use_deepnorm,
         moe_every_n_layers=args.moe_every_n_layers,
         moe_num_experts=args.moe_num_experts,
         moe_top_k=args.moe_top_k,
@@ -2473,6 +3332,17 @@ def main() -> None:
         hyper_connection_layers=args.hyper_connection_layers,
         distill_weight=args.distill_weight,
         fake_quant_tail_steps=args.fake_quant_tail_steps,
+        use_smear_gate=args.use_smear_gate,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        orthogonal_init=args.orthogonal_init,
+        mup_proj_init=args.mup_proj_init,
+        export_quant_bits=args.export_quant_bits,
+        export_codec=args.export_codec,
+        export_high_precision_bits=args.export_high_precision_bits,
+        export_high_precision_budget_bytes=args.export_high_precision_budget_bytes,
+        export_high_precision_max_tensors=args.export_high_precision_max_tensors,
+        export_high_precision_min_numel=args.export_high_precision_min_numel,
     )
 
     # -----------------------------
@@ -2526,6 +3396,7 @@ def main() -> None:
                         args.z_loss_coeff,
                         args.logit_var_loss_coeff,
                         args.moe_aux_loss_coeff,
+                        args.dynamic_head_aux_loss_coeff,
                     )
                     if args.row_norm_loss_coeff > 0.0:
                         warmup_loss = warmup_loss + args.row_norm_loss_coeff * row_norm_regularization(base_model)
@@ -2573,9 +3444,10 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
+            val_loss, val_bpb, val_mode = run_validation(
                 args,
                 model,
+                base_model,
                 rank,
                 world_size,
                 device,
@@ -2587,13 +3459,14 @@ def main() -> None:
                 max_seqs=args.val_max_seqs,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_mode:{val_mode} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             metric0(
                 "val",
                 step=step,
                 iterations=args.iterations,
+                val_mode=val_mode,
                 val_loss=val_loss,
                 val_bpb=val_bpb,
                 train_time_ms=training_time_ms,
@@ -2613,7 +3486,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        base_model.set_fake_quant(args.fake_quant_bits if fake_quant_tail_active(args, step, elapsed_ms) else 0)
+        base_model.set_fake_quant(args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms) else 0)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -2633,6 +3506,7 @@ def main() -> None:
                         args.z_loss_coeff,
                         args.logit_var_loss_coeff,
                         args.moe_aux_loss_coeff,
+                        args.dynamic_head_aux_loss_coeff,
                     )
                 else:
                     student_logits = base_model.forward_logits(x)
@@ -2643,6 +3517,7 @@ def main() -> None:
                         z_loss_coeff=args.z_loss_coeff,
                         logit_var_loss_coeff=args.logit_var_loss_coeff,
                         moe_aux_loss_coeff=args.moe_aux_loss_coeff,
+                        dynamic_head_aux_loss_coeff=args.dynamic_head_aux_loss_coeff,
                         teacher_logits=teacher_logits,
                         distill_weight=args.distill_weight,
                         distill_temperature=args.distill_temperature,
@@ -2730,11 +3605,29 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats, auto_keep_info = quantize_state_dict_int8(base_model.state_dict())
+    if args.export_quant_bits < 8:
+        quant_obj, mixed_stats, mixed_precision_info = quantize_state_dict_mixed_precision(
+            base_model.state_dict(), bits=args.export_quant_bits
+        )
+        quant_stats = {
+            "param_count": mixed_stats["param_count"],
+            "num_tensors": mixed_stats["num_tensors"],
+            "num_float_tensors": mixed_stats["num_float_tensors"],
+            "num_nonfloat_tensors": mixed_stats["num_nonfloat_tensors"],
+            "baseline_tensor_bytes": mixed_stats["baseline_tensor_bytes"],
+            "int8_payload_bytes": mixed_stats["payload_bytes"],
+            "auto_keep_count": mixed_stats["high_precision_tensor_count"],
+            "auto_keep_extra_bytes": mixed_stats["high_precision_extra_bytes"],
+            "auto_keep_row_group_count": 0,
+            "auto_keep_row_group_extra_bytes": 0,
+        }
+        auto_keep_info = {**mixed_precision_info, "row_groups": {}}
+    else:
+        quant_obj, quant_stats, auto_keep_info = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob, used_codec = compress_blob(quant_raw, args.export_codec, args.export_zstd_level)
     quant_raw_bytes = len(quant_raw)
     submission_over_limit = False
     raw_model_bytes = None
@@ -2748,7 +3641,7 @@ def main() -> None:
         total_submission_bytes = quant_file_bytes + code_bytes
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model q{args.export_quant_bits}+{used_codec}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         if auto_keep_info["enabled"]:
@@ -2757,13 +3650,14 @@ def main() -> None:
                 f"selected_extra_bytes:{auto_keep_info['selected_extra_bytes']}"
             )
             for idx, candidate in enumerate(auto_keep_info["top_candidates"], start=1):
+                rel_metric = float(candidate.get("rel_mse", candidate.get("rel_mse_gain", 0.0)))
                 log0(
                     "auto_keep_top_"
-                    f"{idx}:name:{candidate['name']} rel_mse:{candidate['rel_mse']:.6e} "
+                    f"{idx}:name:{candidate['name']} rel_mse:{rel_metric:.6e} "
                     f"extra_bytes:{candidate['extra_bytes']} "
                     f"benefit_per_extra_byte:{candidate['benefit_per_extra_byte']:.6e}"
                 )
-        log0(f"Total submission size int8+zlib: {total_submission_bytes} bytes")
+        log0(f"Total submission size q{args.export_quant_bits}+{used_codec}: {total_submission_bytes} bytes")
         log0(f"Submission size limit: {args.submission_size_limit_bytes} bytes")
         submission_over_limit = total_submission_bytes > args.submission_size_limit_bytes
         metric0(
@@ -2794,15 +3688,18 @@ def main() -> None:
         dist.barrier()
     with open(quant_model_path, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    quant_state = torch.load(io.BytesIO(decompress_blob(quant_blob_disk, used_codec)), map_location="cpu")
+    if args.export_quant_bits < 8:
+        base_model.load_state_dict(dequantize_state_dict_mixed_precision(quant_state), strict=True)
+    else:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     final_eval_is_exact = True
-    if 0 < args.eval_stride < args.train_seq_len:
+    if uses_sliding_eval(args):
         final_eval_is_exact = args.final_eval_max_seqs <= 0
         log0(
-            f"final_eval_mode:sliding_window stride:{args.eval_stride} "
+            f"final_eval_mode:sliding_window seq_len:{eval_seq_len} stride:{args.eval_stride} "
             f"batch_seqs:{args.eval_batch_seqs} max_seqs:{args.final_eval_max_seqs}"
         )
         q_val_loss, q_val_bpb = eval_val_sliding(
@@ -2811,17 +3708,18 @@ def main() -> None:
             rank,
             world_size,
             device,
-            val_tokens,
+            val_tokens_eval,
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
+            seq_len_override=eval_seq_len,
             stride=args.eval_stride,
             batch_seqs=args.eval_batch_seqs,
             max_seqs=args.final_eval_max_seqs,
         )
     else:
         final_eval_is_exact = args.final_eval_max_seqs <= 0
-        log0(f"final_eval_mode:standard max_seqs:{args.final_eval_max_seqs}")
+        log0(f"final_eval_mode:standard seq_len:{eval_seq_len} max_seqs:{args.final_eval_max_seqs}")
         q_val_loss, q_val_bpb = eval_val(
             args,
             model,
@@ -2829,21 +3727,22 @@ def main() -> None:
             world_size,
             device,
             grad_accum_steps,
-            val_tokens,
+            val_tokens_eval,
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
+            seq_len_override=eval_seq_len,
             max_seqs=args.final_eval_max_seqs,
         )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_q{args.export_quant_bits}_{used_codec}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     if final_eval_is_exact:
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_q{args.export_quant_bits}_{used_codec}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     else:
-        log0(f"final_int8_zlib_roundtrip_proxy val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_q{args.export_quant_bits}_{used_codec}_roundtrip_proxy val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     final_eval_ms = 1000.0 * (time.perf_counter() - t_qeval)
     metric0(
         "final_eval",
@@ -2851,7 +3750,8 @@ def main() -> None:
         val_bpb=q_val_bpb,
         eval_time_ms=final_eval_ms,
         exact=final_eval_is_exact,
-        eval_mode="sliding_window" if 0 < args.eval_stride < args.train_seq_len else "standard",
+        eval_mode="sliding_window" if uses_sliding_eval(args) else "standard",
+        eval_seq_len=eval_seq_len,
     )
 
     if master_process:
@@ -2884,8 +3784,9 @@ def main() -> None:
             "quant_stats": {key: int(value) for key, value in quant_stats.items()},
             "auto_keep_info": auto_keep_info,
             "final_eval": {
-                "mode": "sliding_window" if 0 < args.eval_stride < args.train_seq_len else "standard",
+                "mode": "sliding_window" if uses_sliding_eval(args) else "standard",
                 "exact": final_eval_is_exact,
+                "eval_seq_len": eval_seq_len,
                 "val_loss": q_val_loss,
                 "val_bpb": q_val_bpb,
                 "eval_time_ms": final_eval_ms,
