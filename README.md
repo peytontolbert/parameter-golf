@@ -28,8 +28,6 @@ Happy training!
 
 ## Leaderboard
 
-![Running best leaderboard score over submission time](assets/leaderboard-best-score-over-time.svg)
-
 | Run | Score | Author | Summary | Date | Info |
 |-----|------:|--------|---------|------|------|
 | 10L Int5-MLP + BigramHash(10240) | 1.1428 | thwu1 | 10 layers, mixed int5/int6 quantization, BigramHash(10240), SWA(0.4), WD=0.04 | 2026-03-20 | [info](records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/README.md) |
