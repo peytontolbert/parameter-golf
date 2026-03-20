@@ -1983,10 +1983,21 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0, use_xpos: bool = False, xpos_scale_base: float = 512.0):
+    # Supports NTK-aware scaling when evaluated beyond the training context.
+    def __init__(
+        self,
+        dim: int,
+        base: float = 10000.0,
+        use_xpos: bool = False,
+        xpos_scale_base: float = 512.0,
+        train_seq_len: int = 1024,
+    ):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.dim = dim
+        self.base = base
+        self.train_seq_len = max(int(train_seq_len), 1)
         self.use_xpos = use_xpos
         self.xpos_scale_base = xpos_scale_base
         xpos_scale = (torch.arange(0, dim, 2, dtype=torch.float32) + 0.4 * dim) / (1.4 * dim)
@@ -2004,7 +2015,15 @@ class Rotary(nn.Module):
             or self._cos_cached.device != device
         ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
+            if seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                adjusted_base = self.base * (scale ** (self.dim / max(self.dim - 2, 1)))
+                inv_freq = 1.0 / (
+                    adjusted_base ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+                )
+            else:
+                inv_freq = self.inv_freq.to(device)
+            freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             if self.use_xpos:
@@ -2085,6 +2104,7 @@ class CausalSelfAttention(nn.Module):
         dynamic_head_top_k: int = 0,
         dynamic_head_temperature: float = 1.0,
         use_subln: bool = False,
+        train_seq_len: int = 1024,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -2129,7 +2149,13 @@ class CausalSelfAttention(nn.Module):
         self.retention_gate = (
             nn.Parameter(torch.zeros(num_heads, self.head_dim, dtype=torch.float32)) if retention_output_gate else None
         ) if attention_variant == "retention" else None
-        self.rotary = Rotary(self.head_dim, base=rope_base, use_xpos=use_xpos, xpos_scale_base=xpos_scale_base)
+        self.rotary = Rotary(
+            self.head_dim,
+            base=rope_base,
+            use_xpos=use_xpos,
+            xpos_scale_base=xpos_scale_base,
+            train_seq_len=train_seq_len,
+        )
         self.register_buffer("alibi_slopes", _get_alibi_slopes(num_heads), persistent=False)
         self.relative_attention_bias = (
             nn.Parameter(torch.zeros(num_heads, relative_bias_num_buckets, dtype=torch.float32))
@@ -2494,6 +2520,7 @@ class Block(nn.Module):
         moe_num_experts: int,
         moe_top_k: int,
         moe_hidden: int,
+        train_seq_len: int,
     ):
         super().__init__()
         self.token_shift = token_shift
@@ -2525,6 +2552,7 @@ class Block(nn.Module):
             dynamic_head_top_k=dynamic_head_top_k,
             dynamic_head_temperature=dynamic_head_temperature,
             use_subln=use_subln,
+            train_seq_len=train_seq_len,
         )
         use_moe = moe_every_n_layers > 0 and ((layer_idx + 1) % moe_every_n_layers == 0)
         moe_inner_dim = moe_hidden if moe_hidden > 0 else (mlp_hidden if mlp_hidden > 0 else mlp_mult * dim)
@@ -2639,6 +2667,7 @@ class GPT(nn.Module):
         bigram_dim: int,
         orthogonal_init: bool,
         mup_proj_init: bool,
+        train_seq_len: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2733,6 +2762,7 @@ class GPT(nn.Module):
                     moe_num_experts=self.moe_num_experts,
                     moe_top_k=self.moe_top_k,
                     moe_hidden=self.moe_hidden,
+                    train_seq_len=train_seq_len,
                 )
                 for i in range(num_layers)
             ]
@@ -2770,6 +2800,7 @@ class GPT(nn.Module):
                     moe_num_experts=self.moe_num_experts,
                     moe_top_k=self.moe_top_k,
                     moe_hidden=self.moe_hidden,
+                    train_seq_len=train_seq_len,
                 )
                 for i in range(self.num_shared_layers)
             ]
@@ -3123,6 +3154,7 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         bigram_dim=args.bigram_dim,
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
+        train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     state = torch.load(args.distill_teacher_checkpoint, map_location="cpu")
     teacher.load_state_dict(state, strict=True)
@@ -3406,6 +3438,7 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
+        train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
