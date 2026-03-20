@@ -1994,6 +1994,15 @@ class CausalSelfAttention(nn.Module):
         self._alibi_bias_cache: Tensor | None = None
         self._alibi_bias_seq_len = 0
         self.last_dynamic_head_aux_loss = torch.tensor(0.0)
+        self.fast_path = (
+            not self.use_alibi
+            and not self.use_residual_attention
+            and self.memory_kv_slots == 0
+            and not self.use_relative_bias
+            and self.attention_variant == "attention"
+            and self.dynamic_head_router is None
+            and self.inner_attn_norm is None
+        )
 
     def _get_retention_bias(self, seq_len: int, total_k: int, device: torch.device, dtype: torch.dtype) -> Tensor:
         if self.retention_decay is None:
@@ -2128,6 +2137,30 @@ class CausalSelfAttention(nn.Module):
         if self.inner_attn_norm is not None:
             y = self.inner_attn_norm(y)
         return self.proj(y), next_attn_logits
+
+    def forward_simple(self, x: Tensor) -> Tensor:
+        if not self.fast_path:
+            raise RuntimeError("forward_simple requested for a non-fast attention block")
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin, scale = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin, scale=scale)
+        k = apply_rotary_emb(k, cos, sin, scale=scale, inverse_scale=True)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
 
 
 class MLP(nn.Module):
@@ -2288,6 +2321,7 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.pre_mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if macaron_layout else None
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.fast_path = not self.token_shift and self.pre_mlp is None and self.attn.fast_path
 
     def forward(self, x: Tensor, x0: Tensor, prev_attn_logits: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -2303,6 +2337,16 @@ class Block(nn.Module):
         mlp_scale = 0.5 if self.pre_mlp is not None else 1.0
         x = x * self.residual_alpha + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
         return x, next_attn_logits
+
+    def forward_simple(self, x: Tensor, x0: Tensor) -> Tensor:
+        if not self.fast_path:
+            raise RuntimeError("forward_simple requested for a non-fast block")
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn.forward_simple(self.attn_norm(x))
+        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
 
 
 class GPT(nn.Module):
@@ -2511,6 +2555,12 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.fast_features_path = (
+            self.register_tokens is None
+            and self.shared_loop_gates is None
+            and self.hyper_connection_gates is None
+            and all(block.fast_path for block in self.blocks)
+        )
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -2669,6 +2719,8 @@ class GPT(nn.Module):
         return x
 
     def _forward_features(self, input_ids: Tensor) -> Tensor:
+        if self.fast_features_path:
+            return self._forward_features_fast(input_ids)
         x = F.embedding(input_ids, self._embedding_weight())
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -2693,6 +2745,24 @@ class GPT(nn.Module):
         if self.num_register_tokens > 0:
             x = x[:, self.num_register_tokens :, :]
         return x
+
+    def _forward_features_fast(self, input_ids: Tensor) -> Tensor:
+        x = F.embedding(input_ids, self._embedding_weight())
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        if self.smear is not None:
+            x = self.smear(x)
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i].forward_simple(x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i].forward_simple(x, x0)
+        return self.final_norm(x)
 
     def forward(
         self,
