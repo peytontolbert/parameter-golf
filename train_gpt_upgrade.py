@@ -30,6 +30,14 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+
+    HAS_FLASH_ATTN_3 = True
+except Exception:
+    flash_attn_3_func = None
+    HAS_FLASH_ATTN_3 = False
+
+try:
     import zstandard
     HAS_ZSTD = True
 except ImportError:
@@ -149,6 +157,7 @@ class Hyperparameters:
     export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "0"))
     export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "0"))
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
+    use_flash_attn_3 = bool(int(os.environ.get("USE_FLASH_ATTN_3", "0")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", "8"))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.01"))
@@ -521,6 +530,7 @@ TRACKED_CONFIG_ENV_VARS = [
     "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
     "EXPORT_HIGH_PRECISION_MAX_TENSORS",
     "EXPORT_HIGH_PRECISION_MIN_NUMEL",
+    "USE_FLASH_ATTN_3",
     "TTT_ENABLED",
     "TTT_LORA_RANK",
     "TTT_LORA_LR",
@@ -2105,6 +2115,7 @@ class CausalSelfAttention(nn.Module):
         dynamic_head_temperature: float = 1.0,
         use_subln: bool = False,
         train_seq_len: int = 1024,
+        use_flash_attn_3: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -2122,6 +2133,7 @@ class CausalSelfAttention(nn.Module):
         self.attention_variant = attention_variant
         self.dynamic_head_top_k = max(0, min(int(dynamic_head_top_k), num_heads))
         self.dynamic_head_temperature = max(float(dynamic_head_temperature), 1e-4)
+        self.use_flash_attn_3 = bool(use_flash_attn_3 and HAS_FLASH_ATTN_3)
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
@@ -2184,6 +2196,16 @@ class CausalSelfAttention(nn.Module):
             and self.dynamic_head_router is None
             and self.inner_attn_norm is None
         )
+
+    def _flash_attn_3(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        if flash_attn_3_func is None:
+            raise RuntimeError("FA3 path requested but flash_attn_interface is unavailable")
+        return flash_attn_3_func(
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
+            v.transpose(1, 2).contiguous(),
+            causal=True,
+        ).transpose(1, 2).contiguous()
 
     def _get_retention_bias(self, seq_len: int, total_k: int, device: torch.device, dtype: torch.dtype) -> Tensor:
         if self.retention_decay is None:
@@ -2300,10 +2322,7 @@ class CausalSelfAttention(nn.Module):
             q = apply_rotary_emb(q, cos, sin, scale=scale)
             k = apply_rotary_emb(k, cos, sin, scale=scale, inverse_scale=True)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if self.num_kv_heads != self.num_heads:
-            repeat = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
+        gqa_repeat = self.num_heads // self.num_kv_heads if self.num_kv_heads != self.num_heads else 1
         if self.memory_kv_slots > 0:
             mem_k = self.mem_k.to(dtype=q.dtype)[None, :, :, :].expand(bsz, -1, -1, -1)
             mem_v = self.mem_v.to(dtype=q.dtype)[None, :, :, :].expand(bsz, -1, -1, -1)
@@ -2311,19 +2330,28 @@ class CausalSelfAttention(nn.Module):
             v = torch.cat((mem_v, v), dim=-2)
         next_attn_logits = None
         if self.use_residual_attention or self.memory_kv_slots > 0 or self.attention_variant == "retention":
+            if gqa_repeat > 1:
+                k = k.repeat_interleave(gqa_repeat, dim=1)
+                v = v.repeat_interleave(gqa_repeat, dim=1)
             y, next_attn_logits = self._manual_attention(q, k, v, prev_attn_logits, q.dtype)
         else:
             attn_bias = self._get_alibi_bias(seqlen, x.device, q.dtype) if self.use_alibi else None
             rel_bias = self._get_relative_bias(seqlen, x.device, q.dtype)
             if rel_bias is not None:
                 attn_bias = rel_bias if attn_bias is None else attn_bias + rel_bias
-            y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_bias,
-                is_causal=True,
-            )
+            if attn_bias is None and self.use_flash_attn_3:
+                y = self._flash_attn_3(q, k, v)
+            else:
+                if gqa_repeat > 1:
+                    k = k.repeat_interleave(gqa_repeat, dim=1)
+                    v = v.repeat_interleave(gqa_repeat, dim=1)
+                y = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_bias,
+                    is_causal=True,
+                )
         if head_gate is not None:
             y = y * head_gate.transpose(1, 2).unsqueeze(-1).to(dtype=y.dtype)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -2355,17 +2383,20 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, scale=scale)
         k = apply_rotary_emb(k, cos, sin, scale=scale, inverse_scale=True)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if self.num_kv_heads != self.num_heads:
-            repeat = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-        )
+        if self.use_flash_attn_3:
+            y = self._flash_attn_3(q, k, v)
+        else:
+            if self.num_kv_heads != self.num_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -2521,6 +2552,7 @@ class Block(nn.Module):
         moe_top_k: int,
         moe_hidden: int,
         train_seq_len: int,
+        use_flash_attn_3: bool,
     ):
         super().__init__()
         self.token_shift = token_shift
@@ -2553,6 +2585,7 @@ class Block(nn.Module):
             dynamic_head_temperature=dynamic_head_temperature,
             use_subln=use_subln,
             train_seq_len=train_seq_len,
+            use_flash_attn_3=use_flash_attn_3,
         )
         use_moe = moe_every_n_layers > 0 and ((layer_idx + 1) % moe_every_n_layers == 0)
         moe_inner_dim = moe_hidden if moe_hidden > 0 else (mlp_hidden if mlp_hidden > 0 else mlp_mult * dim)
@@ -2668,6 +2701,7 @@ class GPT(nn.Module):
         orthogonal_init: bool,
         mup_proj_init: bool,
         train_seq_len: int,
+        use_flash_attn_3: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2763,6 +2797,7 @@ class GPT(nn.Module):
                     moe_top_k=self.moe_top_k,
                     moe_hidden=self.moe_hidden,
                     train_seq_len=train_seq_len,
+                    use_flash_attn_3=use_flash_attn_3,
                 )
                 for i in range(num_layers)
             ]
@@ -2801,6 +2836,7 @@ class GPT(nn.Module):
                     moe_top_k=self.moe_top_k,
                     moe_hidden=self.moe_hidden,
                     train_seq_len=train_seq_len,
+                    use_flash_attn_3=use_flash_attn_3,
                 )
                 for i in range(self.num_shared_layers)
             ]
@@ -3155,6 +3191,7 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
+        use_flash_attn_3=args.use_flash_attn_3,
     ).to(device).bfloat16()
     state = torch.load(args.distill_teacher_checkpoint, map_location="cpu")
     teacher.load_state_dict(state, strict=True)
@@ -3439,6 +3476,7 @@ def main() -> None:
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
+        use_flash_attn_3=args.use_flash_attn_3,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -3525,6 +3563,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"flash_attn_3:requested:{args.use_flash_attn_3} available:{HAS_FLASH_ATTN_3}")
     log0(f"torch_compile:{args.enable_torch_compile}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
