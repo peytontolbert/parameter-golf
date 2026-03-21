@@ -89,6 +89,8 @@ class Hyperparameters:
     runtime_policy = os.environ.get("RUNTIME_POLICY", "").strip().lower()
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    rope_dims = int(os.environ.get("ROPE_DIMS", "0"))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "1")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 512))
@@ -150,6 +152,8 @@ class Hyperparameters:
     fake_quant_tail_steps = int(os.environ.get("FAKE_QUANT_TAIL_STEPS", "0"))
     fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", "8"))
     fake_quant_full_run = bool(int(os.environ.get("FAKE_QUANT_FULL_RUN", "0")))
+    late_qat = bool(int(os.environ.get("LATE_QAT", "0")))
+    qat_threshold = float(os.environ.get("QAT_THRESHOLD", "0.1"))
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", "0"))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))
@@ -224,6 +228,8 @@ class Hyperparameters:
             "train_batch_tokens": "TRAIN_BATCH_TOKENS",
             "num_layers": "NUM_LAYERS",
             "mlp_hidden": "MLP_HIDDEN",
+            "rope_dims": "ROPE_DIMS",
+            "ln_scale": "LN_SCALE",
             "tied_embed_lr": "TIED_EMBED_LR",
             "matrix_lr": "MATRIX_LR",
             "scalar_lr": "SCALAR_LR",
@@ -239,6 +245,8 @@ class Hyperparameters:
             "fake_quant_tail_steps": "FAKE_QUANT_TAIL_STEPS",
             "fake_quant_bits": "FAKE_QUANT_BITS",
             "fake_quant_full_run": "FAKE_QUANT_FULL_RUN",
+            "late_qat": "LATE_QAT",
+            "qat_threshold": "QAT_THRESHOLD",
             "int8_auto_keep_budget_bytes": "INT8_AUTO_KEEP_BUDGET_BYTES",
             "int8_auto_keep_max_tensors": "INT8_AUTO_KEEP_MAX_TENSORS",
             "int8_auto_keep_row_budget_bytes": "INT8_AUTO_KEEP_ROW_BUDGET_BYTES",
@@ -549,6 +557,8 @@ TRACKED_CONFIG_ENV_VARS = [
     "RUNTIME_POLICY",
     "MAX_WALLCLOCK_SECONDS",
     "QK_GAIN_INIT",
+    "ROPE_DIMS",
+    "LN_SCALE",
     "ENABLE_TORCH_COMPILE",
     "EVAL_STRIDE",
     "EVAL_BATCH_SEQS",
@@ -610,6 +620,8 @@ TRACKED_CONFIG_ENV_VARS = [
     "FAKE_QUANT_TAIL_STEPS",
     "FAKE_QUANT_BITS",
     "FAKE_QUANT_FULL_RUN",
+    "LATE_QAT",
+    "QAT_THRESHOLD",
     "USE_SMEAR_GATE",
     "BIGRAM_VOCAB_SIZE",
     "BIGRAM_DIM",
@@ -2175,6 +2187,25 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, scale: Tensor | None =
     return rot / full_scale if inverse_scale else rot * full_scale
 
 
+def apply_partial_rotary_emb(
+    x: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    rope_dims: int,
+    scale: Tensor | None = None,
+    inverse_scale: bool = False,
+) -> Tensor:
+    rope_dims = max(int(rope_dims), 0)
+    if rope_dims <= 0:
+        return x
+    if rope_dims >= x.size(-1):
+        return apply_rotary_emb(x, cos, sin, scale=scale, inverse_scale=inverse_scale)
+    rot_x = x[..., :rope_dims]
+    tail_x = x[..., rope_dims:]
+    rot = apply_rotary_emb(rot_x, cos[..., : rope_dims // 2], sin[..., : rope_dims // 2], scale=scale, inverse_scale=inverse_scale)
+    return torch.cat((rot, tail_x), dim=-1)
+
+
 def _get_alibi_slopes(num_heads: int) -> Tensor:
     def get_slopes_power_of_2(n: int) -> list[float]:
         start = 2.0 ** (-(2.0 ** -(math.log2(n) - 3)))
@@ -2235,6 +2266,7 @@ class CausalSelfAttention(nn.Module):
         use_subln: bool = False,
         train_seq_len: int = 1024,
         use_flash_attn_3: bool = False,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -2256,6 +2288,9 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = self.head_dim if rope_dims <= 0 else min(int(rope_dims), self.head_dim)
+        if self.rope_dims % 2 != 0:
+            raise ValueError("rope_dims must be even")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -2281,7 +2316,7 @@ class CausalSelfAttention(nn.Module):
             nn.Parameter(torch.zeros(num_heads, self.head_dim, dtype=torch.float32)) if retention_output_gate else None
         ) if attention_variant == "retention" else None
         self.rotary = Rotary(
-            self.head_dim,
+            self.rope_dims,
             base=rope_base,
             use_xpos=use_xpos,
             xpos_scale_base=xpos_scale_base,
@@ -2438,8 +2473,8 @@ class CausalSelfAttention(nn.Module):
         k = F.rms_norm(k, (k.size(-1),))
         if not self.use_alibi:
             cos, sin, scale = self.rotary(seqlen, x.device, q.dtype)
-            q = apply_rotary_emb(q, cos, sin, scale=scale)
-            k = apply_rotary_emb(k, cos, sin, scale=scale, inverse_scale=True)
+            q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
+            k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         gqa_repeat = self.num_heads // self.num_kv_heads if self.num_kv_heads != self.num_heads else 1
         if self.memory_kv_slots > 0:
@@ -2499,8 +2534,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin, scale = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, scale=scale)
-        k = apply_rotary_emb(k, cos, sin, scale=scale, inverse_scale=True)
+        q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
+        k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if self.use_flash_attn_3:
             y = self._flash_attn_3(q, k, v)
@@ -2702,6 +2737,8 @@ class Block(nn.Module):
         moe_hidden: int,
         train_seq_len: int,
         use_flash_attn_3: bool,
+        rope_dims: int,
+        ln_scale: bool,
     ):
         super().__init__()
         self.token_shift = token_shift
@@ -2709,6 +2746,7 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         self.attention_variant = attention_variant
         self.residual_alpha = float(residual_alpha)
+        self.norm_scale = (1.0 / math.sqrt(layer_idx + 1)) if ln_scale else 1.0
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.pre_mlp_norm = RMSNorm()
@@ -2735,6 +2773,7 @@ class Block(nn.Module):
             use_subln=use_subln,
             train_seq_len=train_seq_len,
             use_flash_attn_3=use_flash_attn_3,
+            rope_dims=rope_dims,
         )
         use_moe = moe_every_n_layers > 0 and ((layer_idx + 1) % moe_every_n_layers == 0)
         moe_inner_dim = moe_hidden if moe_hidden > 0 else (mlp_hidden if mlp_hidden > 0 else mlp_mult * dim)
@@ -2759,14 +2798,21 @@ class Block(nn.Module):
         v_lora: BatchedLinearLoRA | None = None,
     ) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
+        norm_scale = self.norm_scale
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.pre_mlp is not None and self.pre_mlp_scale is not None:
             pre_mlp_in = apply_token_shift(x) if self.token_shift else x
-            pre_mlp_out = 0.5 * self.pre_mlp_scale.to(dtype=x.dtype)[None, None, :] * self.pre_mlp(self.pre_mlp_norm(pre_mlp_in))
+            pre_mlp_normed = self.pre_mlp_norm(pre_mlp_in)
+            if norm_scale != 1.0:
+                pre_mlp_normed = pre_mlp_normed * norm_scale
+            pre_mlp_out = 0.5 * self.pre_mlp_scale.to(dtype=x.dtype)[None, None, :] * self.pre_mlp(pre_mlp_normed)
             x = x * self.residual_alpha + pre_mlp_out
         x_in = apply_token_shift(x) if self.token_shift else x
+        attn_normed = self.attn_norm(x_in)
+        if norm_scale != 1.0:
+            attn_normed = attn_normed * norm_scale
         attn_out, next_attn_logits = self.attn(
-            self.attn_norm(x_in),
+            attn_normed,
             prev_attn_logits=prev_attn_logits,
             q_lora=q_lora,
             v_lora=v_lora,
@@ -2774,7 +2820,10 @@ class Block(nn.Module):
         x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_in = apply_token_shift(x) if self.token_shift else x
         mlp_scale = 0.5 if self.pre_mlp is not None else 1.0
-        x = x * self.residual_alpha + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(mlp_in))
+        mlp_normed = self.mlp_norm(mlp_in)
+        if norm_scale != 1.0:
+            mlp_normed = mlp_normed * norm_scale
+        x = x * self.residual_alpha + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
         return x, next_attn_logits
 
     def forward_simple(
@@ -2787,10 +2836,17 @@ class Block(nn.Module):
         if not self.fast_path:
             raise RuntimeError("forward_simple requested for a non-fast block")
         mix = self.resid_mix.to(dtype=x.dtype)
+        norm_scale = self.norm_scale
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn.forward_simple(self.attn_norm(x), q_lora=q_lora, v_lora=v_lora)
+        attn_normed = self.attn_norm(x)
+        if norm_scale != 1.0:
+            attn_normed = attn_normed * norm_scale
+        attn_out = self.attn.forward_simple(attn_normed, q_lora=q_lora, v_lora=v_lora)
         x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_normed = self.mlp_norm(x)
+        if norm_scale != 1.0:
+            mlp_normed = mlp_normed * norm_scale
+        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
         return x
 
 
@@ -2851,6 +2907,8 @@ class GPT(nn.Module):
         mup_proj_init: bool,
         train_seq_len: int,
         use_flash_attn_3: bool,
+        rope_dims: int,
+        ln_scale: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2890,6 +2948,8 @@ class GPT(nn.Module):
         self.hyper_connection_layers = max(int(hyper_connection_layers), 0)
         self.hyper_connection_gate_init = hyper_connection_gate_init
         self.use_smear_gate = use_smear_gate
+        self.rope_dims = max(int(rope_dims), 0)
+        self.ln_scale = bool(ln_scale)
         self.orthogonal_init = orthogonal_init
         self.mup_proj_init = mup_proj_init
         self.ttt_config = {
@@ -2954,6 +3014,8 @@ class GPT(nn.Module):
                     moe_hidden=self.moe_hidden,
                     train_seq_len=train_seq_len,
                     use_flash_attn_3=use_flash_attn_3,
+                    rope_dims=self.rope_dims,
+                    ln_scale=self.ln_scale,
                 )
                 for i in range(num_layers)
             ]
@@ -2993,6 +3055,8 @@ class GPT(nn.Module):
                     moe_hidden=self.moe_hidden,
                     train_seq_len=train_seq_len,
                     use_flash_attn_3=use_flash_attn_3,
+                    rope_dims=self.rope_dims,
+                    ln_scale=self.ln_scale,
                 )
                 for i in range(self.num_shared_layers)
             ]
@@ -3348,6 +3412,8 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
         use_flash_attn_3=args.use_flash_attn_3,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     state = torch.load(args.distill_teacher_checkpoint, map_location="cpu")
     teacher.load_state_dict(state, strict=True)
@@ -3357,10 +3423,12 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
     return teacher
 
 
-def fake_quant_active(args: Hyperparameters, step: int, elapsed_ms: float) -> bool:
+def fake_quant_active(args: Hyperparameters, step: int, elapsed_ms: float, lr_scale: float) -> bool:
     if args.fake_quant_bits <= 0:
         return False
     if args.fake_quant_full_run:
+        return True
+    if args.late_qat and lr_scale <= args.qat_threshold:
         return True
     if args.fake_quant_tail_steps <= 0:
         return False
@@ -3633,6 +3701,8 @@ def main() -> None:
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
         use_flash_attn_3=args.use_flash_attn_3,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -3773,6 +3843,7 @@ def main() -> None:
         f"resid_mix_phase_init:{args.resid_mix_phase_init} "
         f"resid_mix_phase_sharpness:{args.resid_mix_phase_sharpness}"
     )
+    log0(f"rope_norm:rope_dims:{args.rope_dims} ln_scale:{args.ln_scale}")
     log0(f"cheap_biases:use_alibi:{args.use_alibi} token_shift:{args.token_shift}")
     log0(
         f"context_ext:use_xpos:{args.use_xpos} xpos_scale_base:{args.xpos_scale_base} "
@@ -3811,7 +3882,7 @@ def main() -> None:
     )
     log0(
         f"fake_quant:bits:{args.fake_quant_bits} tail_steps:{args.fake_quant_tail_steps} "
-        f"full_run:{args.fake_quant_full_run}"
+        f"full_run:{args.fake_quant_full_run} late_qat:{args.late_qat} qat_threshold:{args.qat_threshold}"
     )
     log0(
         f"token_enrich:use_smear_gate:{args.use_smear_gate} "
@@ -4053,7 +4124,7 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        base_model.set_fake_quant(args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms) else 0)
+        base_model.set_fake_quant(args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms, scale) else 0)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
