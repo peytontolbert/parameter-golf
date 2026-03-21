@@ -456,6 +456,7 @@ class Hyperparameters:
                 "optimizer_policy": "record_2048",
                 "eval_policy": "sliding64",
                 "runtime_policy": "compiled",
+                "warmdown_iters": 3000,
                 "use_flash_attn_3": True,
                 "fake_quant_full_run": False,
                 "export_quant_bits": 6,
