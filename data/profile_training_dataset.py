@@ -171,6 +171,59 @@ def build_base_bytes(tokenizer_path: str, vocab_size: int) -> np.ndarray | None:
     raise ValueError(f"Unsupported tokenizer format: {tokenizer_path}")
 
 
+def build_tokenizer_metadata(tokenizer_path: str, vocab_size: int) -> list[dict[str, object]] | None:
+    if not tokenizer_path:
+        return None
+    path = Path(tokenizer_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+
+    meta: list[dict[str, object]] = [
+        {"piece": None, "rendered": None, "byte_len": 0, "usable": False, "leading_space": False}
+        for _ in range(vocab_size)
+    ]
+    if path.suffix == ".model":
+        if spm is None:
+            raise RuntimeError("sentencepiece is not installed")
+        sp = spm.SentencePieceProcessor(model_file=str(path))
+        for token_id in range(min(vocab_size, int(sp.vocab_size()))):
+            if sp.is_control(token_id) or sp.is_unknown(token_id) or sp.is_unused(token_id):
+                continue
+            piece = sp.id_to_piece(token_id)
+            leading_space = piece.startswith("▁")
+            rendered = (" " + piece[1:]) if leading_space else piece
+            meta[token_id] = {
+                "piece": piece,
+                "rendered": rendered,
+                "byte_len": len(rendered.encode("utf-8")),
+                "usable": True,
+                "leading_space": leading_space,
+            }
+        return meta
+
+    if path.suffix == ".json":
+        if Tokenizer is None:
+            raise RuntimeError("tokenizers is not installed")
+        tok = Tokenizer.from_file(str(path))
+        vocab = tok.get_vocab(with_added_tokens=True)
+        inverse_vocab = {idx: token for token, idx in vocab.items()}
+        for token_id in range(vocab_size):
+            token = inverse_vocab.get(token_id)
+            if token is None:
+                continue
+            rendered = token.replace("Ġ", " ").replace("▁", " ")
+            meta[token_id] = {
+                "piece": token,
+                "rendered": rendered,
+                "byte_len": len(rendered.encode("utf-8")),
+                "usable": True,
+                "leading_space": token.startswith(("Ġ", "▁")),
+            }
+        return meta
+
+    raise ValueError(f"Unsupported tokenizer format: {tokenizer_path}")
+
+
 def entropy_from_counts(counts: np.ndarray) -> float:
     total = int(counts.sum())
     if total <= 0:
@@ -337,6 +390,95 @@ def top_bigrams(tokens: np.ndarray, vocab_size: int, k: int) -> list[dict[str, i
             }
         )
     return out
+
+
+def tokenizer_merge_candidates(
+    tokens: np.ndarray,
+    vocab_size: int,
+    tokenizer_meta: list[dict[str, object]] | None,
+    k: int,
+) -> list[dict[str, object]]:
+    if tokenizer_meta is None or tokens.size < 2:
+        return []
+    pair_ids = tokens[:-1].astype(np.int64) * vocab_size + tokens[1:].astype(np.int64)
+    counts = np.bincount(pair_ids, minlength=vocab_size * vocab_size)
+    ranked = np.argsort(counts)[::-1]
+    out: list[dict[str, object]] = []
+    seen_merged: set[str] = set()
+    for flat in ranked:
+        count = int(counts[flat])
+        if count <= 1:
+            break
+        left = int(flat // vocab_size)
+        right = int(flat % vocab_size)
+        left_meta = tokenizer_meta[left]
+        right_meta = tokenizer_meta[right]
+        if not bool(left_meta["usable"]) or not bool(right_meta["usable"]):
+            continue
+        if bool(right_meta["leading_space"]):
+            continue
+        left_rendered = str(left_meta["rendered"])
+        right_rendered = str(right_meta["rendered"])
+        if not left_rendered or not right_rendered:
+            continue
+        merged_rendered = left_rendered + right_rendered
+        if merged_rendered in seen_merged:
+            continue
+        seen_merged.add(merged_rendered)
+        merged_byte_len = len(merged_rendered.encode("utf-8"))
+        out.append(
+            {
+                "left": left,
+                "right": right,
+                "count": count,
+                "left_piece": str(left_meta["piece"]),
+                "right_piece": str(right_meta["piece"]),
+                "left_rendered": left_rendered,
+                "right_rendered": right_rendered,
+                "merged_rendered": merged_rendered,
+                "merged_byte_len": merged_byte_len,
+                "estimated_token_reduction": count,
+                "byte_mass": int(count * merged_byte_len),
+            }
+        )
+        if len(out) >= k:
+            break
+    return out
+
+
+def tokenizer_budget_analysis(
+    candidates: list[dict[str, object]],
+    budget_options: list[int],
+    model_dim: int,
+    current_vocab_size: int,
+    submission_limit_bytes: int,
+    code_size_bytes: int,
+    current_artifact_bytes: int | None,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    ranked = sorted(candidates, key=lambda item: int(item["byte_mass"]), reverse=True)
+    for add_tokens in budget_options:
+        if add_tokens <= 0:
+            continue
+        chosen = ranked[:add_tokens]
+        extra_embedding_bytes = int(add_tokens * model_dim * 2)
+        projected_artifact = None if current_artifact_bytes is None else int(current_artifact_bytes + extra_embedding_bytes)
+        projected_headroom = None if projected_artifact is None else int(submission_limit_bytes - code_size_bytes - projected_artifact)
+        rows.append(
+            {
+                "extra_vocab_tokens": int(add_tokens),
+                "projected_vocab_size": int(current_vocab_size + add_tokens),
+                "candidate_count_used": int(len(chosen)),
+                "estimated_token_reduction": int(sum(int(item["estimated_token_reduction"]) for item in chosen)),
+                "estimated_byte_mass_covered": int(sum(int(item["byte_mass"]) for item in chosen)),
+                "extra_embedding_bytes_fp16_tied": extra_embedding_bytes,
+                "projected_artifact_bytes_excluding_code": projected_artifact,
+                "projected_submission_headroom_after_code": projected_headroom,
+                "fits_submission_limit_estimate": None if projected_headroom is None else bool(projected_headroom >= 0),
+                "top_merged_rendered": [str(item["merged_rendered"]) for item in chosen[: min(8, len(chosen))]],
+            }
+        )
+    return rows
 
 
 def shard_summaries(
@@ -1717,6 +1859,7 @@ def summarize_recommendations(
     loss_shape: dict[str, object] | None = None,
     observed_frontier: list[dict[str, object]] | None = None,
     leaderboard_frontier: list[dict[str, object]] | None = None,
+    tokenizer_merge_summary: dict[str, object] | None = None,
 ) -> list[str]:
     recs: list[str] = []
     long_lag_nmi = [m.normalized_mi for m in lag_stats if m.lag >= 512]
@@ -1746,6 +1889,18 @@ def summarize_recommendations(
             recs.append("Average bytes per token are high; tokenizer redesign may be a strong lever.")
         elif bytes_per_token <= 2.8:
             recs.append("Tokenizer compression already looks decent; focus on modeling and post-quant export interaction first.")
+    if tokenizer_merge_summary is not None:
+        best_small_budget = tokenizer_merge_summary.get("best_small_budget")
+        if isinstance(best_small_budget, dict):
+            add_tokens = int(best_small_budget.get("extra_vocab_tokens", 0))
+            token_reduction = int(best_small_budget.get("estimated_token_reduction", 0))
+            fits = best_small_budget.get("fits_submission_limit_estimate")
+            if add_tokens > 0 and token_reduction > 0:
+                fit_text = "and stays within the estimated artifact budget." if fits is True else "but needs artifact-size verification."
+                recs.append(
+                    f"A tiny tokenizer bump looks plausible: +{add_tokens} merges targets high-mass recurrent substrings "
+                    f"(proxy {token_reduction} token events) {fit_text}"
+                )
     if shard_aggregate is not None and shard_aggregate.get("max_js_divergence_bits", 0.0) >= 0.02:
         recs.append("Shard drift is non-trivial; TTT or mild domain-adaptive evaluation may benefit more than a one-size-fits-all context setting.")
     if eval_candidates:
@@ -1867,6 +2022,12 @@ def main() -> None:
         default="",
         help="Comma-separated candidate model specs: name:num_layers:model_dim:mlp_hidden[:num_heads:num_kv_heads[:vocab_size]]",
     )
+    parser.add_argument("--tokenizer-candidate-count", type=int, default=64)
+    parser.add_argument("--tokenizer-budget-options", default="16,32,64")
+    parser.add_argument("--model-dim", type=int, default=512)
+    parser.add_argument("--current-artifact-bytes", type=int, default=0)
+    parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000)
+    parser.add_argument("--assumed-code-bytes", type=int, default=200_000)
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()
 
@@ -1883,6 +2044,7 @@ def main() -> None:
     reuse_stats = context_reuse_profile(sequential_tokens, parse_int_list(args.reuse_windows))
 
     base_bytes = build_base_bytes(args.tokenizer_path, args.vocab_size) if args.tokenizer_path else None
+    tokenizer_meta = build_tokenizer_metadata(args.tokenizer_path, args.vocab_size) if args.tokenizer_path else None
     bytes_per_token = None if base_bytes is None else float(base_bytes[distribution_tokens].mean())
     shard_summary_rows, shard_aggregate = shard_summaries(files, args.vocab_size, args.sample_tokens_per_shard, base_bytes)
     eval_candidates = eval_length_candidates(sequential_tokens, parse_int_list(args.eval_lengths))
@@ -1953,6 +2115,25 @@ def main() -> None:
         ttt_multipliers=parse_float_list(args.ttt_multipliers),
     )
     transition_geometry = transition_geometry_profile(sequential_tokens, args.vocab_size, token_counts, args.top_k)
+    tokenizer_candidates = tokenizer_merge_candidates(
+        sequential_tokens,
+        args.vocab_size,
+        tokenizer_meta,
+        args.tokenizer_candidate_count,
+    )
+    tokenizer_budget = tokenizer_budget_analysis(
+        tokenizer_candidates,
+        parse_int_list(args.tokenizer_budget_options),
+        model_dim=args.model_dim,
+        current_vocab_size=args.vocab_size,
+        submission_limit_bytes=args.submission_limit_bytes,
+        code_size_bytes=args.assumed_code_bytes,
+        current_artifact_bytes=(args.current_artifact_bytes if args.current_artifact_bytes > 0 else None),
+    )
+    tokenizer_merge_summary = {
+        "candidate_count": int(len(tokenizer_candidates)),
+        "best_small_budget": tokenizer_budget[0] if tokenizer_budget else None,
+    }
     loss_shape = loss_geometry_surface(
         lag_stats=lag_stats,
         reuse_stats=reuse_stats,
@@ -2115,6 +2296,8 @@ def main() -> None:
         },
         "tokenizer_profile": {
             "bytes_per_token": bytes_per_token,
+            "candidate_merges": tokenizer_candidates,
+            "budget_analysis": tokenizer_budget,
         },
         "recommendations": summarize_recommendations(
             lag_stats,
@@ -2128,6 +2311,7 @@ def main() -> None:
             loss_shape=loss_shape,
             observed_frontier=observed_frontier,
             leaderboard_frontier=leaderboard_analysis,
+            tokenizer_merge_summary=tokenizer_merge_summary,
         ),
         "limitations": [
             "Binary shards do not preserve explicit document boundaries, so document-level TTT fit is inferred indirectly from stream statistics.",
