@@ -157,7 +157,7 @@ class Hyperparameters:
     export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "0"))
     export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "0"))
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
-    use_flash_attn_3 = bool(int(os.environ.get("USE_FLASH_ATTN_3", "0")))
+    use_flash_attn_3 = bool(int(os.environ.get("USE_FLASH_ATTN_3", "1")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", "8"))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.01"))
@@ -241,6 +241,12 @@ class Hyperparameters:
             "export_high_precision_budget_bytes": "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
             "export_high_precision_max_tensors": "EXPORT_HIGH_PRECISION_MAX_TENSORS",
             "export_high_precision_min_numel": "EXPORT_HIGH_PRECISION_MIN_NUMEL",
+            "ttt_enabled": "TTT_ENABLED",
+            "ttt_lora_rank": "TTT_LORA_RANK",
+            "ttt_lora_lr": "TTT_LORA_LR",
+            "ttt_chunk_size": "TTT_CHUNK_SIZE",
+            "ttt_eval_seq_len": "TTT_EVAL_SEQ_LEN",
+            "ttt_batch_size": "TTT_BATCH_SIZE",
         }
 
     def _apply_schema_values(self, values: dict[str, object]) -> None:
@@ -420,6 +426,30 @@ class Hyperparameters:
                 "precision_policy": "export_plus",
                 "eval_policy": "sliding64",
                 "runtime_policy": "compiled",
+            },
+            "peak_ttt_10l": {
+                "recipe_family": "top_recipe_10l",
+                "curriculum_policy": "top_recipe_8k",
+                "data_policy": "sequential",
+                "optimizer_policy": "top_recipe",
+                "eval_policy": "sliding64_2048",
+                "runtime_policy": "compiled",
+                "num_kv_heads": 1,
+                "train_seq_len": 1024,
+                "eval_seq_len": 2048,
+                "train_batch_tokens": 786432,
+                "use_smear_gate": True,
+                "bigram_vocab_size": 0,
+                "use_xpos": False,
+                "fake_quant_full_run": False,
+                "export_quant_bits": 6,
+                "export_codec": "zstd",
+                "ttt_enabled": True,
+                "ttt_lora_rank": 8,
+                "ttt_lora_lr": 0.01,
+                "ttt_chunk_size": 256,
+                "ttt_eval_seq_len": 2048,
+                "ttt_batch_size": 32,
             },
         }
         if self.training_preset not in preset_aliases:
