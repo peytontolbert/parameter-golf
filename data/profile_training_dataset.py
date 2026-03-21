@@ -22,7 +22,9 @@ import glob
 import importlib.util
 import json
 import math
+import os
 import re
+import tempfile
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -222,6 +224,204 @@ def build_tokenizer_metadata(tokenizer_path: str, vocab_size: int) -> list[dict[
         return meta
 
     raise ValueError(f"Unsupported tokenizer format: {tokenizer_path}")
+
+
+def reconstruct_text_from_tokens(tokens: np.ndarray, tokenizer_meta: list[dict[str, object]] | None) -> str | None:
+    if tokenizer_meta is None:
+        return None
+    pieces: list[str] = []
+    for token_id in map(int, tokens):
+        if token_id < 0 or token_id >= len(tokenizer_meta):
+            continue
+        meta = tokenizer_meta[token_id]
+        rendered = meta.get("rendered")
+        if not isinstance(rendered, str):
+            continue
+        pieces.append(rendered)
+    if not pieces:
+        return None
+    return "".join(pieces)
+
+
+def evaluate_tokenizer_on_text(tokenizer_path: Path, text: str, trainer_family: str) -> dict[str, object]:
+    encoded_ids: list[int]
+    vocab_size: int
+    if tokenizer_path.suffix == ".model":
+        if spm is None:
+            raise RuntimeError("sentencepiece is not installed")
+        sp = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
+        encoded_ids = list(sp.encode(text, out_type=int))
+        vocab_size = int(sp.vocab_size())
+    elif tokenizer_path.suffix == ".json":
+        if Tokenizer is None:
+            raise RuntimeError("tokenizers is not installed")
+        tok = Tokenizer.from_file(str(tokenizer_path))
+        encoding = tok.encode(text)
+        encoded_ids = list(encoding.ids)
+        vocab_size = int(tok.get_vocab_size(with_added_tokens=True))
+    else:
+        raise ValueError(f"Unsupported tokenizer format: {tokenizer_path}")
+    byte_count = len(text.encode("utf-8"))
+    token_count = len(encoded_ids)
+    tokens_per_byte = float(token_count / max(byte_count, 1))
+    bytes_per_token = float(byte_count / max(token_count, 1))
+    counts = np.bincount(np.asarray(encoded_ids, dtype=np.int32), minlength=max(vocab_size, 1)).astype(np.int64)
+    entropy_bits = entropy_from_counts(counts)
+    return {
+        "tokenizer_path": str(tokenizer_path),
+        "family": trainer_family,
+        "vocab_size": vocab_size,
+        "byte_count": int(byte_count),
+        "token_count": int(token_count),
+        "bytes_per_token": bytes_per_token,
+        "tokens_per_byte": tokens_per_byte,
+        "entropy_bits": float(entropy_bits),
+        "effective_vocab": float(2.0**entropy_bits),
+    }
+
+
+def train_local_tokenizer_candidates(
+    text: str | None,
+    output_dir: Path,
+    vocab_sizes: list[int],
+    trainer_families: list[str],
+    current_vocab_size: int,
+    model_dim: int,
+    current_bytes_per_token: float | None,
+) -> dict[str, object]:
+    if not text:
+        return {"available": False, "reason": "reconstructed_text_unavailable"}
+    if len(text.strip()) < 1024:
+        return {"available": False, "reason": "reconstructed_text_too_small"}
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample_path = output_dir / "tokenizer_profile_sample.txt"
+    wrapped_text = "\n".join(text[idx : idx + 2048] for idx in range(0, len(text), 2048))
+    sample_path.write_text(wrapped_text, encoding="utf-8")
+    results: list[dict[str, object]] = []
+
+    for family in trainer_families:
+        normalized_family = family.strip().lower()
+        if not normalized_family:
+            continue
+        for vocab_size in vocab_sizes:
+            if vocab_size <= 0:
+                continue
+            prefix = output_dir / f"{normalized_family}_{vocab_size}"
+            try:
+                if normalized_family in {"sp_bpe", "sp_unigram"}:
+                    if spm is None:
+                        raise RuntimeError("sentencepiece_not_installed")
+                    model_type = "bpe" if normalized_family == "sp_bpe" else "unigram"
+                    spm.SentencePieceTrainer.train(
+                        input=str(sample_path),
+                        model_prefix=str(prefix),
+                        vocab_size=int(vocab_size),
+                        model_type=model_type,
+                        character_coverage=1.0,
+                        bos_id=-1,
+                        eos_id=-1,
+                        pad_id=-1,
+                        unk_id=0,
+                        train_extremely_large_corpus=False,
+                    )
+                    artifact_path = prefix.with_suffix(".model")
+                elif normalized_family == "hf_bpe":
+                    if Tokenizer is None:
+                        raise RuntimeError("tokenizers_not_installed")
+                    from tokenizers import Tokenizer as HFTokenizer
+                    from tokenizers import models, pre_tokenizers, trainers
+
+                    tokenizer = HFTokenizer(models.BPE(unk_token="[UNK]"))
+                    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+                    trainer = trainers.BpeTrainer(
+                        vocab_size=int(vocab_size),
+                        min_frequency=2,
+                        special_tokens=["[UNK]"],
+                        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+                    )
+                    tokenizer.train([str(sample_path)], trainer)
+                    artifact_path = prefix.with_suffix(".json")
+                    tokenizer.save(str(artifact_path))
+                else:
+                    continue
+
+                metrics = evaluate_tokenizer_on_text(artifact_path, text, normalized_family)
+                token_count = int(metrics["token_count"])
+                baseline_token_count = None
+                estimated_token_change_frac = None
+                if current_bytes_per_token is not None and current_bytes_per_token > 0:
+                    baseline_token_count = len(text.encode("utf-8")) / current_bytes_per_token
+                    estimated_token_change_frac = (token_count / max(baseline_token_count, 1.0)) - 1.0
+                embedding_param_delta = (int(vocab_size) - int(current_vocab_size)) * int(model_dim)
+                metrics.update(
+                    {
+                        "estimated_token_change_fraction_vs_current": None
+                        if estimated_token_change_frac is None
+                        else float(estimated_token_change_frac),
+                        "embedding_param_delta": int(embedding_param_delta),
+                        "artifact_bytes": int(artifact_path.stat().st_size) if artifact_path.exists() else None,
+                    }
+                )
+                results.append(metrics)
+            except Exception as exc:
+                results.append(
+                    {
+                        "family": normalized_family,
+                        "vocab_size": int(vocab_size),
+                        "available": False,
+                        "reason": f"{type(exc).__name__}:{exc}",
+                    }
+                )
+
+    viable = [row for row in results if row.get("bytes_per_token") is not None]
+    for row in viable:
+        token_reduction_fraction = max(0.0, -float(row.get("estimated_token_change_fraction_vs_current") or 0.0))
+        embedding_penalty = max(int(row.get("embedding_param_delta") or 0), 0) / max(float(model_dim * 1024 * 1024), 1.0)
+        artifact_penalty = max(int(row.get("artifact_bytes") or 0) - 100_000, 0) / 1_000_000.0
+        conservative_bonus = 0.02 if int(row["vocab_size"]) == int(current_vocab_size) else 0.0
+        if int(row["vocab_size"]) == int(current_vocab_size) + 1024:
+            conservative_bonus -= 0.01
+        row["token_reduction_fraction_vs_current"] = float(token_reduction_fraction)
+        row["training_usefulness_score"] = float(token_reduction_fraction - 0.25 * embedding_penalty - 0.10 * artifact_penalty)
+        row["conservative_score"] = float(token_reduction_fraction - 0.50 * embedding_penalty - 0.20 * artifact_penalty + conservative_bonus)
+
+    best_by_training = sorted(
+        viable,
+        key=lambda row: (
+            -float(row["training_usefulness_score"]),
+            int(row["token_count"]),
+            int(row["artifact_bytes"] or 0),
+        ),
+    )
+    best_conservative = sorted(
+        viable,
+        key=lambda row: (
+            -float(row["conservative_score"]),
+            abs(int(row["vocab_size"]) - int(current_vocab_size)),
+            int(row["artifact_bytes"] or 0),
+        ),
+    )
+    best_by_bytes = sorted(
+        viable,
+        key=lambda row: (
+            float(row["bytes_per_token"]),
+            abs(int(row["vocab_size"]) - int(current_vocab_size)),
+        ),
+    )
+    return {
+        "available": bool(viable),
+        "sample_text_bytes": len(text.encode("utf-8")),
+        "sample_text_chars": len(text),
+        "output_dir": str(output_dir),
+        "current_vocab_size": int(current_vocab_size),
+        "current_bytes_per_token": current_bytes_per_token,
+        "candidates": results,
+        "best_candidates": best_by_training[:8],
+        "best_by_training_usefulness": best_by_training[:8],
+        "best_conservative_candidates": best_conservative[:8],
+        "best_by_bytes_per_token": best_by_bytes[:8],
+    }
 
 
 def entropy_from_counts(counts: np.ndarray) -> float:
@@ -1227,10 +1427,17 @@ def leaderboard_consistent_analysis(
         },
         {
             "name": "ttt_lora",
-            "leaderboard_prior": 0.15,
-            "dataset_fit": 0.5 * reuse_2048 + 0.5 * long_nmi,
-            "rationale": "TTT had profiler support, but leaderboard evidence is weak relative to lexical and compression-aware lanes.",
+            "leaderboard_prior": 0.05,
+            "dataset_fit": 0.2 * reuse_2048 + 0.2 * long_nmi,
+            "rationale": "TTT is now strongly downweighted: dataset signal alone previously overstated it, while empirical runs and leaderboard evidence remain weak.",
             "depends_on": ["ttt_lora"],
+        },
+        {
+            "name": "hyper_connections",
+            "leaderboard_prior": 0.02,
+            "dataset_fit": 0.05 * reuse_2048,
+            "rationale": "Broad hyper-connection mechanisms are currently weakly supported: the dataset looks lexical-dominant and selective late compute is more plausible.",
+            "depends_on": ["hyper_connections"],
         },
     ]
 
@@ -1488,12 +1695,18 @@ def loss_geometry_surface(
     else:
         shape_name = "local_lexical_dominant"
 
+    nonstandard_penalties = {
+        "ttt_lora_penalty": float(0.35 + 0.35 * axes["lexical_shortcut_axis"] - 0.2 * axes["long_context_axis"]),
+        "hyper_connections_penalty": float(0.45 + 0.35 * axes["lexical_shortcut_axis"] - 0.15 * axes["long_context_axis"]),
+    }
+
     return {
         "shape_name": shape_name,
         "best_eval_seq_len_by_reuse": int(best_eval["seq_len"]),
         "estimated_steps_point": est_steps,
         "train_stream_coverage_range": [coverage_min, coverage_max],
         "axes": axes,
+        "nonstandard_penalties": nonstandard_penalties,
     }
 
 
@@ -1545,6 +1758,7 @@ def focused_upgrade_analysis(
         "bigram_4096": 0.18,
         "train_seq_len_2048": 0.35,
         "ttt_lora": 0.0,
+        "hyper_connections": 0.15,
         "tokenizer_redesign": 0.0,
         "fake_quant_tail": 0.02,
     }
@@ -1598,8 +1812,14 @@ def focused_upgrade_analysis(
         {
             "name": "ttt_lora",
             "kind": "eval_only",
-            "rationale": "Eval-time adaptation can exploit high long-window reuse without changing train steps.",
-            "dataset_signal": 0.5 * reuse_2048 + 0.5 * long_nmi,
+            "rationale": "Eval-time adaptation had theoretical support, but should now be treated as a weak lane unless real runs prove otherwise.",
+            "dataset_signal": 0.2 * reuse_2048 + 0.2 * long_nmi,
+        },
+        {
+            "name": "hyper_connections",
+            "kind": "train_and_eval",
+            "rationale": "Broad hyper-connections are likely too global and too expensive for a lexical-dominant stream unless a minimal late-layer variant proves otherwise.",
+            "dataset_signal": 0.05 * reuse_2048 + 0.05 * long_nmi,
         },
         {
             "name": "tokenizer_redesign",
@@ -1860,6 +2080,7 @@ def summarize_recommendations(
     observed_frontier: list[dict[str, object]] | None = None,
     leaderboard_frontier: list[dict[str, object]] | None = None,
     tokenizer_merge_summary: dict[str, object] | None = None,
+    tokenizer_research: dict[str, object] | None = None,
 ) -> list[str]:
     recs: list[str] = []
     long_lag_nmi = [m.normalized_mi for m in lag_stats if m.lag >= 512]
@@ -1901,6 +2122,27 @@ def summarize_recommendations(
                     f"A tiny tokenizer bump looks plausible: +{add_tokens} merges targets high-mass recurrent substrings "
                     f"(proxy {token_reduction} token events) {fit_text}"
                 )
+    if tokenizer_research is not None and tokenizer_research.get("available"):
+        best = next(iter(tokenizer_research.get("best_by_training_usefulness", [])), None)
+        conservative = next(iter(tokenizer_research.get("best_conservative_candidates", [])), None)
+        if isinstance(best, dict):
+            delta = best.get("estimated_token_change_fraction_vs_current")
+            delta_text = ""
+            if delta is not None:
+                delta_text = f", token_count_change={100.0 * float(delta):+.1f}%"
+            recs.append(
+                f"Locally trained tokenizer probe favors {best['family']} vocab={int(best['vocab_size'])} "
+                f"for training usefulness with bytes/token={float(best['bytes_per_token']):.3f}{delta_text}; use this as research guidance, not a submission dependency."
+            )
+        if isinstance(conservative, dict):
+            delta = conservative.get("estimated_token_change_fraction_vs_current")
+            delta_text = ""
+            if delta is not None:
+                delta_text = f", token_count_change={100.0 * float(delta):+.1f}%"
+            recs.append(
+                f"Conservative tokenizer lane: {conservative['family']} vocab={int(conservative['vocab_size'])} "
+                f"with bytes/token={float(conservative['bytes_per_token']):.3f}{delta_text}."
+            )
     if shard_aggregate is not None and shard_aggregate.get("max_js_divergence_bits", 0.0) >= 0.02:
         recs.append("Shard drift is non-trivial; TTT or mild domain-adaptive evaluation may benefit more than a one-size-fits-all context setting.")
     if eval_candidates:
@@ -2024,6 +2266,10 @@ def main() -> None:
     )
     parser.add_argument("--tokenizer-candidate-count", type=int, default=64)
     parser.add_argument("--tokenizer-budget-options", default="16,32,64")
+    parser.add_argument("--train-local-tokenizers", action="store_true")
+    parser.add_argument("--tokenizer-trainer-families", default="sp_bpe,sp_unigram,hf_bpe")
+    parser.add_argument("--tokenizer-train-vocab-sizes", default="768,1024,1280,1536,2048")
+    parser.add_argument("--tokenizer-output-dir", default="")
     parser.add_argument("--model-dim", type=int, default=512)
     parser.add_argument("--current-artifact-bytes", type=int, default=0)
     parser.add_argument("--submission-limit-bytes", type=int, default=16_000_000)
@@ -2046,6 +2292,7 @@ def main() -> None:
     base_bytes = build_base_bytes(args.tokenizer_path, args.vocab_size) if args.tokenizer_path else None
     tokenizer_meta = build_tokenizer_metadata(args.tokenizer_path, args.vocab_size) if args.tokenizer_path else None
     bytes_per_token = None if base_bytes is None else float(base_bytes[distribution_tokens].mean())
+    reconstructed_text = reconstruct_text_from_tokens(sequential_tokens, tokenizer_meta)
     shard_summary_rows, shard_aggregate = shard_summaries(files, args.vocab_size, args.sample_tokens_per_shard, base_bytes)
     eval_candidates = eval_length_candidates(sequential_tokens, parse_int_list(args.eval_lengths))
     marginal_context = marginal_eval_context_gain(eval_candidates)
@@ -2134,6 +2381,19 @@ def main() -> None:
         "candidate_count": int(len(tokenizer_candidates)),
         "best_small_budget": tokenizer_budget[0] if tokenizer_budget else None,
     }
+    tokenizer_research = (
+        train_local_tokenizer_candidates(
+            text=reconstructed_text,
+            output_dir=Path(args.tokenizer_output_dir) if args.tokenizer_output_dir else Path("runs/tokenizer_research"),
+            vocab_sizes=parse_int_list(args.tokenizer_train_vocab_sizes),
+            trainer_families=[part.strip() for part in args.tokenizer_trainer_families.split(",") if part.strip()],
+            current_vocab_size=args.vocab_size,
+            model_dim=args.model_dim,
+            current_bytes_per_token=bytes_per_token,
+        )
+        if args.train_local_tokenizers
+        else {"available": False, "reason": "train_local_tokenizers_disabled"}
+    )
     loss_shape = loss_geometry_surface(
         lag_stats=lag_stats,
         reuse_stats=reuse_stats,
@@ -2299,6 +2559,7 @@ def main() -> None:
             "candidate_merges": tokenizer_candidates,
             "budget_analysis": tokenizer_budget,
         },
+        "tokenizer_research": tokenizer_research,
         "recommendations": summarize_recommendations(
             lag_stats,
             reuse_stats,
@@ -2312,6 +2573,7 @@ def main() -> None:
             observed_frontier=observed_frontier,
             leaderboard_frontier=leaderboard_analysis,
             tokenizer_merge_summary=tokenizer_merge_summary,
+            tokenizer_research=tokenizer_research,
         ),
         "limitations": [
             "Binary shards do not preserve explicit document boundaries, so document-level TTT fit is inferred indirectly from stream statistics.",
