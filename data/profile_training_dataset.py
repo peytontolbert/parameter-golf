@@ -1036,6 +1036,90 @@ def recipe_frontier(
     return sorted(rows, key=lambda row: float(row["composite_priority_score"]), reverse=True)
 
 
+def leaderboard_consistent_analysis(
+    lag_stats: list[LagMetric],
+    reuse_stats: list[dict[str, float]],
+    eval_candidates: list[dict[str, float]],
+    focused_analysis: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    focused_by_name = {str(item["name"]): item for item in focused_analysis}
+    reuse_128 = _lookup_reuse(reuse_stats, 128) or 0.0
+    reuse_2048 = _lookup_eval_reuse(eval_candidates, 2048) or _lookup_reuse(reuse_stats, 2048) or 0.0
+    long_nmi = max((m.normalized_mi for m in lag_stats if m.lag >= 512), default=0.0)
+
+    candidates = [
+        {
+            "name": "mixed_quant_export",
+            "leaderboard_prior": 0.95,
+            "dataset_fit": 0.25,
+            "rationale": "Current top runs are dominated by mixed int5/int6 or selective mixed-precision export policies.",
+            "depends_on": ["fake_quant_tail"],
+        },
+        {
+            "name": "bigram_hash_large",
+            "leaderboard_prior": 0.9,
+            "dataset_fit": 0.55 * reuse_128,
+            "rationale": "Current winning runs repeatedly use large BigramHash tables, consistent with strong local reuse.",
+            "depends_on": ["bigram_4096", "smear_gate"],
+        },
+        {
+            "name": "swa_late",
+            "leaderboard_prior": 0.85,
+            "dataset_fit": 0.15,
+            "rationale": "Late-only SWA appears across top runs and is especially plausible when export quantization is the scored metric.",
+            "depends_on": [],
+        },
+        {
+            "name": "fake_quant_tail",
+            "leaderboard_prior": 0.8,
+            "dataset_fit": 0.2,
+            "rationale": "Compression-aware tail finetuning is explicitly aligned with the scored post-quant artifact.",
+            "depends_on": ["fake_quant_tail"],
+        },
+        {
+            "name": "train_seq_len_2048",
+            "leaderboard_prior": 0.75,
+            "dataset_fit": max(reuse_2048 - (_lookup_eval_reuse(eval_candidates, 1024) or 0.0), 0.0) + 0.5 * long_nmi,
+            "rationale": "The leaderboard now shows true-2048 lanes can win when the kernel is fast enough.",
+            "depends_on": ["train_seq_len_2048"],
+        },
+        {
+            "name": "ttt_lora",
+            "leaderboard_prior": 0.15,
+            "dataset_fit": 0.5 * reuse_2048 + 0.5 * long_nmi,
+            "rationale": "TTT had profiler support, but leaderboard evidence is weak relative to lexical and compression-aware lanes.",
+            "depends_on": ["ttt_lora"],
+        },
+    ]
+
+    rows: list[dict[str, object]] = []
+    for candidate in candidates:
+        focused_support = 0.0
+        focused_budget = 0.0
+        for dep in candidate["depends_on"]:
+            item = focused_by_name.get(dep)
+            if item is None:
+                continue
+            focused_support += max(float(item["priority_score"]), 0.0) / 1000.0
+            budget = item.get("budget_sensitivity", {})
+            if isinstance(budget, dict) and budget.get("lost_steps_max") is not None:
+                focused_budget += float(budget["lost_steps_max"]) / 1000.0
+        composite = 0.65 * float(candidate["leaderboard_prior"]) + 0.35 * (float(candidate["dataset_fit"]) + focused_support) - 0.1 * focused_budget
+        rows.append(
+            {
+                "name": str(candidate["name"]),
+                "leaderboard_prior": float(candidate["leaderboard_prior"]),
+                "dataset_fit": float(candidate["dataset_fit"]),
+                "focused_support": float(focused_support),
+                "budget_penalty_proxy": float(focused_budget),
+                "composite_score": float(composite),
+                "depends_on": list(candidate["depends_on"]),
+                "rationale": str(candidate["rationale"]),
+            }
+        )
+    return sorted(rows, key=lambda row: float(row["composite_score"]), reverse=True)
+
+
 def recurrence_burst_profile(tokens: np.ndarray, max_gap: int = 2048, top_k: int = 16) -> dict[str, object]:
     last_seen: dict[int, int] = {}
     gaps: list[int] = []
@@ -1632,6 +1716,7 @@ def summarize_recommendations(
     training_coverage: dict[str, object] | None = None,
     loss_shape: dict[str, object] | None = None,
     observed_frontier: list[dict[str, object]] | None = None,
+    leaderboard_frontier: list[dict[str, object]] | None = None,
 ) -> list[str]:
     recs: list[str] = []
     long_lag_nmi = [m.normalized_mi for m in lag_stats if m.lag >= 512]
@@ -1707,6 +1792,12 @@ def summarize_recommendations(
                     f"Observed seq-len runtime ratio 2048/1024 is {ratio:.3f} for the fastest logged lanes, "
                     "which is the most relevant budget signal for this cluster."
                 )
+    if leaderboard_frontier:
+        top = leaderboard_frontier[0]
+        recs.append(
+            f"Leaderboard-consistent ranking currently favors {top['name']} "
+            f"(score={float(top['composite_score']):.3f}); use this as an external prior, separate from pure dataset signal."
+        )
     if training_coverage is not None:
         recs.append(
             f"Estimated train-stream coverage is {training_coverage['coverage_fraction_min']:.3f}-"
@@ -1836,6 +1927,12 @@ def main() -> None:
         component_overheads=parse_component_overheads(args.component_overheads),
         observed_component_overrides=observed_overrides,
     )
+    leaderboard_analysis = leaderboard_consistent_analysis(
+        lag_stats=lag_stats,
+        reuse_stats=reuse_stats,
+        eval_candidates=eval_candidates,
+        focused_analysis=focused_analysis,
+    )
     eval_budget_frontier = estimate_eval_budget_frontier(
         eval_lengths=parse_int_list(args.eval_lengths),
         eval_batch_seqs=args.base_eval_batch_seqs,
@@ -1964,6 +2061,7 @@ def main() -> None:
         "training_budget_estimate": training_budget,
         "training_coverage_estimate": training_coverage,
         "focused_upgrade_analysis": focused_analysis,
+        "leaderboard_consistent_analysis": leaderboard_analysis,
         "loss_geometry_surface": loss_shape,
         "run_log_frontier": {
             "anchor_run": None
@@ -2029,6 +2127,7 @@ def main() -> None:
             training_coverage=training_coverage,
             loss_shape=loss_shape,
             observed_frontier=observed_frontier,
+            leaderboard_frontier=leaderboard_analysis,
         ),
         "limitations": [
             "Binary shards do not preserve explicit document boundaries, so document-level TTT fit is inferred indirectly from stream statistics.",
