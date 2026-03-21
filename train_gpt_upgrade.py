@@ -74,7 +74,7 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 20000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -172,12 +172,12 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
-    mlp_hidden = int(os.environ.get("MLP_HIDDEN", "1536"))
+    mlp_hidden = int(os.environ.get("MLP_HIDDEN", "992"))
     num_register_tokens = int(os.environ.get("NUM_REGISTER_TOKENS", "0"))
     num_shared_layers = int(os.environ.get("NUM_SHARED_LAYERS", "0"))
     shared_layer_repeats = int(os.environ.get("SHARED_LAYER_REPEATS", "0"))
@@ -189,19 +189,19 @@ class Hyperparameters:
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.03))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.07))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.02))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.04"))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.06))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.06))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.02"))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
     def __init__(self):
         self._apply_policy_schema()
