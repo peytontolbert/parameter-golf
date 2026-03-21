@@ -281,6 +281,20 @@ class Hyperparameters:
     def _apply_policy_schema(self) -> None:
         recipe_families: dict[str, dict[str, object]] = {
             "long_context_2048": {"train_seq_len": 2048, "eval_seq_len": 2048, "eval_batch_seqs": 256},
+            "record_2048": {
+                "train_seq_len": 2048,
+                "eval_seq_len": 2048,
+                "train_batch_tokens": 786432,
+                "num_layers": 9,
+                "num_kv_heads": 4,
+                "mlp_hidden": 1536,
+                "use_smear_gate": True,
+                "bigram_vocab_size": 4096,
+                "bigram_dim": 128,
+                "orthogonal_init": True,
+                "mup_proj_init": True,
+                "force_fp16_tied_embed_export": True,
+            },
             "winner_int6": {
                 "train_seq_len": 2048,
                 "eval_seq_len": 2048,
@@ -304,6 +318,11 @@ class Hyperparameters:
         curriculum_policies: dict[str, dict[str, object]] = {
             "baseline": {},
             "long_context_2048": {"eval_batch_seqs": 256},
+            "record_2048": {
+                "warmdown_iters": 3000,
+                "grad_clip_norm": 0.3,
+                "eval_batch_seqs": 512,
+            },
             "winner_int6": {"warmdown_iters": 3000, "grad_clip_norm": 0.3},
             "top_recipe_8k": {
                 "warmdown_iters": 20000,
@@ -379,6 +398,15 @@ class Hyperparameters:
         }
         optimizer_policies: dict[str, dict[str, object]] = {
             "baseline": {},
+            "record_2048": {
+                "tied_embed_lr": 0.035,
+                "matrix_lr": 0.025,
+                "scalar_lr": 0.025,
+                "muon_momentum": 0.95,
+                "muon_momentum_warmup_start": 0.85,
+                "muon_momentum_warmup_steps": 500,
+                "muon_weight_decay": 0.02,
+            },
             "winner_int6": {
                 "muon_momentum": 0.99,
                 "muon_momentum_warmup_start": 0.92,
@@ -421,6 +449,18 @@ class Hyperparameters:
                 "optimizer_policy": "winner_int6",
                 "precision_policy": "winner_int6",
                 "eval_policy": "sliding64_2048",
+            },
+            "record_2048_current": {
+                "recipe_family": "record_2048",
+                "curriculum_policy": "record_2048",
+                "optimizer_policy": "record_2048",
+                "eval_policy": "sliding64",
+                "runtime_policy": "compiled",
+                "use_flash_attn_3": True,
+                "fake_quant_full_run": False,
+                "export_quant_bits": 6,
+                "export_codec": "zstd",
+                "ttt_enabled": False,
             },
             "top_recipe_10l": {
                 "recipe_family": "top_recipe_10l",
