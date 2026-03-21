@@ -157,9 +157,15 @@ class Hyperparameters:
     use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", "0"))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", "128"))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", "0"))
+    xsa_gate_init = float(os.environ.get("XSA_GATE_INIT", "-2.0"))
+    late_route_layers = int(os.environ.get("LATE_ROUTE_LAYERS", "0"))
+    late_route_init = float(os.environ.get("LATE_ROUTE_INIT", "-2.0"))
     orthogonal_init = bool(int(os.environ.get("ORTHOGONAL_INIT", "0")))
     mup_proj_init = bool(int(os.environ.get("MUP_PROJ_INIT", "0")))
     export_quant_bits = int(os.environ.get("EXPORT_QUANT_BITS", "8"))
+    export_mlp_bits = int(os.environ.get("EXPORT_MLP_BITS", "0"))
+    export_attn_bits = int(os.environ.get("EXPORT_ATTN_BITS", "0"))
     export_codec = os.environ.get("EXPORT_CODEC", "zlib").strip().lower()
     export_zstd_level = int(os.environ.get("EXPORT_ZSTD_LEVEL", "22"))
     export_high_precision_bits = int(os.environ.get("EXPORT_HIGH_PRECISION_BITS", "8"))
@@ -254,9 +260,13 @@ class Hyperparameters:
             "use_smear_gate": "USE_SMEAR_GATE",
             "bigram_vocab_size": "BIGRAM_VOCAB_SIZE",
             "bigram_dim": "BIGRAM_DIM",
+            "xsa_last_n": "XSA_LAST_N",
+            "late_route_layers": "LATE_ROUTE_LAYERS",
             "orthogonal_init": "ORTHOGONAL_INIT",
             "mup_proj_init": "MUP_PROJ_INIT",
             "export_quant_bits": "EXPORT_QUANT_BITS",
+            "export_mlp_bits": "EXPORT_MLP_BITS",
+            "export_attn_bits": "EXPORT_ATTN_BITS",
             "export_codec": "EXPORT_CODEC",
             "export_high_precision_bits": "EXPORT_HIGH_PRECISION_BITS",
             "export_high_precision_budget_bytes": "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
@@ -625,9 +635,15 @@ TRACKED_CONFIG_ENV_VARS = [
     "USE_SMEAR_GATE",
     "BIGRAM_VOCAB_SIZE",
     "BIGRAM_DIM",
+    "XSA_LAST_N",
+    "XSA_GATE_INIT",
+    "LATE_ROUTE_LAYERS",
+    "LATE_ROUTE_INIT",
     "ORTHOGONAL_INIT",
     "MUP_PROJ_INIT",
     "EXPORT_QUANT_BITS",
+    "EXPORT_MLP_BITS",
+    "EXPORT_ATTN_BITS",
     "EXPORT_CODEC",
     "EXPORT_ZSTD_LEVEL",
     "EXPORT_HIGH_PRECISION_BITS",
@@ -1356,6 +1372,8 @@ INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 FORCE_FP16_TIED_EMBED_EXPORT = bool(int(os.environ.get("FORCE_FP16_TIED_EMBED_EXPORT", "1")))
 LATE_K_FP16_LAYERS = int(os.environ.get("LATE_K_FP16_LAYERS", "2"))
 LARGE_MATRIX_QUANT_BITS = int(os.environ.get("LARGE_MATRIX_QUANT_BITS", "6"))
+MIXED_PRECISION_EXPORT_MLP_BITS = int(os.environ.get("EXPORT_MLP_BITS", "0"))
+MIXED_PRECISION_EXPORT_ATTN_BITS = int(os.environ.get("EXPORT_ATTN_BITS", "0"))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -1902,7 +1920,15 @@ def quantize_state_dict_mixed_precision(state_dict: dict[str, Tensor], bits: int
             stats["payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        target_bits = bits if _classify_quant_target(name) in {"mlp", "attn"} else 8
+        target_class = _classify_quant_target(name)
+        if target_class == "mlp":
+            target_bits = MIXED_PRECISION_EXPORT_MLP_BITS if MIXED_PRECISION_EXPORT_MLP_BITS > 0 else bits
+        elif target_class == "attn":
+            target_bits = MIXED_PRECISION_EXPORT_ATTN_BITS if MIXED_PRECISION_EXPORT_ATTN_BITS > 0 else bits
+        elif target_class == "embed":
+            target_bits = 8
+        else:
+            target_bits = 8
         if name in high_precision_names:
             target_bits = high_bits
             stats["high_precision_tensor_count"] += 1
@@ -2739,6 +2765,10 @@ class Block(nn.Module):
         use_flash_attn_3: bool,
         rope_dims: int,
         ln_scale: bool,
+        use_xsa: bool,
+        xsa_gate_init: float,
+        use_late_route: bool,
+        late_route_init: float,
     ):
         super().__init__()
         self.token_shift = token_shift
@@ -2775,6 +2805,38 @@ class Block(nn.Module):
             use_flash_attn_3=use_flash_attn_3,
             rope_dims=rope_dims,
         )
+        self.xsa_attn = (
+            CausalSelfAttention(
+                dim,
+                num_heads,
+                num_kv_heads,
+                rope_base,
+                qk_gain_init,
+                use_alibi,
+                use_xpos,
+                xpos_scale_base,
+                False,
+                residual_attention_gain_init,
+                0,
+                False,
+                relative_bias_num_buckets,
+                relative_bias_max_distance,
+                attention_variant="attention",
+                retention_decay_init=retention_decay_init,
+                retention_output_gate=retention_output_gate,
+                dynamic_head_top_k=0,
+                dynamic_head_temperature=1.0,
+                use_subln=False,
+                train_seq_len=train_seq_len,
+                use_flash_attn_3=use_flash_attn_3,
+                rope_dims=rope_dims,
+            )
+            if use_xsa
+            else None
+        )
+        self.xsa_gate = nn.Parameter(torch.full((dim,), xsa_gate_init, dtype=torch.float32)) if use_xsa else None
+        self.late_router = CastedLinear(dim, 1, bias=False) if use_late_route else None
+        self.late_route_bias = nn.Parameter(torch.tensor(late_route_init, dtype=torch.float32)) if use_late_route else None
         use_moe = moe_every_n_layers > 0 and ((layer_idx + 1) % moe_every_n_layers == 0)
         moe_inner_dim = moe_hidden if moe_hidden > 0 else (mlp_hidden if mlp_hidden > 0 else mlp_mult * dim)
         self.mlp = (
@@ -2787,7 +2849,13 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.pre_mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if macaron_layout else None
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.fast_path = not self.token_shift and self.pre_mlp is None and self.attn.fast_path
+        self.fast_path = (
+            not self.token_shift
+            and self.pre_mlp is None
+            and self.attn.fast_path
+            and self.xsa_attn is None
+            and self.late_router is None
+        )
 
     def forward(
         self,
@@ -2807,6 +2875,7 @@ class Block(nn.Module):
                 pre_mlp_normed = pre_mlp_normed * norm_scale
             pre_mlp_out = 0.5 * self.pre_mlp_scale.to(dtype=x.dtype)[None, None, :] * self.pre_mlp(pre_mlp_normed)
             x = x * self.residual_alpha + pre_mlp_out
+        block_base = x
         x_in = apply_token_shift(x) if self.token_shift else x
         attn_normed = self.attn_norm(x_in)
         if norm_scale != 1.0:
@@ -2817,6 +2886,10 @@ class Block(nn.Module):
             q_lora=q_lora,
             v_lora=v_lora,
         )
+        if self.xsa_attn is not None and self.xsa_gate is not None:
+            xsa_out, _ = self.xsa_attn(attn_normed)
+            xsa_gate = torch.sigmoid(self.xsa_gate.to(dtype=x.dtype))[None, None, :]
+            attn_out = attn_out + xsa_gate * xsa_out
         x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_in = apply_token_shift(x) if self.token_shift else x
         mlp_scale = 0.5 if self.pre_mlp is not None else 1.0
@@ -2824,6 +2897,10 @@ class Block(nn.Module):
         if norm_scale != 1.0:
             mlp_normed = mlp_normed * norm_scale
         x = x * self.residual_alpha + mlp_scale * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        if self.late_router is not None and self.late_route_bias is not None:
+            route_logits = self.late_router(attn_normed).to(dtype=x.dtype) + self.late_route_bias.to(dtype=x.dtype)
+            route_gate = torch.sigmoid(route_logits)
+            x = block_base + route_gate * (x - block_base)
         return x, next_attn_logits
 
     def forward_simple(
@@ -2838,15 +2915,24 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         norm_scale = self.norm_scale
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        block_base = x
         attn_normed = self.attn_norm(x)
         if norm_scale != 1.0:
             attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_simple(attn_normed, q_lora=q_lora, v_lora=v_lora)
+        if self.xsa_attn is not None and self.xsa_gate is not None:
+            xsa_out = self.xsa_attn.forward_simple(attn_normed)
+            xsa_gate = torch.sigmoid(self.xsa_gate.to(dtype=x.dtype))[None, None, :]
+            attn_out = attn_out + xsa_gate * xsa_out
         x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_normed = self.mlp_norm(x)
         if norm_scale != 1.0:
             mlp_normed = mlp_normed * norm_scale
         x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        if self.late_router is not None and self.late_route_bias is not None:
+            route_logits = self.late_router(attn_normed).to(dtype=x.dtype) + self.late_route_bias.to(dtype=x.dtype)
+            route_gate = torch.sigmoid(route_logits)
+            x = block_base + route_gate * (x - block_base)
         return x
 
 
@@ -2909,6 +2995,10 @@ class GPT(nn.Module):
         use_flash_attn_3: bool,
         rope_dims: int,
         ln_scale: bool,
+        xsa_last_n: int,
+        xsa_gate_init: float,
+        late_route_layers: int,
+        late_route_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2950,6 +3040,10 @@ class GPT(nn.Module):
         self.use_smear_gate = use_smear_gate
         self.rope_dims = max(int(rope_dims), 0)
         self.ln_scale = bool(ln_scale)
+        self.xsa_last_n = max(int(xsa_last_n), 0)
+        self.xsa_gate_init = float(xsa_gate_init)
+        self.late_route_layers = max(int(late_route_layers), 0)
+        self.late_route_init = float(late_route_init)
         self.orthogonal_init = orthogonal_init
         self.mup_proj_init = mup_proj_init
         self.ttt_config = {
@@ -2966,6 +3060,8 @@ class GPT(nn.Module):
         self.shared_loop_gate_init = shared_loop_gate_init
         retention_start = max(num_layers - self.retention_layers, 0)
         dynamic_head_start = max(num_layers - self.dynamic_head_layers, 0)
+        xsa_start = max(num_layers - self.xsa_last_n, 0)
+        late_route_start = max(num_layers - self.late_route_layers, 0)
         residual_alpha = math.pow(2.0 * num_layers, 0.25) if self.use_deepnorm and num_layers > 0 else 1.0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -3016,6 +3112,10 @@ class GPT(nn.Module):
                     use_flash_attn_3=use_flash_attn_3,
                     rope_dims=self.rope_dims,
                     ln_scale=self.ln_scale,
+                    use_xsa=i >= xsa_start,
+                    xsa_gate_init=self.xsa_gate_init,
+                    use_late_route=i >= late_route_start,
+                    late_route_init=self.late_route_init,
                 )
                 for i in range(num_layers)
             ]
@@ -3057,6 +3157,10 @@ class GPT(nn.Module):
                     use_flash_attn_3=use_flash_attn_3,
                     rope_dims=self.rope_dims,
                     ln_scale=self.ln_scale,
+                    use_xsa=False,
+                    xsa_gate_init=self.xsa_gate_init,
+                    use_late_route=False,
+                    late_route_init=self.late_route_init,
                 )
                 for i in range(self.num_shared_layers)
             ]
@@ -3408,6 +3512,10 @@ def maybe_build_teacher(args: Hyperparameters, device: torch.device) -> nn.Modul
         use_smear_gate=args.use_smear_gate,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        xsa_last_n=args.xsa_last_n,
+        xsa_gate_init=args.xsa_gate_init,
+        late_route_layers=args.late_route_layers,
+        late_route_init=args.late_route_init,
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
@@ -3697,6 +3805,10 @@ def main() -> None:
         use_smear_gate=args.use_smear_gate,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        xsa_last_n=args.xsa_last_n,
+        xsa_gate_init=args.xsa_gate_init,
+        late_route_layers=args.late_route_layers,
+        late_route_init=args.late_route_init,
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
         train_seq_len=args.train_seq_len,
@@ -3889,6 +4001,10 @@ def main() -> None:
         f"bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim}"
     )
     log0(
+        f"late_compute:xsa_last_n:{args.xsa_last_n} xsa_gate_init:{args.xsa_gate_init} "
+        f"late_route_layers:{args.late_route_layers} late_route_init:{args.late_route_init}"
+    )
+    log0(
         f"ttt:enabled:{args.ttt_enabled} rank:{args.ttt_lora_rank} lr:{args.ttt_lora_lr} "
         f"chunk_size:{args.ttt_chunk_size} eval_seq_len:{args.ttt_eval_seq_len or eval_seq_len} "
         f"batch_size:{args.ttt_batch_size} late_layers:{args.ttt_late_layers} "
@@ -3898,7 +4014,8 @@ def main() -> None:
     )
     log0(
         f"init_export:orthogonal_init:{args.orthogonal_init} mup_proj_init:{args.mup_proj_init} "
-        f"export_quant_bits:{args.export_quant_bits} export_codec:{args.export_codec} "
+        f"export_quant_bits:{args.export_quant_bits} export_mlp_bits:{args.export_mlp_bits} "
+        f"export_attn_bits:{args.export_attn_bits} export_codec:{args.export_codec} "
         f"export_high_precision_bits:{args.export_high_precision_bits} "
         f"export_high_precision_budget_bytes:{args.export_high_precision_budget_bytes} "
         f"export_high_precision_max_tensors:{args.export_high_precision_max_tensors} "
