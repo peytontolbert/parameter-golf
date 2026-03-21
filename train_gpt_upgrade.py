@@ -164,11 +164,19 @@ class Hyperparameters:
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
     use_flash_attn_3 = bool(int(os.environ.get("USE_FLASH_ATTN_3", "1")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", "8"))
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.01"))
-    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", "256"))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", "4"))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", "0.001"))
+    ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", "1024"))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", "0"))
-    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", "32"))
+    ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", "16"))
+    ttt_late_layers = int(os.environ.get("TTT_LATE_LAYERS", "2"))
+    ttt_min_adapt_context = int(os.environ.get("TTT_MIN_ADAPT_CONTEXT", "1024"))
+    ttt_grad_clip_norm = float(os.environ.get("TTT_GRAD_CLIP_NORM", "0.5"))
+    ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", "0.01"))
+    ttt_enable_lm_head = bool(int(os.environ.get("TTT_ENABLE_LM_HEAD", "1")))
+    ttt_enable_q = bool(int(os.environ.get("TTT_ENABLE_Q", "0")))
+    ttt_enable_v = bool(int(os.environ.get("TTT_ENABLE_V", "1")))
+    ttt_lora_scale = float(os.environ.get("TTT_LORA_SCALE", "0.25"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -252,6 +260,14 @@ class Hyperparameters:
             "ttt_chunk_size": "TTT_CHUNK_SIZE",
             "ttt_eval_seq_len": "TTT_EVAL_SEQ_LEN",
             "ttt_batch_size": "TTT_BATCH_SIZE",
+            "ttt_late_layers": "TTT_LATE_LAYERS",
+            "ttt_min_adapt_context": "TTT_MIN_ADAPT_CONTEXT",
+            "ttt_grad_clip_norm": "TTT_GRAD_CLIP_NORM",
+            "ttt_weight_decay": "TTT_WEIGHT_DECAY",
+            "ttt_enable_lm_head": "TTT_ENABLE_LM_HEAD",
+            "ttt_enable_q": "TTT_ENABLE_Q",
+            "ttt_enable_v": "TTT_ENABLE_V",
+            "ttt_lora_scale": "TTT_LORA_SCALE",
         }
 
     def _apply_schema_values(self, values: dict[str, object]) -> None:
@@ -572,6 +588,14 @@ TRACKED_CONFIG_ENV_VARS = [
     "TTT_CHUNK_SIZE",
     "TTT_EVAL_SEQ_LEN",
     "TTT_BATCH_SIZE",
+    "TTT_LATE_LAYERS",
+    "TTT_MIN_ADAPT_CONTEXT",
+    "TTT_GRAD_CLIP_NORM",
+    "TTT_WEIGHT_DECAY",
+    "TTT_ENABLE_LM_HEAD",
+    "TTT_ENABLE_Q",
+    "TTT_ENABLE_V",
+    "TTT_LORA_SCALE",
     "VOCAB_SIZE",
     "NUM_LAYERS",
     "NUM_KV_HEADS",
@@ -1024,7 +1048,13 @@ BOS_ID = 1
 
 
 def build_ttt_optimizer(lora: BatchedTTTLoRA, args: Hyperparameters) -> torch.optim.Optimizer:
-    return torch.optim.Adam(lora.parameters(), lr=args.ttt_lora_lr, betas=(args.beta1, args.beta2), eps=1e-10)
+    return torch.optim.AdamW(
+        lora.parameters(),
+        lr=args.ttt_lora_lr,
+        betas=(args.beta1, args.beta2),
+        eps=1e-10,
+        weight_decay=args.ttt_weight_decay,
+    )
 
 
 def find_docs(tokens: Tensor) -> list[tuple[int, int]]:
@@ -1148,9 +1178,22 @@ def eval_val_ttt_lora(
                         per_doc_loss.append(per_token_loss.new_zeros(()))
                     else:
                         per_doc_loss.append(per_token_loss[b, chunk_offset : chunk_offset + chunk_len].mean())
-                mask = torch.tensor([float(chunk_idx < num_chunks[b] - 1) for b in range(bsz)], device=device)
+                adapt_mask = []
+                for b in range(bsz):
+                    if not active[b]:
+                        adapt_mask.append(0.0)
+                        continue
+                    chunk_end = min((chunk_idx + 1) * chunk_size, pred_lens[b])
+                    enough_context = chunk_end >= args.ttt_min_adapt_context
+                    has_future = chunk_idx < num_chunks[b] - 1
+                    adapt_mask.append(float(enough_context and has_future))
+                mask = torch.tensor(adapt_mask, device=device)
+                if mask.sum().item() <= 0:
+                    continue
                 opt.zero_grad(set_to_none=True)
                 (torch.stack(per_doc_loss) * mask).sum().backward()
+                if args.ttt_grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(lora.parameters(), args.ttt_grad_clip_norm)
                 opt.step()
 
     if dist.is_available() and dist.is_initialized():
@@ -2490,15 +2533,16 @@ class BigramHashEmbedding(nn.Module):
 
 
 class BatchedLinearLoRA(nn.Module):
-    def __init__(self, bsz: int, in_features: int, out_features: int, rank: int):
+    def __init__(self, bsz: int, in_features: int, out_features: int, rank: int, scale: float = 1.0):
         super().__init__()
         self.in_features = in_features
+        self.scale = float(scale)
         self.A = nn.Parameter(torch.empty(bsz, rank, in_features))
         self.B = nn.Parameter(torch.zeros(bsz, out_features, rank))
         self.reset()
 
     def forward(self, x: Tensor) -> Tensor:
-        return (x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2)
+        return self.scale * ((x @ self.A.transpose(1, 2)) @ self.B.transpose(1, 2))
 
     def reset(self) -> None:
         bound = 1.0 / math.sqrt(max(self.in_features, 1))
@@ -2512,12 +2556,41 @@ class BatchedTTTLoRA(nn.Module):
         super().__init__()
         dim = model.tok_emb.embedding_dim
         vocab = model.tok_emb.num_embeddings
-        self.lm_head_lora = BatchedLinearLoRA(bsz, dim, vocab, rank)
-        self.q_loras = nn.ModuleList()
-        self.v_loras = nn.ModuleList()
-        for block in model.blocks:
-            self.q_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank))
-            self.v_loras.append(BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank))
+        cfg = model.ttt_config
+        self.use_lm_head = bool(cfg["enable_lm_head"])
+        self.use_q = bool(cfg["enable_q"])
+        self.use_v = bool(cfg["enable_v"])
+        self.late_layers = max(int(cfg["late_layers"]), 0)
+        scale = float(cfg["lora_scale"])
+        self.layer_mask = [False] * len(model.blocks)
+        start_idx = max(len(model.blocks) - self.late_layers, 0)
+        for i in range(start_idx, len(model.blocks)):
+            self.layer_mask[i] = True
+        self.lm_head_lora = (
+            BatchedLinearLoRA(bsz, dim, vocab, rank, scale=scale)
+            if self.use_lm_head
+            else None
+        )
+        self.q_loras: list[BatchedLinearLoRA | None] = []
+        self.v_loras: list[BatchedLinearLoRA | None] = []
+        for i, block in enumerate(model.blocks):
+            enabled = self.layer_mask[i]
+            self.q_loras.append(
+                BatchedLinearLoRA(bsz, dim, block.attn.c_q.weight.shape[0], rank, scale=scale)
+                if enabled and self.use_q
+                else None
+            )
+            self.v_loras.append(
+                BatchedLinearLoRA(bsz, dim, block.attn.c_v.weight.shape[0], rank, scale=scale)
+                if enabled and self.use_v
+                else None
+            )
+        modules = []
+        if self.lm_head_lora is not None:
+            modules.append(self.lm_head_lora)
+        modules.extend([m for m in self.q_loras if m is not None])
+        modules.extend([m for m in self.v_loras if m is not None])
+        self.adapters = nn.ModuleList(modules)
 
     def reset(self) -> None:
         for module in self.modules():
@@ -2778,6 +2851,13 @@ class GPT(nn.Module):
         self.use_smear_gate = use_smear_gate
         self.orthogonal_init = orthogonal_init
         self.mup_proj_init = mup_proj_init
+        self.ttt_config = {
+            "enable_lm_head": True,
+            "enable_q": False,
+            "enable_v": True,
+            "late_layers": 2,
+            "lora_scale": 0.25,
+        }
         self.fake_quant_bits = 0
         self.num_register_tokens = max(int(num_register_tokens), 0)
         self.num_shared_layers = max(int(num_shared_layers), 0)
@@ -3118,7 +3198,7 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        if lora is not None:
+        if lora is not None and lora.lm_head_lora is not None:
             logits_proj = logits_proj + lora.lm_head_lora(x).to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
@@ -3517,6 +3597,13 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    base_model.ttt_config = {
+        "enable_lm_head": args.ttt_enable_lm_head,
+        "enable_q": args.ttt_enable_q,
+        "enable_v": args.ttt_enable_v,
+        "late_layers": args.ttt_late_layers,
+        "lora_scale": args.ttt_lora_scale,
+    }
     compiled_model = (
         torch.compile(base_model, dynamic=False, fullgraph=True)
         if args.enable_torch_compile
@@ -3692,7 +3779,10 @@ def main() -> None:
     log0(
         f"ttt:enabled:{args.ttt_enabled} rank:{args.ttt_lora_rank} lr:{args.ttt_lora_lr} "
         f"chunk_size:{args.ttt_chunk_size} eval_seq_len:{args.ttt_eval_seq_len or eval_seq_len} "
-        f"batch_size:{args.ttt_batch_size}"
+        f"batch_size:{args.ttt_batch_size} late_layers:{args.ttt_late_layers} "
+        f"min_adapt_context:{args.ttt_min_adapt_context} grad_clip:{args.ttt_grad_clip_norm} "
+        f"weight_decay:{args.ttt_weight_decay} enable_lm_head:{args.ttt_enable_lm_head} "
+        f"enable_q:{args.ttt_enable_q} enable_v:{args.ttt_enable_v} lora_scale:{args.ttt_lora_scale}"
     )
     log0(
         f"init_export:orthogonal_init:{args.orthogonal_init} mup_proj_init:{args.mup_proj_init} "
