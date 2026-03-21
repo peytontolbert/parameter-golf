@@ -34,8 +34,13 @@ try:
 
     HAS_FLASH_ATTN_3 = True
 except Exception:
-    flash_attn_3_func = None
-    HAS_FLASH_ATTN_3 = False
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_3_func
+
+        HAS_FLASH_ATTN_3 = True
+    except Exception:
+        flash_attn_3_func = None
+        HAS_FLASH_ATTN_3 = False
 
 try:
     import zstandard
