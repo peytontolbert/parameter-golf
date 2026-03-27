@@ -166,89 +166,115 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
     def forward(
         ctx,
         local_logits: Tensor,
-        transition_log_probs: Tensor,
+        transition_source_probs: Tensor,
+        transition_dest_probs: Tensor,
         transition_context: Tensor,
         initial_log_belief: Tensor,
         transition_gate: Tensor,
+        transition_stay_probs: Tensor,
         chunk_size: int,
     ) -> tuple[Tensor, Tensor]:
         ext = load_causal_machine_scan_cuda()
-        local_logits_f32 = local_logits.contiguous().float()
-        transition_log_probs_f32 = transition_log_probs.contiguous().float()
-        transition_context_f32 = transition_context.contiguous().float()
-        initial_log_belief_f32 = initial_log_belief.contiguous().float()
+        local_logits_in = local_logits.contiguous()
+        transition_source_probs_f32 = transition_source_probs.contiguous().float()
+        transition_dest_probs_f32 = transition_dest_probs.contiguous().float()
+        transition_context_in = transition_context.contiguous()
+        initial_log_belief_in = initial_log_belief.contiguous()
+        transition_stay_probs_f32 = transition_stay_probs.contiguous().float()
         gate_value = float(transition_gate.detach().float().item())
         beliefs, final_belief = ext.forward(
-            local_logits_f32,
-            transition_log_probs_f32,
-            transition_context_f32,
-            initial_log_belief_f32,
+            local_logits_in,
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_in,
+            initial_log_belief_in,
             gate_value,
+            transition_stay_probs_f32,
             int(chunk_size),
         )
         ctx.save_for_backward(
-            local_logits_f32,
-            transition_log_probs_f32,
-            transition_context_f32,
-            initial_log_belief_f32,
-            beliefs,
-            final_belief,
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_in,
+            initial_log_belief_in,
+            beliefs.contiguous(),
             transition_gate.float(),
+            transition_stay_probs_f32,
         )
         ctx.chunk_size = int(chunk_size)
-        return beliefs.to(dtype=local_logits.dtype), final_belief.to(dtype=local_logits.dtype)
+        return beliefs, final_belief
 
     @staticmethod
     def backward(ctx, grad_beliefs: Tensor, grad_final_belief: Tensor):
         ext = load_causal_machine_scan_cuda()
         (
-            local_logits_f32,
-            transition_log_probs_f32,
-            transition_context_f32,
-            initial_log_belief_f32,
-            beliefs_f32,
-            final_belief_f32,
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_saved,
+            initial_log_belief_saved,
+            beliefs_saved,
             transition_gate_f32,
+            transition_stay_probs_f32,
         ) = ctx.saved_tensors
         grads = ext.backward(
-            grad_beliefs.contiguous().float(),
-            grad_final_belief.contiguous().float(),
-            local_logits_f32,
-            transition_log_probs_f32,
-            transition_context_f32,
-            initial_log_belief_f32,
-            beliefs_f32,
-            final_belief_f32,
+            grad_beliefs.contiguous(),
+            grad_final_belief.contiguous(),
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_saved.contiguous(),
+            initial_log_belief_saved.contiguous(),
+            beliefs_saved.contiguous(),
             float(transition_gate_f32.detach().float().item()),
+            transition_stay_probs_f32,
             int(ctx.chunk_size),
         )
-        grad_local, grad_transition, grad_context, grad_initial, grad_gate = grads
+        grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = grads
         return (
             grad_local,
-            grad_transition,
+            grad_source,
+            grad_dest,
             grad_context,
             grad_initial,
             grad_gate.reshape_as(transition_gate_f32),
+            grad_stay.reshape_as(transition_stay_probs_f32),
             None,
         )
 
 
 def causal_machine_scan_cuda(
     local_logits: Tensor,
-    transition_log_probs: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
     transition_context: Tensor,
     initial_log_belief: Tensor,
     transition_gate: Tensor,
+    transition_stay_probs: Tensor,
     chunk_size: int,
 ) -> tuple[Tensor, Tensor]:
     return _CausalMachineScanCudaFn.apply(
         local_logits,
-        transition_log_probs,
+        transition_source_probs,
+        transition_dest_probs,
         transition_context,
         initial_log_belief,
         transition_gate,
+        transition_stay_probs,
         int(chunk_size),
     )
+
+
+def structured_transition_predict_log_belief(
+    prev_log_belief: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    transition_stay_probs: Tensor,
+) -> Tensor:
+    prev_probs = prev_log_belief.float().exp()
+    latent_probs = prev_probs @ transition_source_probs.float()
+    mix_probs = latent_probs @ transition_dest_probs.float()
+    stay_probs = transition_stay_probs.float().unsqueeze(0)
+    pred_probs = stay_probs * prev_probs + (1.0 - stay_probs) * mix_probs
+    return pred_probs.clamp_min(1.0e-20).log()
 
 
 def inverse_softplus_scalar(value: float) -> float:
@@ -280,8 +306,20 @@ class AttentionStepCache:
 
 
 @dataclass
+class BlockStepCache:
+    attention_cache: AttentionStepCache | None = None
+    state_cache: CausalMachineCache | None = None
+
+    def reset(self) -> None:
+        if self.attention_cache is not None:
+            self.attention_cache.reset()
+        if self.state_cache is not None:
+            self.state_cache.reset()
+
+
+@dataclass
 class BackboneStepCache:
-    layers: list[AttentionStepCache]
+    layers: list[BlockStepCache]
     position: int = 0
 
     def reset(self) -> None:
@@ -298,15 +336,21 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "num_kv_heads": 4,
     "mlp_hidden": 896,
     "use_causal_machine_bias": False,
+    "use_causal_machine_output_bias": False,
+    "use_causal_machine_backbone": True,
+    "block_pattern": "attn,attn,attn,attn,ssm,ssm,ssm,ssm,ssm,ssm",
     "causal_machine_num_states": 128,
-    "causal_machine_hidden_rank": 128,
-    "causal_machine_scale_init": 0.5,
-    "causal_machine_gate_init": -0.75,
+    "causal_machine_hidden_rank": 64,
+    "causal_machine_transition_rank": 8,
+    "causal_machine_scale_init": 0.35,
+    "causal_machine_gate_init": -1.5,
     "causal_machine_teacher_loss_coeff": 0.0,
-    "causal_machine_state_loss_coeff": 0.0,
-    "causal_machine_next_token_loss_coeff": 0.05,
-    "causal_machine_transition_gate_init": -3.0,
-    "causal_machine_transition_stickiness_init": 4.0,
+    "causal_machine_state_loss_coeff": 0.06,
+    "causal_machine_next_token_loss_coeff": 0.0,
+    "causal_machine_transition_kl_coeff": 0.005,
+    "causal_machine_future_sketch_loss_coeff": 0.015,
+    "causal_machine_transition_gate_init": -1.0,
+    "causal_machine_transition_stickiness_init": 2.5,
     "causal_machine_emit_delta_scale_init": 0.10,
     "orthogonal_init": True,
     "mup_proj_init": True,
@@ -334,6 +378,9 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "head_weight_decay": 0.0,
 }
 
+DEFAULT_CAUSAL_MACHINE_SKETCH_HORIZONS: tuple[int, ...] = (1, 2, 4, 8)
+DEFAULT_CAUSAL_MACHINE_SKETCH_DIM = 16
+
     # Keep local proxy launch presets aligned with the shared recipe defaults and
     # enable a cheap early validation window so we can inspect the real trajectory
     # in steps 0-10 without mutating the configured full validation budget.
@@ -351,6 +398,44 @@ LOCAL_PROXY_PRESET_COMMON: dict[str, object] = {
     "early_val_max_seqs": 256,
     "val_loss_every": 100,
 }
+
+
+def default_block_pattern(num_layers: int) -> str:
+    if num_layers == 10:
+        return "attn,attn,attn,attn,ssm,ssm,ssm,ssm,ssm,ssm"
+    if num_layers <= 0:
+        return ""
+    front_attn = min(num_layers, max(1, 4 if num_layers >= 8 else num_layers // 2))
+    return ",".join("attn" if idx < front_attn else "ssm" for idx in range(num_layers))
+
+
+def normalize_block_pattern_spec(spec: str, num_layers: int) -> str:
+    raw = str(spec or "").strip().lower()
+    if not raw:
+        return ""
+    tokens = [token.strip() for token in raw.replace(";", ",").split(",") if token.strip()]
+    aliases = {
+        "a": "attn",
+        "attn": "attn",
+        "attention": "attn",
+        "sa": "attn",
+        "s": "ssm",
+        "ssm": "ssm",
+        "state": "ssm",
+        "state_space": "ssm",
+        "statespace": "ssm",
+        "cm": "ssm",
+        "causal_machine": "ssm",
+    }
+    normalized = [aliases.get(token) for token in tokens]
+    if any(token is None for token in normalized):
+        bad = next(tokens[idx] for idx, token in enumerate(normalized) if token is None)
+        raise ValueError(f"BLOCK_PATTERN token {bad!r} is invalid; expected attn or ssm")
+    if num_layers > 0 and len(normalized) != num_layers:
+        raise ValueError(
+            f"BLOCK_PATTERN must provide exactly NUM_LAYERS={num_layers} entries, got {len(normalized)}"
+        )
+    return ",".join(normalized)
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -505,6 +590,10 @@ class Hyperparameters:
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
     use_flash_attn_3 = bool(int(os.environ.get("USE_FLASH_ATTN_3", "1")))
     attention_kv_mode = os.environ.get("ATTENTION_KV_MODE", "").strip().lower()
+    block_pattern = os.environ.get(
+        "BLOCK_PATTERN",
+        str(LOCAL_PROXY_RECIPE_COMMON["block_pattern"]),
+    ).strip().lower()
     use_mqa = bool(int(os.environ.get("USE_MQA", "0")))
 
     # Model shape.
@@ -527,6 +616,22 @@ class Hyperparameters:
             )
         )
     )
+    use_causal_machine_output_bias = bool(
+        int(
+            os.environ.get(
+                "USE_CAUSAL_MACHINE_OUTPUT_BIAS",
+                "1" if LOCAL_PROXY_RECIPE_COMMON["use_causal_machine_output_bias"] else "0",
+            )
+        )
+    )
+    use_causal_machine_backbone = bool(
+        int(
+            os.environ.get(
+                "USE_CAUSAL_MACHINE_BACKBONE",
+                "1" if LOCAL_PROXY_RECIPE_COMMON["use_causal_machine_backbone"] else "0",
+            )
+        )
+    )
     causal_machine_profile_json = os.environ.get(
         "CAUSAL_MACHINE_PROFILE_JSON",
         DEFAULT_CAUSAL_MACHINE_PROFILE_JSON,
@@ -535,6 +640,12 @@ class Hyperparameters:
         os.environ.get(
             "CAUSAL_MACHINE_HIDDEN_RANK",
             str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_hidden_rank"])),
+        )
+    )
+    causal_machine_transition_rank = int(
+        os.environ.get(
+            "CAUSAL_MACHINE_TRANSITION_RANK",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_transition_rank"])),
         )
     )
     causal_machine_num_states = int(
@@ -571,6 +682,18 @@ class Hyperparameters:
         os.environ.get(
             "CAUSAL_MACHINE_NEXT_TOKEN_LOSS_COEFF",
             str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_next_token_loss_coeff"])),
+        )
+    )
+    causal_machine_transition_kl_coeff = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_TRANSITION_KL_COEFF",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_transition_kl_coeff"])),
+        )
+    )
+    causal_machine_future_sketch_loss_coeff = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_FUTURE_SKETCH_LOSS_COEFF",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_future_sketch_loss_coeff"])),
         )
     )
     causal_machine_transition_gate_init = float(
@@ -626,6 +749,7 @@ class Hyperparameters:
         self._apply_policy_schema()
         self._apply_training_preset()
         self._resolve_attention_config()
+        self._resolve_block_pattern_config()
 
     def _env_override_map(self) -> dict[str, str]:
         return {
@@ -695,11 +819,14 @@ class Hyperparameters:
             "causal_machine_profile_json": "CAUSAL_MACHINE_PROFILE_JSON",
             "causal_machine_num_states": "CAUSAL_MACHINE_NUM_STATES",
             "causal_machine_hidden_rank": "CAUSAL_MACHINE_HIDDEN_RANK",
+            "causal_machine_transition_rank": "CAUSAL_MACHINE_TRANSITION_RANK",
             "causal_machine_scale_init": "CAUSAL_MACHINE_SCALE_INIT",
             "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
             "causal_machine_teacher_loss_coeff": "CAUSAL_MACHINE_TEACHER_LOSS_COEFF",
             "causal_machine_state_loss_coeff": "CAUSAL_MACHINE_STATE_LOSS_COEFF",
             "causal_machine_next_token_loss_coeff": "CAUSAL_MACHINE_NEXT_TOKEN_LOSS_COEFF",
+            "causal_machine_transition_kl_coeff": "CAUSAL_MACHINE_TRANSITION_KL_COEFF",
+            "causal_machine_future_sketch_loss_coeff": "CAUSAL_MACHINE_FUTURE_SKETCH_LOSS_COEFF",
             "causal_machine_transition_gate_init": "CAUSAL_MACHINE_TRANSITION_GATE_INIT",
             "causal_machine_transition_stickiness_init": "CAUSAL_MACHINE_TRANSITION_STICKINESS_INIT",
             "causal_machine_emit_delta_scale_init": "CAUSAL_MACHINE_EMIT_DELTA_SCALE_INIT",
@@ -718,7 +845,10 @@ class Hyperparameters:
             "cuda_graph_warmup_steps": "CUDA_GRAPH_WARMUP_STEPS",
             "debug_static_shapes": "DEBUG_STATIC_SHAPES",
             "attention_kv_mode": "ATTENTION_KV_MODE",
+            "block_pattern": "BLOCK_PATTERN",
             "use_mqa": "USE_MQA",
+            "use_causal_machine_output_bias": "USE_CAUSAL_MACHINE_OUTPUT_BIAS",
+            "use_causal_machine_backbone": "USE_CAUSAL_MACHINE_BACKBONE",
             "init_model_path": "INIT_MODEL_PATH",
             "init_model_strict": "INIT_MODEL_STRICT",
         }
@@ -843,6 +973,17 @@ class Hyperparameters:
                 f"and NUM_KV_HEADS={self.num_kv_heads}"
             )
         self.attention_kv_mode = kv_mode
+
+    def _resolve_block_pattern_config(self) -> None:
+        if "USE_CAUSAL_MACHINE_OUTPUT_BIAS" not in os.environ:
+            self.use_causal_machine_output_bias = bool(self.use_causal_machine_bias)
+        normalized = normalize_block_pattern_spec(self.block_pattern, int(self.num_layers))
+        if normalized:
+            self.block_pattern = normalized
+            if "ssm" in normalized.split(","):
+                self.use_causal_machine_backbone = True
+        elif self.use_causal_machine_backbone:
+            self.block_pattern = default_block_pattern(int(self.num_layers))
 
 
 # -----------------------------
@@ -3870,6 +4011,7 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.last_aux: dict[str, Tensor | None] = {}
         self.fast_path = True
 
     def forward_simple(
@@ -3895,24 +4037,377 @@ class Block(nn.Module):
         self,
         x: Tensor,
         x0: Tensor,
-        cache: AttentionStepCache,
+        cache: BlockStepCache,
         position: int,
         q_gain_delta: Tensor | None = None,
         norm_condition: Tensor | None = None,
     ) -> Tensor:
         if x.size(1) != 1:
             raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
+        if cache.attention_cache is None:
+            cache.attention_cache = AttentionStepCache()
         mix = self.resid_mix.to(dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
-        attn_out = self.attn.forward_step(attn_normed, cache=cache, position=position, q_gain_delta=q_gain_delta)
+        attn_out = self.attn.forward_step(
+            attn_normed,
+            cache=cache.attention_cache,
+            position=position,
+            q_gain_delta=q_gain_delta,
+        )
         x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
         mlp_normed = mlp_normed * norm_scale
         x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
         return x
+
+    def init_step_cache(self, max_len: int | None = None) -> BlockStepCache:
+        return BlockStepCache(attention_cache=AttentionStepCache(max_len=max_len))
+
+    def reset_step_cache(self, cache: BlockStepCache) -> None:
+        cache.reset()
+
+
+AttentionBlock = Block
+
+
+class CausalStateMixer(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_rank: int,
+        num_states: int,
+        transition_rank: int,
+        scale_init: float,
+        gate_init: float,
+        transition_gate_init: float,
+        transition_stickiness_init: float,
+        emit_delta_scale_init: float,
+        train_seq_len: int,
+        track_state_ce: bool,
+        track_transition_kl: bool,
+        track_future_sketch: bool,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.hidden_rank = hidden_rank
+        self.num_states = num_states
+        self.transition_rank = max(1, int(transition_rank))
+        self.filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
+        self.transition_context_rank = max(8, min(16, hidden_rank))
+        self.track_state_ce = bool(track_state_ce)
+        self.track_transition_kl = bool(track_transition_kl)
+        self.track_future_sketch = bool(track_future_sketch)
+        self.prefix_down = CastedLinear(dim, hidden_rank, bias=False)
+        self.decoder_hidden = CastedLinear(hidden_rank, hidden_rank, bias=True)
+        self.state_head = CastedLinear(hidden_rank, num_states, bias=False)
+        self.transition_context_in = CastedLinear(hidden_rank, self.transition_context_rank, bias=False)
+        self.transition_context_out = CastedLinear(self.transition_context_rank, num_states, bias=False)
+        self.transition_context_out._zero_init = True
+        self.hidden_gate = CastedLinear(hidden_rank, 1, bias=True)
+        self.belief_out = CastedLinear(num_states, dim, bias=False)
+        self.output_scale = nn.Parameter(torch.tensor(inverse_softplus_scalar(scale_init), dtype=torch.float32))
+        self.output_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
+        self.transition_gate = nn.Parameter(torch.tensor(transition_gate_init, dtype=torch.float32))
+        self.transition_source_logits = nn.Parameter(torch.zeros((num_states, self.transition_rank), dtype=torch.float32))
+        self.transition_dest_logits = nn.Parameter(torch.zeros((self.transition_rank, num_states), dtype=torch.float32))
+        self.transition_stay_logits = nn.Parameter(
+            torch.full((num_states,), fill_value=float(transition_stickiness_init), dtype=torch.float32)
+        )
+        self.emit_delta_scale = nn.Parameter(
+            torch.tensor(inverse_softplus_scalar(max(float(emit_delta_scale_init), 1e-6)), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "log_state_priors",
+            torch.full((num_states,), fill_value=-math.log(max(num_states, 1)), dtype=torch.float32),
+            persistent=False,
+        )
+        self.future_sketch_head: CastedLinear | None = None
+        self.future_sketch_dim = 0
+        self.last_aux: dict[str, Tensor | None] = {}
+        self.fast_path = True
+
+    def configure_future_sketch(self, total_sketch_dim: int) -> None:
+        total_sketch_dim = max(int(total_sketch_dim), 0)
+        if total_sketch_dim <= 0:
+            self.future_sketch_dim = 0
+            self.future_sketch_head = None
+            return
+        if self.future_sketch_head is not None and self.future_sketch_dim == total_sketch_dim:
+            return
+        device = self.prefix_down.weight.device
+        head = CastedLinear(self.hidden_rank, total_sketch_dim, bias=False).to(device)
+        head.float()
+        nn.init.normal_(head.weight, mean=0.0, std=0.02)
+        self.future_sketch_head = head
+        self.future_sketch_dim = total_sketch_dim
+
+    def _initial_log_belief(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return self.log_state_priors.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1).contiguous()
+
+    def _project_hidden(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        prev_x = torch.cat([torch.zeros_like(x[:, :1, :]), x[:, :-1, :]], dim=1)
+        delta = x - prev_x
+        state_features = x + 0.5 * delta
+        state_hidden = self.prefix_down(state_features)
+        state_hidden = torch.tanh(self.decoder_hidden(state_hidden))
+        local_logits = self.state_head(state_hidden)
+        transition_context = self.transition_context_out(self.transition_context_in(state_hidden))
+        return state_hidden, local_logits, transition_context
+
+    def _structured_transition_params(self) -> tuple[Tensor, Tensor, Tensor]:
+        transition_source_probs = F.softmax(self.transition_source_logits.float(), dim=-1)
+        transition_dest_probs = F.softmax(self.transition_dest_logits.float(), dim=-1)
+        transition_stay_probs = torch.sigmoid(self.transition_stay_logits.float())
+        return transition_source_probs, transition_dest_probs, transition_stay_probs
+
+    def _filter_sequence(
+        self,
+        local_logits: Tensor,
+        transition_context: Tensor,
+        initial_log_belief: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        transition_source_probs, transition_dest_probs, transition_stay_probs = self._structured_transition_params()
+        transition_gate = torch.sigmoid(self.transition_gate.float())
+        use_cuda_scan = (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and local_logits.is_cuda
+            and local_logits.size(-1) == 128
+        )
+        if use_cuda_scan:
+            state_log_beliefs, final_log_belief = causal_machine_scan_cuda(
+                local_logits,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context,
+                initial_log_belief.to(dtype=local_logits.dtype),
+                transition_gate.reshape(()),
+                transition_stay_probs,
+                int(self.filter_chunk_size),
+            )
+            prior_log_beliefs = None
+            if self.track_transition_kl:
+                prior_steps: list[Tensor] = []
+                prev_log_belief = initial_log_belief.float()
+                for t in range(int(local_logits.size(1))):
+                    pred_log_belief = structured_transition_predict_log_belief(
+                        prev_log_belief,
+                        transition_source_probs,
+                        transition_dest_probs,
+                        transition_stay_probs,
+                    )
+                    prior_steps.append((pred_log_belief + transition_context[:, t, :].float()).to(dtype=local_logits.dtype))
+                    prev_log_belief = state_log_beliefs[:, t, :].float()
+                prior_log_beliefs = torch.stack(prior_steps, dim=1)
+            return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, prior_log_beliefs
+        belief_steps: list[Tensor] = []
+        prior_steps: list[Tensor] = []
+        prev_log_belief = initial_log_belief.float()
+        seq_len = int(local_logits.size(1))
+        chunk_size = max(int(self.filter_chunk_size), 1)
+        for chunk_start in range(0, seq_len, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, seq_len)
+            for t in range(chunk_start, chunk_end):
+                pred_log_belief = structured_transition_predict_log_belief(
+                    prev_log_belief,
+                    transition_source_probs,
+                    transition_dest_probs,
+                    transition_stay_probs,
+                )
+                if self.track_transition_kl:
+                    prior_steps.append((pred_log_belief + transition_context[:, t, :].float()).to(dtype=local_logits.dtype))
+                filtered_logits = local_logits[:, t, :].float() + transition_gate * (
+                    pred_log_belief + transition_context[:, t, :].float()
+                )
+                prev_log_belief = F.log_softmax(filtered_logits, dim=-1)
+                belief_steps.append(prev_log_belief.to(dtype=local_logits.dtype))
+        prior_log_beliefs = torch.stack(prior_steps, dim=1) if prior_steps else None
+        return torch.stack(belief_steps, dim=1), prev_log_belief, prior_log_beliefs
+
+    def _filter_step(
+        self,
+        local_logits: Tensor,
+        transition_context: Tensor,
+        cache: CausalMachineCache,
+    ) -> Tensor:
+        batch_size = int(local_logits.size(0))
+        prev_log_belief = (
+            cache.log_belief.to(device=local_logits.device, dtype=torch.float32)
+            if cache.log_belief is not None
+            else self._initial_log_belief(batch_size, local_logits.device, torch.float32)
+        )
+        transition_source_probs, transition_dest_probs, transition_stay_probs = self._structured_transition_params()
+        transition_gate = torch.sigmoid(self.transition_gate.float())
+        pred_log_belief = structured_transition_predict_log_belief(
+            prev_log_belief,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_stay_probs,
+        )
+        filtered_logits = local_logits[:, 0, :].float() + transition_gate * (
+            pred_log_belief + transition_context[:, 0, :].float()
+        )
+        next_log_belief = F.log_softmax(filtered_logits, dim=-1)
+        cache.log_belief = next_log_belief.detach().to(dtype=local_logits.dtype)
+        cache.num_updates += 1
+        return next_log_belief.to(dtype=local_logits.dtype).unsqueeze(1)
+
+    def _decode(self, state_hidden: Tensor, state_log_beliefs: Tensor) -> Tensor:
+        scale = F.softplus(self.output_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        gate = torch.sigmoid(self.output_gate).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        belief_features = self.belief_out(state_log_beliefs.exp().to(dtype=state_hidden.dtype))
+        hidden_gate = torch.tanh(self.hidden_gate(state_hidden))
+        emit_scale = F.softplus(self.emit_delta_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        return scale * gate * belief_features * (1.0 + emit_scale * hidden_gate)
+
+    def forward_simple(self, x: Tensor) -> Tensor:
+        batch_size = int(x.size(0))
+        state_hidden, local_logits, transition_context = self._project_hidden(x)
+        initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
+        state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(local_logits, transition_context, initial_log_belief)
+        future_sketch_pred = (
+            self.future_sketch_head(state_hidden)
+            if self.track_future_sketch and self.future_sketch_head is not None
+            else None
+        )
+        self.last_aux = {
+            "local_state_log_probs": F.log_softmax(local_logits.float(), dim=-1).to(dtype=x.dtype) if self.track_state_ce else None,
+            "state_log_beliefs": state_log_beliefs if self.track_transition_kl else None,
+            "prior_state_log_beliefs": prior_log_beliefs,
+            "future_sketch_pred": future_sketch_pred,
+            "block_hidden": None,
+        }
+        return self._decode(state_hidden, state_log_beliefs)
+
+    def forward_step(self, x: Tensor, cache: CausalMachineCache) -> Tensor:
+        if x.size(1) != 1:
+            raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
+        state_hidden, local_logits, transition_context = self._project_hidden(x)
+        state_log_beliefs = self._filter_step(local_logits, transition_context, cache)
+        return self._decode(state_hidden, state_log_beliefs)
+
+
+class StateSpaceBlock(nn.Module):
+    def __init__(
+        self,
+        layer_idx: int,
+        dim: int,
+        mlp_mult: int,
+        mlp_hidden: int,
+        residual_alpha: float,
+        train_seq_len: int,
+        ln_scale: bool,
+        use_adaptive_rmsnorm: bool,
+        adaptive_rmsnorm_gate_init: float,
+        norm_condition_dim: int,
+        causal_machine_num_states: int,
+        causal_machine_hidden_rank: int,
+        causal_machine_transition_rank: int,
+        causal_machine_scale_init: float,
+        causal_machine_gate_init: float,
+        causal_machine_transition_gate_init: float,
+        causal_machine_transition_stickiness_init: float,
+        causal_machine_emit_delta_scale_init: float,
+        track_state_ce: bool,
+        track_transition_kl: bool,
+        track_future_sketch: bool,
+    ):
+        super().__init__()
+        if causal_machine_num_states <= 0 or causal_machine_hidden_rank <= 0:
+            raise ValueError("StateSpaceBlock requires positive causal-machine state and hidden sizes")
+        self.layer_idx = layer_idx
+        self.residual_alpha = float(residual_alpha)
+        norm_scale = (1.0 / math.sqrt(layer_idx + 1)) if ln_scale else 1.0
+        self.register_buffer("norm_scale_buffer", torch.tensor(norm_scale, dtype=torch.float32), persistent=False)
+        if use_adaptive_rmsnorm:
+            self.attn_norm = AdaptiveRMSNorm(dim, condition_dim=norm_condition_dim, gate_init=adaptive_rmsnorm_gate_init)
+            self.mlp_norm = AdaptiveRMSNorm(dim, condition_dim=norm_condition_dim, gate_init=adaptive_rmsnorm_gate_init)
+        else:
+            self.attn_norm = nn.RMSNorm(dim, elementwise_affine=False)
+            self.mlp_norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.attn = CausalStateMixer(
+            dim=dim,
+            hidden_rank=causal_machine_hidden_rank,
+            num_states=causal_machine_num_states,
+            transition_rank=causal_machine_transition_rank,
+            scale_init=causal_machine_scale_init,
+            gate_init=causal_machine_gate_init,
+            transition_gate_init=causal_machine_transition_gate_init,
+            transition_stickiness_init=causal_machine_transition_stickiness_init,
+            emit_delta_scale_init=causal_machine_emit_delta_scale_init,
+            train_seq_len=train_seq_len,
+            track_state_ce=track_state_ce,
+            track_transition_kl=track_transition_kl,
+            track_future_sketch=track_future_sketch,
+        )
+        self.mlp = MLP(dim, mlp_mult, hidden_dim=mlp_hidden)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.fast_path = True
+
+    def forward_simple(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        q_gain_delta: Tensor | None = None,
+        norm_condition: Tensor | None = None,
+    ) -> Tensor:
+        del q_gain_delta
+        mix = self.resid_mix.to(dtype=x.dtype)
+        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
+        attn_normed = attn_normed * norm_scale
+        attn_out = self.attn.forward_simple(attn_normed)
+        self.last_aux = dict(self.attn.last_aux)
+        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
+        mlp_normed = mlp_normed * norm_scale
+        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        self.last_aux["block_hidden"] = x
+        return x
+
+    def forward_simple_step(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        cache: BlockStepCache,
+        position: int,
+        q_gain_delta: Tensor | None = None,
+        norm_condition: Tensor | None = None,
+    ) -> Tensor:
+        del position, q_gain_delta
+        if x.size(1) != 1:
+            raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
+        if cache.state_cache is None:
+            cache.state_cache = CausalMachineCache()
+        mix = self.resid_mix.to(dtype=x.dtype)
+        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
+        attn_normed = attn_normed * norm_scale
+        attn_out = self.attn.forward_step(attn_normed, cache.state_cache)
+        self.last_aux = {}
+        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
+        mlp_normed = mlp_normed * norm_scale
+        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        return x
+
+    def init_step_cache(self, max_len: int | None = None) -> BlockStepCache:
+        del max_len
+        return BlockStepCache(state_cache=CausalMachineCache())
+
+    def reset_step_cache(self, cache: BlockStepCache) -> None:
+        cache.reset()
 
 
 class GPT(nn.Module):
@@ -3941,14 +4436,20 @@ class GPT(nn.Module):
         shared_layer_repeats: int,
         attention_kv_mode: str,
         use_causal_machine_bias: bool,
+        use_causal_machine_output_bias: bool,
+        use_causal_machine_backbone: bool,
+        block_pattern: str,
         causal_machine_profile_json: str,
         causal_machine_num_states: int,
         causal_machine_hidden_rank: int,
+        causal_machine_transition_rank: int,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
         causal_machine_teacher_loss_coeff: float,
         causal_machine_state_loss_coeff: float,
         causal_machine_next_token_loss_coeff: float,
+        causal_machine_transition_kl_coeff: float,
+        causal_machine_future_sketch_loss_coeff: float,
         causal_machine_transition_gate_init: float,
         causal_machine_transition_stickiness_init: float,
         causal_machine_emit_delta_scale_init: float,
@@ -3986,15 +4487,32 @@ class GPT(nn.Module):
         self.num_heads = max(int(num_heads), 1)
         self.num_kv_heads = max(int(num_kv_heads), 1)
         self.attention_kv_mode = str(attention_kv_mode or "").strip().lower() or "gqa"
-        self.use_causal_machine_bias = bool(use_causal_machine_bias)
+        self.use_causal_machine_output_bias = bool(use_causal_machine_output_bias or use_causal_machine_bias)
+        self.use_causal_machine_bias = self.use_causal_machine_output_bias
+        self.use_causal_machine_backbone = bool(use_causal_machine_backbone)
+        self.block_pattern = normalize_block_pattern_spec(block_pattern, self.num_layers)
+        if self.block_pattern:
+            self.block_types = self.block_pattern.split(",")
+            if any(block_type == "ssm" for block_type in self.block_types):
+                self.use_causal_machine_backbone = True
+        else:
+            self.block_types = (
+                default_block_pattern(self.num_layers).split(",")
+                if self.use_causal_machine_backbone
+                else ["attn"] * self.num_layers
+            )
+        self.block_pattern = ",".join(self.block_types)
         self.causal_machine_profile_json = str(causal_machine_profile_json or "").strip()
         self.causal_machine_num_states = max(int(causal_machine_num_states), 0)
         self.causal_machine_hidden_rank = max(int(causal_machine_hidden_rank), 0)
+        self.causal_machine_transition_rank = max(int(causal_machine_transition_rank), 1)
         self.causal_machine_scale_init = max(float(causal_machine_scale_init), 0.0)
         self.causal_machine_gate_init = float(causal_machine_gate_init)
         self.causal_machine_teacher_loss_coeff = max(float(causal_machine_teacher_loss_coeff), 0.0)
         self.causal_machine_state_loss_coeff = max(float(causal_machine_state_loss_coeff), 0.0)
         self.causal_machine_next_token_loss_coeff = max(float(causal_machine_next_token_loss_coeff), 0.0)
+        self.causal_machine_transition_kl_coeff = max(float(causal_machine_transition_kl_coeff), 0.0)
+        self.causal_machine_future_sketch_loss_coeff = max(float(causal_machine_future_sketch_loss_coeff), 0.0)
         self.causal_machine_transition_gate_init = float(causal_machine_transition_gate_init)
         self.causal_machine_transition_stickiness_init = float(causal_machine_transition_stickiness_init)
         self.causal_machine_emit_delta_scale_init = max(float(causal_machine_emit_delta_scale_init), 0.0)
@@ -4030,30 +4548,26 @@ class GPT(nn.Module):
         self.register_buffer("shared_tail_schedule_mult_buffer", torch.ones((), dtype=torch.float32), persistent=False)
         self.blocks = nn.ModuleList(
             [
-                Block(
-                    i,
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    mlp_hidden,
-                    rope_base,
-                    qk_gain_init,
+                self._build_backbone_block(
+                    block_type=self.block_types[i],
+                    layer_idx=i,
+                    model_dim=model_dim,
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    mlp_mult=mlp_mult,
+                    mlp_hidden=mlp_hidden,
+                    rope_base=rope_base,
+                    qk_gain_init=qk_gain_init,
                     residual_alpha=residual_alpha,
                     train_seq_len=train_seq_len,
                     use_flash_attn_3=use_flash_attn_3,
-                    rope_dims=self.rope_dims,
-                    ln_scale=self.ln_scale,
-                    use_adaptive_rmsnorm=self.use_adaptive_rmsnorm,
-                    adaptive_rmsnorm_gate_init=self.adaptive_rmsnorm_gate_init,
-                    norm_condition_dim=self.norm_condition_dim,
                 )
                 for i in range(num_layers)
             ]
         )
         self.shared_blocks = nn.ModuleList(
             [
-                Block(
+                AttentionBlock(
                     num_layers + i,
                     model_dim,
                     num_heads,
@@ -4081,7 +4595,11 @@ class GPT(nn.Module):
         self.output_logit_bias = (
             nn.Parameter(torch.zeros(vocab_size, dtype=torch.float32)) if self.use_output_logit_bias else None
         )
-        causal_machine_enabled = self.use_causal_machine_bias and self.causal_machine_hidden_rank > 0 and self.causal_machine_num_states > 0
+        causal_machine_enabled = (
+            self.use_causal_machine_output_bias
+            and self.causal_machine_hidden_rank > 0
+            and self.causal_machine_num_states > 0
+        )
         self.causal_machine_sketch_dim = 0
         self.causal_machine_horizons = []
         self.causal_machine_prefix_down = (
@@ -4138,15 +4656,19 @@ class GPT(nn.Module):
                 fill_value=-math.log(max(self.causal_machine_num_states, 1)),
                 dtype=torch.float32,
             )
-            transition_init = torch.full(
-                (self.causal_machine_num_states, self.causal_machine_num_states),
-                fill_value=-float(self.causal_machine_num_states) ** -0.5,
+            transition_source_init = torch.zeros(
+                (self.causal_machine_num_states, self.causal_machine_transition_rank),
                 dtype=torch.float32,
             )
-            diag_boost = torch.eye(self.causal_machine_num_states, dtype=torch.float32) * float(
-                self.causal_machine_transition_stickiness_init
+            transition_dest_init = torch.zeros(
+                (self.causal_machine_transition_rank, self.causal_machine_num_states),
+                dtype=torch.float32,
             )
-            transition_init = transition_init + diag_boost
+            transition_stay_init = torch.full(
+                (self.causal_machine_num_states,),
+                fill_value=float(self.causal_machine_transition_stickiness_init),
+                dtype=torch.float32,
+            )
             causal_machine_emit_delta = torch.empty_like(causal_machine_log_probs, dtype=torch.float32)
             bucket_ids_t = torch.empty((0,), dtype=torch.int64)
             signs_t = torch.empty((0,), dtype=torch.float32)
@@ -4155,14 +4677,22 @@ class GPT(nn.Module):
             causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
             causal_machine_horizons = torch.empty((0,), dtype=torch.int64)
             causal_machine_log_state_priors = torch.empty((0,), dtype=torch.float32)
-            transition_init = torch.empty((0, 0), dtype=torch.float32)
+            transition_source_init = torch.empty((0, 0), dtype=torch.float32)
+            transition_dest_init = torch.empty((0, 0), dtype=torch.float32)
+            transition_stay_init = torch.empty((0,), dtype=torch.float32)
             causal_machine_emit_delta = torch.empty((0, 0), dtype=torch.float32)
             bucket_ids_t = torch.empty((0,), dtype=torch.int64)
             signs_t = torch.empty((0,), dtype=torch.float32)
         self.register_buffer("causal_machine_log_probs", causal_machine_log_probs, persistent=True)
         self.register_buffer("causal_machine_log_state_priors", causal_machine_log_state_priors, persistent=True)
-        self.causal_machine_transition_logits = (
-            nn.Parameter(transition_init) if causal_machine_enabled else None
+        self.causal_machine_transition_source_logits = (
+            nn.Parameter(transition_source_init) if causal_machine_enabled else None
+        )
+        self.causal_machine_transition_dest_logits = (
+            nn.Parameter(transition_dest_init) if causal_machine_enabled else None
+        )
+        self.causal_machine_transition_stay_logits = (
+            nn.Parameter(transition_stay_init) if causal_machine_enabled else None
         )
         self.causal_machine_emit_delta = (
             nn.Parameter(causal_machine_emit_delta) if causal_machine_enabled else None
@@ -4171,10 +4701,95 @@ class GPT(nn.Module):
         self.register_buffer("causal_machine_horizon_tensor", causal_machine_horizons, persistent=False)
         self.register_buffer("causal_machine_bucket_ids", bucket_ids_t, persistent=False)
         self.register_buffer("causal_machine_signs", signs_t, persistent=False)
+        needs_default_online_sketch = (
+            self.causal_machine_num_states > 0
+            and self.vocab_size > 0
+            and (
+                self.causal_machine_future_sketch_loss_coeff > 0.0
+                or self.causal_machine_state_loss_coeff > 0.0
+                or self.causal_machine_teacher_loss_coeff > 0.0
+            )
+        )
+        if needs_default_online_sketch:
+            default_sketch_dim = max(4, min(DEFAULT_CAUSAL_MACHINE_SKETCH_DIM, self.vocab_size))
+            default_horizons = list(DEFAULT_CAUSAL_MACHINE_SKETCH_HORIZONS)
+            bucket_ids_np, signs_np = _sketch_token_tables(self.vocab_size, default_sketch_dim)
+            self.causal_machine_horizon_tensor = torch.tensor(default_horizons, dtype=torch.int64)
+            self.causal_machine_bucket_ids = torch.from_numpy(bucket_ids_np.astype(np.int64, copy=False))
+            self.causal_machine_signs = torch.from_numpy(signs_np.astype(np.float32, copy=False))
+            self.causal_machine_sketch_dim = default_sketch_dim
+            self.causal_machine_horizons = default_horizons
+            total_sketch_dim = default_sketch_dim * len(default_horizons)
+            self.causal_machine_signature_centroids = torch.zeros(
+                (self.causal_machine_num_states, total_sketch_dim), dtype=torch.float32
+            )
+            for block in self.blocks:
+                if isinstance(block, StateSpaceBlock):
+                    block.attn.configure_future_sketch(total_sketch_dim)
         self.mid_aux_head = CastedLinear(model_dim, vocab_size, bias=False)
         self.mid_aux_head._zero_init = True
         self.fast_features_path = all(block.fast_path for block in self.blocks)
         self._init_weights()
+
+    def _build_backbone_block(
+        self,
+        block_type: str,
+        layer_idx: int,
+        model_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        mlp_hidden: int,
+        rope_base: float,
+        qk_gain_init: float,
+        residual_alpha: float,
+        train_seq_len: int,
+        use_flash_attn_3: bool,
+    ) -> nn.Module:
+        if block_type == "attn":
+            return AttentionBlock(
+                layer_idx,
+                model_dim,
+                num_heads,
+                num_kv_heads,
+                mlp_mult,
+                mlp_hidden,
+                rope_base,
+                qk_gain_init,
+                residual_alpha=residual_alpha,
+                train_seq_len=train_seq_len,
+                use_flash_attn_3=use_flash_attn_3,
+                rope_dims=self.rope_dims,
+                ln_scale=self.ln_scale,
+                use_adaptive_rmsnorm=self.use_adaptive_rmsnorm,
+                adaptive_rmsnorm_gate_init=self.adaptive_rmsnorm_gate_init,
+                norm_condition_dim=self.norm_condition_dim,
+            )
+        if block_type == "ssm":
+            return StateSpaceBlock(
+                layer_idx=layer_idx,
+                dim=model_dim,
+                mlp_mult=mlp_mult,
+                mlp_hidden=mlp_hidden,
+                residual_alpha=residual_alpha,
+                train_seq_len=train_seq_len,
+                ln_scale=self.ln_scale,
+                use_adaptive_rmsnorm=self.use_adaptive_rmsnorm,
+                adaptive_rmsnorm_gate_init=self.adaptive_rmsnorm_gate_init,
+                norm_condition_dim=self.norm_condition_dim,
+                causal_machine_num_states=self.causal_machine_num_states,
+                causal_machine_hidden_rank=self.causal_machine_hidden_rank,
+                causal_machine_transition_rank=self.causal_machine_transition_rank,
+                causal_machine_scale_init=self.causal_machine_scale_init,
+                causal_machine_gate_init=self.causal_machine_gate_init,
+                causal_machine_transition_gate_init=self.causal_machine_transition_gate_init,
+                causal_machine_transition_stickiness_init=self.causal_machine_transition_stickiness_init,
+                causal_machine_emit_delta_scale_init=self.causal_machine_emit_delta_scale_init,
+                track_state_ce=self.causal_machine_state_loss_coeff > 0.0,
+                track_transition_kl=self.causal_machine_transition_kl_coeff > 0.0,
+                track_future_sketch=self.causal_machine_future_sketch_loss_coeff > 0.0,
+            )
+        raise ValueError(f"Unknown block type {block_type!r}")
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -4325,6 +4940,18 @@ class GPT(nn.Module):
             transition_context = self._apply_output_head(self.causal_machine_transition_context, state_hidden)
         return local_logits, transition_context
 
+    def _structured_causal_machine_transition_params(self) -> tuple[Tensor, Tensor, Tensor]:
+        if (
+            self.causal_machine_transition_source_logits is None
+            or self.causal_machine_transition_dest_logits is None
+            or self.causal_machine_transition_stay_logits is None
+        ):
+            raise RuntimeError("structured causal-machine transition parameters are unavailable")
+        transition_source_probs = F.softmax(self.causal_machine_transition_source_logits.float(), dim=-1)
+        transition_dest_probs = F.softmax(self.causal_machine_transition_dest_logits.float(), dim=-1)
+        transition_stay_probs = torch.sigmoid(self.causal_machine_transition_stay_logits.float())
+        return transition_source_probs, transition_dest_probs, transition_stay_probs
+
     def _filter_causal_machine_beliefs(
         self,
         state_hidden: Tensor,
@@ -4333,7 +4960,9 @@ class GPT(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if (
             self.causal_machine_state_head is None
-            or self.causal_machine_transition_logits is None
+            or self.causal_machine_transition_source_logits is None
+            or self.causal_machine_transition_dest_logits is None
+            or self.causal_machine_transition_stay_logits is None
             or self.causal_machine_transition_gate is None
         ):
             state_logits = self._apply_output_head(self.causal_machine_state_head, state_hidden) if self.causal_machine_state_head is not None else state_hidden
@@ -4341,7 +4970,7 @@ class GPT(nn.Module):
             return state_logits, state_log_beliefs.to(dtype=state_hidden.dtype)
         batch_size, seq_len, _ = state_hidden.shape
         local_logits, transition_context = self._compute_causal_machine_local_logits_and_transition_context(state_hidden)
-        transition_log_probs = F.log_softmax(self.causal_machine_transition_logits.float(), dim=-1)
+        transition_source_probs, transition_dest_probs, transition_stay_probs = self._structured_causal_machine_transition_params()
         transition_gate = torch.sigmoid(self.causal_machine_transition_gate.float())
         if cache is not None and cache.log_belief is not None:
             initial_log_belief = cache.log_belief.to(device=state_hidden.device, dtype=torch.float32)
@@ -4366,11 +4995,13 @@ class GPT(nn.Module):
         )
         if use_cuda_scan:
             state_log_beliefs, final_log_belief = causal_machine_scan_cuda(
-                local_logits.float(),
-                transition_log_probs,
-                transition_context.float(),
-                initial_log_belief,
+                local_logits,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context,
+                initial_log_belief.to(dtype=local_logits.dtype),
                 transition_gate.reshape(()),
+                transition_stay_probs,
                 int(self.causal_machine_filter_chunk_size),
             )
         else:
@@ -4380,9 +5011,11 @@ class GPT(nn.Module):
             for chunk_start in range(0, seq_len, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, seq_len)
                 for t in range(chunk_start, chunk_end):
-                    pred_log_belief = torch.logsumexp(
-                        prev_log_belief.unsqueeze(-1) + transition_log_probs.unsqueeze(0),
-                        dim=-2,
+                    pred_log_belief = structured_transition_predict_log_belief(
+                        prev_log_belief,
+                        transition_source_probs,
+                        transition_dest_probs,
+                        transition_stay_probs,
                     )
                     filtered_logits = local_logits[:, t, :].float() + transition_gate * (
                         pred_log_belief + transition_context[:, t, :].float()
@@ -4430,10 +5063,42 @@ class GPT(nn.Module):
         gate = torch.sigmoid(self.causal_machine_gate).to(device=x.device, dtype=x.dtype)
         return scale * gate * raw_machine_logits, state_log_beliefs, raw_machine_logits, local_state_log_probs
 
-    def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+    def apply_causal_machine_profile(self, profile: dict[str, object], vocab_size: int) -> None:
+        num_states = int(profile["num_states"])
+        if num_states != self.causal_machine_num_states:
+            raise ValueError(
+                f"CAUSAL_MACHINE_PROFILE_JSON num_states={num_states} does not match CAUSAL_MACHINE_NUM_STATES={self.causal_machine_num_states}"
+            )
+        device = self.tok_emb.weight.device
+        sketch_dim = int(profile["sketch_dim"])
+        horizons = [int(v) for v in profile["horizons"]]
+        total_sketch_dim = sketch_dim * len(horizons)
+        log_probs = torch.from_numpy(np.asarray(profile["log_probs"], dtype=np.float32)).to(device=device)
+        state_masses = torch.from_numpy(np.asarray(profile["state_masses"], dtype=np.float32)).to(device=device)
+        centroids = torch.from_numpy(np.asarray(profile["centroids_sketch"], dtype=np.float32)).to(device=device)
+        bucket_ids_np, signs_np = _sketch_token_tables(vocab_size, sketch_dim)
+        bucket_ids_t = torch.from_numpy(bucket_ids_np.astype(np.int64, copy=False)).to(device=device)
+        signs_t = torch.from_numpy(signs_np.astype(np.float32, copy=False)).to(device=device)
+        self.causal_machine_log_probs = log_probs
+        mass_sum = state_masses.sum().item()
+        if mass_sum > 0.0:
+            priors = torch.log(state_masses / max(mass_sum, 1e-12)).clamp_min(-30.0)
+        else:
+            priors = torch.full((num_states,), fill_value=-math.log(max(num_states, 1)), dtype=torch.float32, device=device)
+        self.causal_machine_log_state_priors = priors
+        self.causal_machine_signature_centroids = centroids
+        self.causal_machine_horizon_tensor = torch.tensor(horizons, dtype=torch.int64, device=device)
+        self.causal_machine_bucket_ids = bucket_ids_t
+        self.causal_machine_signs = signs_t
+        self.causal_machine_sketch_dim = sketch_dim
+        self.causal_machine_horizons = horizons
+        for block in self.blocks:
+            if isinstance(block, StateSpaceBlock):
+                block.attn.configure_future_sketch(total_sketch_dim)
+
+    def _compute_causal_machine_future_sketch(self, target_ids: Tensor) -> Tensor | None:
         if (
-            self.causal_machine_signature_centroids.numel() == 0
-            or self.causal_machine_bucket_ids.numel() == 0
+            self.causal_machine_bucket_ids.numel() == 0
             or self.causal_machine_signs.numel() == 0
             or self.causal_machine_horizon_tensor.numel() == 0
             or self.causal_machine_sketch_dim <= 0
@@ -4459,12 +5124,109 @@ class GPT(nn.Module):
                 denom = denom + valid.reshape(-1, 1)
             accum = accum / denom.clamp_min(1.0)
             blocks.append(accum)
-        features = torch.cat(blocks, dim=1)
+        return torch.cat(blocks, dim=1).reshape(batch_size, seq_len, -1)
+
+    def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+        if (
+            self.causal_machine_signature_centroids.numel() == 0
+            or self.causal_machine_log_probs.numel() == 0
+            or self.causal_machine_bucket_ids.numel() == 0
+            or self.causal_machine_signs.numel() == 0
+            or self.causal_machine_horizon_tensor.numel() == 0
+            or self.causal_machine_sketch_dim <= 0
+        ):
+            return None
+        features_3d = self._compute_causal_machine_future_sketch(target_ids)
+        if features_3d is None:
+            return None
+        features = features_3d.reshape(-1, features_3d.size(-1))
         centroids = self.causal_machine_signature_centroids.to(device=target_ids.device, dtype=features.dtype)
         feat_norm = (features * features).sum(dim=1, keepdim=True)
         centroid_norm = (centroids * centroids).sum(dim=1).unsqueeze(0)
         dists = feat_norm - 2.0 * (features @ centroids.transpose(0, 1)) + centroid_norm
-        return torch.argmin(dists, dim=1).reshape(batch_size, seq_len)
+        return torch.argmin(dists, dim=1).reshape(target_ids.size(0), target_ids.size(1))
+
+    def _compute_state_space_backbone_loss(
+        self,
+        target_ids: Tensor,
+        loss_mask: Tensor | None,
+    ) -> Tensor | None:
+        state_blocks = [block for block in self.blocks if isinstance(block, StateSpaceBlock) and block.last_aux]
+        if not state_blocks:
+            return None
+        teacher_state_ids = self._compute_causal_machine_teacher_state_ids(target_ids)
+        teacher_future_sketch = self._compute_causal_machine_future_sketch(target_ids)
+        mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
+        accum_terms: list[Tensor] = []
+        for block in state_blocks:
+            aux = block.last_aux
+            if self.causal_machine_next_token_loss_coeff > 0.0:
+                block_hidden = aux.get("block_hidden")
+                if block_hidden is not None:
+                    block_features = (
+                        self.final_norm(block_hidden, condition=None)
+                        if isinstance(self.final_norm, AdaptiveRMSNorm)
+                        else self.final_norm(block_hidden)
+                    )
+                    block_logits = self._project_logits(block_features)
+                    block_ce = F.cross_entropy(
+                        block_logits.reshape(-1, block_logits.size(-1)).float(),
+                        target_ids.reshape(-1),
+                        reduction="none",
+                    ).view_as(target_ids)
+                    if mask is None:
+                        accum_terms.append(self.causal_machine_next_token_loss_coeff * block_ce.mean())
+                    else:
+                        accum_terms.append(
+                            self.causal_machine_next_token_loss_coeff
+                            * (block_ce * mask).sum()
+                            / mask.sum().clamp_min(1.0)
+                        )
+            if teacher_state_ids is not None and self.causal_machine_state_loss_coeff > 0.0:
+                local_state_log_probs = aux.get("local_state_log_probs")
+                if local_state_log_probs is not None:
+                    state_ce = F.nll_loss(
+                        local_state_log_probs.reshape(-1, local_state_log_probs.size(-1)).float(),
+                        teacher_state_ids.reshape(-1),
+                        reduction="none",
+                    ).view_as(target_ids)
+                    if mask is None:
+                        accum_terms.append(self.causal_machine_state_loss_coeff * state_ce.mean())
+                    else:
+                        accum_terms.append(
+                            self.causal_machine_state_loss_coeff
+                            * (state_ce * mask).sum()
+                            / mask.sum().clamp_min(1.0)
+                        )
+            if self.causal_machine_transition_kl_coeff > 0.0:
+                state_log_beliefs = aux.get("state_log_beliefs")
+                prior_log_beliefs = aux.get("prior_state_log_beliefs")
+                if state_log_beliefs is not None and prior_log_beliefs is not None:
+                    target_probs = state_log_beliefs.detach().float().exp()
+                    transition_kl = (target_probs * (state_log_beliefs.detach().float() - prior_log_beliefs.float())).sum(dim=-1)
+                    if mask is None:
+                        accum_terms.append(self.causal_machine_transition_kl_coeff * transition_kl.mean())
+                    else:
+                        accum_terms.append(
+                            self.causal_machine_transition_kl_coeff
+                            * (transition_kl * mask).sum()
+                            / mask.sum().clamp_min(1.0)
+                        )
+            if teacher_future_sketch is not None and self.causal_machine_future_sketch_loss_coeff > 0.0:
+                pred_sketch = aux.get("future_sketch_pred")
+                if pred_sketch is not None:
+                    sketch_loss = F.smooth_l1_loss(pred_sketch.float(), teacher_future_sketch.float(), reduction="none").mean(dim=-1)
+                    if mask is None:
+                        accum_terms.append(self.causal_machine_future_sketch_loss_coeff * sketch_loss.mean())
+                    else:
+                        accum_terms.append(
+                            self.causal_machine_future_sketch_loss_coeff
+                            * (sketch_loss * mask).sum()
+                            / mask.sum().clamp_min(1.0)
+                        )
+        if not accum_terms:
+            return None
+        return sum(accum_terms) / float(max(len(state_blocks), 1))
 
     def _staged_mult(self, step: int, enable_step: int, ramp_steps: int) -> float:
         step = max(int(step), 0)
@@ -4610,9 +5372,8 @@ class GPT(nn.Module):
         )
 
     def init_backbone_step_cache(self, max_len: int | None = None) -> BackboneStepCache:
-        cache_max_len = None if max_len is None or max_len <= 0 else int(max_len)
         return BackboneStepCache(
-            layers=[AttentionStepCache(max_len=cache_max_len) for _ in self.blocks],
+            layers=[block.init_step_cache(max_len=max_len) for block in self.blocks],
             position=0,
         )
 
@@ -4786,6 +5547,9 @@ class GPT(nn.Module):
                     else:
                         state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
                     loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
+        state_space_backbone_loss = self._compute_state_space_backbone_loss(target_ids, loss_mask)
+        if state_space_backbone_loss is not None:
+            loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
         mid_aux_active = False
         if torch.is_tensor(mid_aux_loss_coeff):
             mid_aux_active = bool(mid_aux_loss_coeff.detach().abs().max().item() > 0.0)
@@ -4878,6 +5642,16 @@ def load_initial_model_state(model: nn.Module, path: str, strict: bool) -> tuple
         raise TypeError(f"Unsupported INIT_MODEL_PATH payload type: {type(payload).__name__}")
     incompatible = model.load_state_dict(state_dict, strict=strict)
     return list(getattr(incompatible, "missing_keys", [])), list(getattr(incompatible, "unexpected_keys", []))
+
+
+def _sketch_token_tables(vocab_size: int, sketch_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    token_ids = np.arange(vocab_size, dtype=np.int64)
+    bucket_ids = ((token_ids * np.int64(1103515245) + np.int64(12345)) % np.int64(max(sketch_dim, 1))).astype(
+        np.int64, copy=False
+    )
+    sign_bits = ((token_ids * np.int64(214013) + np.int64(2531011)) >> np.int64(4)) & np.int64(1)
+    signs = np.where(sign_bits == 0, 1.0, -1.0).astype(np.float32, copy=False)
+    return bucket_ids, signs
 
 
 def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
@@ -5093,14 +5867,20 @@ def main() -> None:
         shared_layer_repeats=args.shared_layer_repeats,
         attention_kv_mode=args.attention_kv_mode,
         use_causal_machine_bias=args.use_causal_machine_bias,
+        use_causal_machine_output_bias=args.use_causal_machine_output_bias,
+        use_causal_machine_backbone=args.use_causal_machine_backbone,
+        block_pattern=args.block_pattern,
         causal_machine_profile_json=args.causal_machine_profile_json,
         causal_machine_num_states=args.causal_machine_num_states,
         causal_machine_hidden_rank=args.causal_machine_hidden_rank,
+        causal_machine_transition_rank=args.causal_machine_transition_rank,
         causal_machine_scale_init=args.causal_machine_scale_init,
         causal_machine_gate_init=args.causal_machine_gate_init,
         causal_machine_teacher_loss_coeff=args.causal_machine_teacher_loss_coeff,
         causal_machine_state_loss_coeff=args.causal_machine_state_loss_coeff,
         causal_machine_next_token_loss_coeff=args.causal_machine_next_token_loss_coeff,
+        causal_machine_transition_kl_coeff=args.causal_machine_transition_kl_coeff,
+        causal_machine_future_sketch_loss_coeff=args.causal_machine_future_sketch_loss_coeff,
         causal_machine_transition_gate_init=args.causal_machine_transition_gate_init,
         causal_machine_transition_stickiness_init=args.causal_machine_transition_stickiness_init,
         causal_machine_emit_delta_scale_init=args.causal_machine_emit_delta_scale_init,
@@ -5123,6 +5903,14 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.causal_machine_profile_json:
+        causal_machine_profile = load_causal_machine_profile(args.causal_machine_profile_json)
+        base_model.apply_causal_machine_profile(causal_machine_profile, vocab_size=args.vocab_size)
+        log0(
+            f"causal_machine_profile:loaded states:{int(causal_machine_profile['num_states'])} "
+            f"horizons:{','.join(str(int(v)) for v in causal_machine_profile['horizons'])} "
+            f"sketch_dim:{int(causal_machine_profile['sketch_dim'])}"
+        )
     if args.mid_aux_loss_coeff <= 0.0 and getattr(base_model, "mid_aux_head", None) is not None:
         for param in base_model.mid_aux_head.parameters():
             param.requires_grad_(False)
