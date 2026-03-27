@@ -5148,12 +5148,14 @@ class GPT(nn.Module):
         self,
         target_ids: Tensor,
         state_log_beliefs: Tensor | None,
+        features_3d: Tensor | None = None,
     ) -> None:
         if self.causal_machine_profile_loaded:
             return
         if state_log_beliefs is None or self.causal_machine_num_states <= 0:
             return
-        features_3d = self._compute_causal_machine_future_sketch(target_ids)
+        if features_3d is None:
+            features_3d = self._compute_causal_machine_future_sketch(target_ids)
         if features_3d is None:
             return
         device = target_ids.device
@@ -5215,7 +5217,11 @@ class GPT(nn.Module):
         teacher_ready = active_states >= max(8, num_states // 8) and self.current_training_step >= 50
         self.causal_machine_online_teacher_ready.fill_(bool(teacher_ready))
 
-    def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+    def _compute_causal_machine_teacher_state_ids(
+        self,
+        target_ids: Tensor,
+        features_3d: Tensor | None = None,
+    ) -> Tensor | None:
         if not self.causal_machine_profile_loaded and not bool(self.causal_machine_online_teacher_ready.item()):
             return None
         if (
@@ -5227,7 +5233,8 @@ class GPT(nn.Module):
             or self.causal_machine_sketch_dim <= 0
         ):
             return None
-        features_3d = self._compute_causal_machine_future_sketch(target_ids)
+        if features_3d is None:
+            features_3d = self._compute_causal_machine_future_sketch(target_ids)
         if features_3d is None:
             return None
         features = features_3d.reshape(-1, features_3d.size(-1))
@@ -5241,12 +5248,12 @@ class GPT(nn.Module):
         self,
         target_ids: Tensor,
         loss_mask: Tensor | None,
+        teacher_state_ids: Tensor | None = None,
+        teacher_future_sketch: Tensor | None = None,
     ) -> Tensor | None:
         state_blocks = [block for block in self.blocks if isinstance(block, StateSpaceBlock) and block.last_aux]
         if not state_blocks:
             return None
-        teacher_state_ids = self._compute_causal_machine_teacher_state_ids(target_ids)
-        teacher_future_sketch = self._compute_causal_machine_future_sketch(target_ids)
         mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
         accum_terms: list[Tensor] = []
         for block in state_blocks:
@@ -5613,12 +5620,18 @@ class GPT(nn.Module):
             z_loss_coeff=z_loss_coeff,
             logit_var_loss_coeff=logit_var_loss_coeff,
         )
+        teacher_future_sketch = self._compute_causal_machine_future_sketch(target_ids)
         online_teacher_beliefs = self._select_online_teacher_beliefs(
             causal_machine_state_log_beliefs,
         )
         self._update_online_causal_teacher(
             target_ids,
             online_teacher_beliefs,
+            features_3d=teacher_future_sketch,
+        )
+        teacher_state_ids = self._compute_causal_machine_teacher_state_ids(
+            target_ids,
+            features_3d=teacher_future_sketch,
         )
         if causal_machine_raw_logits is not None:
             if self.causal_machine_next_token_loss_coeff > 0.0:
@@ -5633,7 +5646,6 @@ class GPT(nn.Module):
                 else:
                     state_next_token_loss = (state_ce * loss_mask.to(dtype=state_ce.dtype)).sum() / loss_mask.sum().clamp_min(1.0)
                 loss = loss + self.causal_machine_next_token_loss_coeff * state_next_token_loss.to(dtype=loss.dtype)
-            teacher_state_ids = self._compute_causal_machine_teacher_state_ids(target_ids)
             if teacher_state_ids is not None:
                 mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
                 teacher_log_probs = self.causal_machine_log_probs[teacher_state_ids].to(device=logits.device, dtype=torch.float32)
@@ -5656,7 +5668,12 @@ class GPT(nn.Module):
                     else:
                         state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
                     loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
-        state_space_backbone_loss = self._compute_state_space_backbone_loss(target_ids, loss_mask)
+        state_space_backbone_loss = self._compute_state_space_backbone_loss(
+            target_ids,
+            loss_mask,
+            teacher_state_ids=teacher_state_ids,
+            teacher_future_sketch=teacher_future_sketch,
+        )
         if state_space_backbone_loss is not None:
             loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
         mid_aux_active = False
