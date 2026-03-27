@@ -250,11 +250,12 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "num_kv_heads": 4,
     "mlp_hidden": 896,
     "use_causal_machine_bias": False,
+    "causal_machine_num_states": 128,
     "causal_machine_hidden_rank": 128,
     "causal_machine_scale_init": 0.35,
     "causal_machine_gate_init": -1.5,
-    "causal_machine_teacher_loss_coeff": 0.05,
-    "causal_machine_state_loss_coeff": 0.02,
+    "causal_machine_teacher_loss_coeff": 0.0,
+    "causal_machine_state_loss_coeff": 0.0,
     "causal_machine_transition_gate_init": 0.0,
     "causal_machine_transition_stickiness_init": 3.0,
     "causal_machine_emit_delta_scale_init": 0.05,
@@ -486,6 +487,12 @@ class Hyperparameters:
             str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_hidden_rank"])),
         )
     )
+    causal_machine_num_states = int(
+        os.environ.get(
+            "CAUSAL_MACHINE_NUM_STATES",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_num_states"])),
+        )
+    )
     causal_machine_scale_init = float(
         os.environ.get(
             "CAUSAL_MACHINE_SCALE_INIT",
@@ -629,6 +636,7 @@ class Hyperparameters:
             "signed_skip_weights": "SIGNED_SKIP_WEIGHTS",
             "use_causal_machine_bias": "USE_CAUSAL_MACHINE_BIAS",
             "causal_machine_profile_json": "CAUSAL_MACHINE_PROFILE_JSON",
+            "causal_machine_num_states": "CAUSAL_MACHINE_NUM_STATES",
             "causal_machine_hidden_rank": "CAUSAL_MACHINE_HIDDEN_RANK",
             "causal_machine_scale_init": "CAUSAL_MACHINE_SCALE_INIT",
             "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
@@ -3868,6 +3876,7 @@ class GPT(nn.Module):
         attention_kv_mode: str,
         use_causal_machine_bias: bool,
         causal_machine_profile_json: str,
+        causal_machine_num_states: int,
         causal_machine_hidden_rank: int,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
@@ -3911,12 +3920,14 @@ class GPT(nn.Module):
         self.num_kv_heads = max(int(num_kv_heads), 1)
         self.attention_kv_mode = str(attention_kv_mode or "").strip().lower() or "gqa"
         self.use_causal_machine_bias = bool(use_causal_machine_bias)
+        self.causal_machine_num_states_config = max(int(causal_machine_num_states), 1)
         self.causal_machine_profile_json = str(causal_machine_profile_json or "").strip()
         self.causal_machine_hidden_rank = max(int(causal_machine_hidden_rank), 0)
         self.causal_machine_scale_init = max(float(causal_machine_scale_init), 0.0)
         self.causal_machine_gate_init = float(causal_machine_gate_init)
         self.causal_machine_teacher_loss_coeff = max(float(causal_machine_teacher_loss_coeff), 0.0)
         self.causal_machine_state_loss_coeff = max(float(causal_machine_state_loss_coeff), 0.0)
+        self.causal_machine_use_teacher_targets = False
         self.causal_machine_transition_gate_init = float(causal_machine_transition_gate_init)
         self.causal_machine_transition_stickiness_init = float(causal_machine_transition_stickiness_init)
         self.causal_machine_emit_delta_scale_init = max(float(causal_machine_emit_delta_scale_init), 0.0)
@@ -4003,63 +4014,59 @@ class GPT(nn.Module):
         self.output_logit_bias = (
             nn.Parameter(torch.zeros(vocab_size, dtype=torch.float32)) if self.use_output_logit_bias else None
         )
-        causal_machine_enabled = self.use_causal_machine_bias and self.causal_machine_hidden_rank > 0 and bool(self.causal_machine_profile_json)
-        causal_machine_profile: dict[str, object] | None = None
-        if causal_machine_enabled:
-            causal_machine_profile = load_causal_machine_profile(self.causal_machine_profile_json)
-        self.causal_machine_num_states = 0 if causal_machine_profile is None else int(causal_machine_profile["num_states"])
-        self.causal_machine_sketch_dim = 0 if causal_machine_profile is None else int(causal_machine_profile["sketch_dim"])
-        self.causal_machine_horizons = [] if causal_machine_profile is None else [int(v) for v in causal_machine_profile["horizons"]]
+        causal_machine_enabled = self.use_causal_machine_bias and self.causal_machine_hidden_rank > 0
+        self.causal_machine_num_states = self.causal_machine_num_states_config if causal_machine_enabled else 0
+        self.causal_machine_sketch_dim = 0
+        self.causal_machine_horizons: list[int] = []
         self.causal_machine_prefix_down = (
             CastedLinear(model_dim, self.causal_machine_hidden_rank, bias=False)
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_state_head = (
             CastedLinear(self.causal_machine_hidden_rank, self.causal_machine_num_states, bias=False)
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_transition_context = (
             CastedLinear(self.causal_machine_hidden_rank, self.causal_machine_num_states, bias=False)
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_scale = (
             nn.Parameter(torch.tensor(inverse_softplus_scalar(self.causal_machine_scale_init), dtype=torch.float32))
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_gate = (
             nn.Parameter(torch.tensor(self.causal_machine_gate_init, dtype=torch.float32))
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_transition_gate = (
             nn.Parameter(torch.tensor(self.causal_machine_transition_gate_init, dtype=torch.float32))
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.causal_machine_emit_delta_scale = (
             nn.Parameter(
                 torch.tensor(inverse_softplus_scalar(self.causal_machine_emit_delta_scale_init), dtype=torch.float32)
             )
-            if causal_machine_profile is not None
+            if causal_machine_enabled
             else None
         )
         self.use_causal_machine_cuda_scan = bool(
-            USE_CAUSAL_MACHINE_CUDA_SCAN and causal_machine_profile is not None and self.causal_machine_num_states == 128
+            USE_CAUSAL_MACHINE_CUDA_SCAN and causal_machine_enabled and self.causal_machine_num_states == 128
         )
-        if causal_machine_profile is not None:
-            causal_machine_log_probs = torch.from_numpy(causal_machine_profile["log_probs"]).to(dtype=torch.float32)
-            causal_machine_state_masses = torch.from_numpy(causal_machine_profile["state_masses"]).to(dtype=torch.float32)
-            causal_machine_centroids = torch.from_numpy(causal_machine_profile["centroids_sketch"]).to(dtype=torch.float32)
-            causal_machine_horizons = torch.tensor(self.causal_machine_horizons, dtype=torch.int64)
-            if causal_machine_state_masses.numel() == 0 or float(causal_machine_state_masses.sum().item()) <= 0.0:
-                causal_machine_log_state_priors = torch.zeros((self.causal_machine_num_states,), dtype=torch.float32)
-            else:
-                normalized_state_masses = causal_machine_state_masses / causal_machine_state_masses.sum().clamp_min(1e-12)
-                causal_machine_log_state_priors = normalized_state_masses.clamp_min(1e-12).log()
+        if causal_machine_enabled:
+            causal_machine_log_probs = torch.zeros((self.causal_machine_num_states, vocab_size), dtype=torch.float32)
+            causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
+            causal_machine_horizons = torch.empty((0,), dtype=torch.int64)
+            causal_machine_log_state_priors = torch.full(
+                (self.causal_machine_num_states,),
+                fill_value=-math.log(max(self.causal_machine_num_states, 1)),
+                dtype=torch.float32,
+            )
             transition_init = torch.full(
                 (self.causal_machine_num_states, self.causal_machine_num_states),
                 fill_value=-float(self.causal_machine_num_states) ** -0.5,
@@ -4070,9 +4077,8 @@ class GPT(nn.Module):
             )
             transition_init = transition_init + diag_boost
             causal_machine_emit_delta = torch.zeros_like(causal_machine_log_probs, dtype=torch.float32)
-            bucket_ids_np, signs_np = _sketch_token_tables(vocab_size, self.causal_machine_sketch_dim)
-            bucket_ids_t = torch.from_numpy(bucket_ids_np.astype(np.int64, copy=False))
-            signs_t = torch.from_numpy(signs_np.astype(np.float32, copy=False))
+            bucket_ids_t = torch.empty((0,), dtype=torch.int64)
+            signs_t = torch.empty((0,), dtype=torch.float32)
         else:
             causal_machine_log_probs = torch.empty((0, 0), dtype=torch.float32)
             causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
@@ -4085,10 +4091,10 @@ class GPT(nn.Module):
         self.register_buffer("causal_machine_log_probs", causal_machine_log_probs, persistent=True)
         self.register_buffer("causal_machine_log_state_priors", causal_machine_log_state_priors, persistent=True)
         self.causal_machine_transition_logits = (
-            nn.Parameter(transition_init) if causal_machine_profile is not None else None
+            nn.Parameter(transition_init) if causal_machine_enabled else None
         )
         self.causal_machine_emit_delta = (
-            nn.Parameter(causal_machine_emit_delta) if causal_machine_profile is not None else None
+            nn.Parameter(causal_machine_emit_delta) if causal_machine_enabled else None
         )
         self.register_buffer("causal_machine_signature_centroids", causal_machine_centroids, persistent=False)
         self.register_buffer("causal_machine_horizon_tensor", causal_machine_horizons, persistent=False)
@@ -4343,6 +4349,8 @@ class GPT(nn.Module):
         return scale * gate * raw_machine_logits, state_log_beliefs, raw_machine_logits, local_state_log_probs
 
     def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+        if not self.causal_machine_use_teacher_targets:
+            return None
         if (
             self.causal_machine_signature_centroids.numel() == 0
             or self.causal_machine_bucket_ids.numel() == 0
@@ -4763,6 +4771,78 @@ def fake_quant_active(args: Hyperparameters, step: int, elapsed_ms: float, lr_sc
         return remaining_ms <= args.fake_quant_tail_steps * step_ms
     return False
 
+
+def inverse_softplus_scalar(value: float) -> float:
+    value = max(float(value), 1e-6)
+    if value > 20.0:
+        return value
+    return math.log(math.expm1(value))
+
+
+def _sketch_token_tables(vocab_size: int, sketch_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    token_ids = np.arange(vocab_size, dtype=np.int64)
+    bucket_ids = ((token_ids * np.int64(1103515245) + np.int64(12345)) % np.int64(max(sketch_dim, 1))).astype(
+        np.int64, copy=False
+    )
+    sign_bits = ((token_ids * np.int64(214013) + np.int64(2531011)) >> np.int64(4)) & np.int64(1)
+    signs = np.where(sign_bits == 0, 1.0, -1.0).astype(np.float32, copy=False)
+    return bucket_ids, signs
+
+
+def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
+    profile_path = Path(profile_json_path).expanduser()
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"CAUSAL_MACHINE_PROFILE_JSON not found: {profile_path}")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    future_profile = profile.get("future_signature_profile")
+    if not isinstance(future_profile, dict) or not bool(future_profile.get("available")):
+        raise ValueError(f"{profile_path} does not contain an available future_signature_profile")
+    horizons = [int(v) for v in future_profile.get("horizons", []) if int(v) > 0]
+    if not horizons:
+        raise ValueError(f"{profile_path} does not contain valid future_signature_profile horizons")
+    signature_dim = int(future_profile.get("signature_dim", 0))
+    if signature_dim <= 0 or signature_dim % len(horizons) != 0:
+        raise ValueError(f"{profile_path} has invalid future signature dimension {signature_dim} for horizons={horizons}")
+    per_horizon_dim = signature_dim // len(horizons)
+    sketch_dim = per_horizon_dim - 1
+    if sketch_dim <= 0:
+        raise ValueError(f"{profile_path} implies non-positive causal machine sketch dim {sketch_dim}")
+    spectral_block = profile.get("spectral_eigenbases")
+    if not isinstance(spectral_block, dict):
+        raise ValueError(f"{profile_path} is missing spectral_eigenbases metadata")
+    sidecar_path = spectral_block.get("sidecar_npz")
+    if not isinstance(sidecar_path, str) or not sidecar_path.strip():
+        sidecar = profile_path.with_name(f"{profile_path.stem}_spectral_eigenbases.npz")
+    else:
+        sidecar = Path(sidecar_path)
+    if not sidecar.is_absolute():
+        sidecar = (profile_path.parent / sidecar).resolve()
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"Causal machine sidecar not found: {sidecar}")
+    with np.load(sidecar) as arrays:
+        if "causal_machine_signature_centroids" not in arrays or "causal_machine_log_probs" not in arrays:
+            raise ValueError(f"{sidecar} is missing causal machine arrays")
+        centroids = arrays["causal_machine_signature_centroids"].astype(np.float32, copy=False)
+        log_probs = arrays["causal_machine_log_probs"].astype(np.float32, copy=False)
+        state_masses = (
+            arrays["causal_machine_state_masses"].astype(np.float32, copy=False)
+            if "causal_machine_state_masses" in arrays
+            else np.zeros((log_probs.shape[0],), dtype=np.float32)
+        )
+    keep_cols: list[int] = []
+    for idx in range(len(horizons)):
+        base = idx * per_horizon_dim
+        keep_cols.extend(range(base, base + sketch_dim))
+    centroids_sketch = centroids[:, keep_cols].astype(np.float32, copy=False)
+    return {
+        "num_states": int(log_probs.shape[0]),
+        "horizons": horizons,
+        "sketch_dim": int(sketch_dim),
+        "log_probs": log_probs,
+        "state_masses": state_masses,
+        "centroids_sketch": centroids_sketch,
+    }
+
 def load_initial_model_state(model: nn.Module, path: str, strict: bool) -> tuple[list[str], list[str]]:
     payload = torch.load(path, map_location="cpu")
     if isinstance(payload, dict) and "model_state_dict" in payload and isinstance(payload["model_state_dict"], dict):
@@ -4902,6 +4982,11 @@ def main() -> None:
     eval_seq_len = get_eval_seq_len(args)
     val_tokens_eval = val_tokens if eval_seq_len == args.train_seq_len else load_validation_tokens(args.val_files, eval_seq_len)
     log0(f"tokenizer:{tokenizer_kind} dataset:{dataset_name} train_tokens:{total_train_tokens}")
+    if args.use_causal_machine_bias and args.causal_machine_profile_json:
+        log0(
+            f"causal_machine_profile_ignored:{args.causal_machine_profile_json} "
+            f"mode:random_init num_states:{args.causal_machine_num_states}"
+        )
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
@@ -4933,6 +5018,7 @@ def main() -> None:
         attention_kv_mode=args.attention_kv_mode,
         use_causal_machine_bias=args.use_causal_machine_bias,
         causal_machine_profile_json=args.causal_machine_profile_json,
+        causal_machine_num_states=args.causal_machine_num_states,
         causal_machine_hidden_rank=args.causal_machine_hidden_rank,
         causal_machine_scale_init=args.causal_machine_scale_init,
         causal_machine_gate_init=args.causal_machine_gate_init,
