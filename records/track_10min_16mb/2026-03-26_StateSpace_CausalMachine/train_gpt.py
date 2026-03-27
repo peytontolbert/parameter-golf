@@ -78,46 +78,86 @@ USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_
 BOS_ID = -1
 
 _CAUSAL_MACHINE_SCAN_CUDA = None
+_CAUSAL_MACHINE_SCAN_CUDA_ERROR: Exception | None = None
+
+
+def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
+    return load_cpp_extension(
+        name="causal_machine_scan_cuda_ext",
+        sources=[
+            str(source_dir / "causal_machine_scan.cpp"),
+            str(source_dir / "causal_machine_scan_kernel.cu"),
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+        build_directory=str(build_dir),
+        verbose=False,
+    )
 
 
 def load_causal_machine_scan_cuda():
     global _CAUSAL_MACHINE_SCAN_CUDA
+    global _CAUSAL_MACHINE_SCAN_CUDA_ERROR
     if _CAUSAL_MACHINE_SCAN_CUDA is not None:
         return _CAUSAL_MACHINE_SCAN_CUDA
+    if _CAUSAL_MACHINE_SCAN_CUDA_ERROR is not None:
+        raise RuntimeError("causal_machine_scan_cuda is unavailable") from _CAUSAL_MACHINE_SCAN_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
     build_dir = source_dir / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
     last_exc: Exception | None = None
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    attempts = 4 if dist.is_available() and dist.is_initialized() else 2
-    for attempt in range(attempts):
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    attempts = 4 if distributed else 2
+    if not distributed:
         try:
-            if dist.is_available() and dist.is_initialized() and rank != 0 and attempt == 0:
-                dist.barrier()
-            _CAUSAL_MACHINE_SCAN_CUDA = load_cpp_extension(
-                name="causal_machine_scan_cuda_ext",
-                sources=[
-                    str(source_dir / "causal_machine_scan.cpp"),
-                    str(source_dir / "causal_machine_scan_kernel.cu"),
-                ],
-                extra_cflags=["-O3", "-std=c++17"],
-                extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
-                build_directory=str(build_dir),
-                verbose=False,
-            )
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
+            _CAUSAL_MACHINE_SCAN_CUDA = _load_causal_machine_scan_cuda_extension(source_dir, build_dir)
             return _CAUSAL_MACHINE_SCAN_CUDA
         except Exception as exc:
-            last_exc = exc
-            if dist.is_available() and dist.is_initialized():
-                try:
-                    dist.barrier()
-                except Exception:
-                    pass
-            if attempt + 1 < attempts:
-                time.sleep(0.5 * (attempt + 1))
-                continue
+            _CAUSAL_MACHINE_SCAN_CUDA_ERROR = exc
+            raise RuntimeError("causal_machine_scan_cuda is unavailable") from exc
+
+    sync_device = torch.device("cuda", torch.cuda.current_device())
+    for attempt in range(attempts):
+        local_exc: Exception | None = None
+        leader_success = torch.zeros(1, device=sync_device, dtype=torch.int32)
+        try:
+            if rank == 0:
+                if _CAUSAL_MACHINE_SCAN_CUDA is None:
+                    _CAUSAL_MACHINE_SCAN_CUDA = _load_causal_machine_scan_cuda_extension(source_dir, build_dir)
+                leader_success.fill_(1)
+        except Exception as exc:
+            local_exc = exc
+            if rank == 0:
+                _CAUSAL_MACHINE_SCAN_CUDA = None
+            leader_success.zero_()
+
+        dist.broadcast(leader_success, src=0)
+
+        if int(leader_success.item()) == 1:
+            try:
+                if rank != 0 and _CAUSAL_MACHINE_SCAN_CUDA is None:
+                    _CAUSAL_MACHINE_SCAN_CUDA = _load_causal_machine_scan_cuda_extension(source_dir, build_dir)
+            except Exception as exc:
+                local_exc = exc
+                _CAUSAL_MACHINE_SCAN_CUDA = None
+
+            load_ok = torch.tensor([0 if local_exc is not None else 1], device=sync_device, dtype=torch.int32)
+            dist.all_reduce(load_ok, op=dist.ReduceOp.MIN)
+            if int(load_ok.item()) == 1:
+                return _CAUSAL_MACHINE_SCAN_CUDA
+
+        if local_exc is None:
+            local_exc = RuntimeError(
+                f"causal_machine_scan_cuda leader build failed on rank 0 during attempt {attempt + 1}/{attempts}"
+            )
+        last_exc = local_exc
+        _CAUSAL_MACHINE_SCAN_CUDA = None
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+
+    _CAUSAL_MACHINE_SCAN_CUDA_ERROR = last_exc
     raise RuntimeError("causal_machine_scan_cuda is unavailable after retries") from last_exc
 
 
