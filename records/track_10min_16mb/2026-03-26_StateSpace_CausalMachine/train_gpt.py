@@ -353,6 +353,7 @@ class Hyperparameters:
     early_val_max_seqs = int(os.environ.get("EARLY_VAL_MAX_SEQS", "256"))
     milestone_val_max_seqs = int(os.environ.get("MILESTONE_VAL_MAX_SEQS", "256"))
     final_eval_max_seqs = int(os.environ.get("FINAL_EVAL_MAX_SEQS", "0"))
+    use_strict_streaming_eval = bool(int(os.environ.get("USE_STRICT_STREAMING_EVAL", "0")))
     submission_size_limit_bytes = int(os.environ.get("SUBMISSION_SIZE_LIMIT_BYTES", 16_000_000))
     label_smoothing = float(os.environ.get("LABEL_SMOOTHING", 0.0))
     z_loss_coeff = float(os.environ.get("Z_LOSS_COEFF", 0.00005))
@@ -585,6 +586,7 @@ class Hyperparameters:
             "eval_seq_len": "EVAL_SEQ_LEN",
             "eval_stride": "EVAL_STRIDE",
             "eval_batch_seqs": "EVAL_BATCH_SEQS",
+            "use_strict_streaming_eval": "USE_STRICT_STREAMING_EVAL",
             "train_batch_tokens": "TRAIN_BATCH_TOKENS",
             "early_val_max_seqs": "EARLY_VAL_MAX_SEQS",
             "lr_warmup_steps": "LR_WARMUP_STEPS",
@@ -1322,7 +1324,7 @@ def run_validation(
 ) -> tuple[float, float, str, float, float, float]:
     eval_seq_len = seq_len_override if seq_len_override > 0 else get_eval_seq_len(args)
     if uses_sliding_eval(args):
-        if can_use_strict_streaming_caches(base_model):
+        if args.use_strict_streaming_eval and can_use_strict_streaming_caches(base_model):
             val_loss, val_bpb, bits_per_token, tokens_per_byte, bytes_per_token = eval_val_sliding_streaming_strict(
                 args,
                 base_model,
@@ -5258,9 +5260,6 @@ def main() -> None:
     def next_train_microbatch() -> tuple[Tensor, Tensor, Tensor | None]:
         x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
         loss_mask = None
-        if can_use_strict_streaming_caches(base_model):
-            x = x.reshape(1, -1)
-            y = y.reshape(1, -1)
         return x, y, loss_mask
 
     current_train_step = 0
