@@ -613,7 +613,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
     auto prior_states = torch::zeros_like(drive);
     auto states = torch::zeros_like(drive);
     auto final_state = torch::zeros_like(initial_state);
-    if (seq_len == 0) {
+    if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         final_state.copy_(initial_state);
         return {states, prior_states, final_state};
     }
@@ -680,7 +680,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
     auto chunk_prev = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
     auto prior_states = torch::zeros_like(drive);
     auto final_state = torch::zeros_like(initial_state);
-    if (seq_len == 0) {
+    if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         final_state.copy_(initial_state);
         return {prior_states, final_state};
     }
@@ -746,7 +746,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
     auto grad_drive = torch::zeros_like(states);
     auto grad_decay = torch::zeros_like(decay);
     auto grad_initial_state = torch::zeros_like(initial_state);
-    if (seq_len == 0) {
+    if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
@@ -831,7 +831,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
     auto grad_drive = torch::zeros_like(prior_states);
     auto grad_decay = torch::zeros_like(decay);
     auto grad_initial_state = torch::zeros_like(initial_state);
-    if (seq_len == 0) {
+    if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
