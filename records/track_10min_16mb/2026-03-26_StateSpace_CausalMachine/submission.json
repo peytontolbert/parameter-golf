@@ -1,0 +1,13 @@
+{
+  "track": "10min_16mb",
+  "date": "2026-03-26",
+  "name": "State Space Causal Machine",
+  "author": "TBD",
+  "seed_results": {},
+  "mean_val_loss": null,
+  "mean_val_bpb": null,
+  "p_value": null,
+  "artifact_bytes": null,
+  "code_bytes": null,
+  "notes": "Scaffold created from the LocalObjective/SharedTail/SoftLexicalGate record and flipped to the v20 causal-machine state-space variant. Fill metrics after train.log is finalized."
+}
