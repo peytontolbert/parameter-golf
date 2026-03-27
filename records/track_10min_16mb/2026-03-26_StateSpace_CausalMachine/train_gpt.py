@@ -5100,6 +5100,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.mid_aux_loss_coeff <= 0.0 and getattr(base_model, "mid_aux_head", None) is not None:
+        for param in base_model.mid_aux_head.parameters():
+            param.requires_grad_(False)
     if args.init_model_path:
         missing_keys, unexpected_keys = load_initial_model_state(
             base_model,
