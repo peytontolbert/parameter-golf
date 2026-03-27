@@ -4029,6 +4029,11 @@ class GPT(nn.Module):
             if causal_machine_enabled
             else None
         )
+        self.causal_machine_decoder_hidden = (
+            CastedLinear(self.causal_machine_hidden_rank, self.causal_machine_hidden_rank, bias=True)
+            if causal_machine_enabled
+            else None
+        )
         self.causal_machine_state_head = (
             CastedLinear(self.causal_machine_hidden_rank, self.causal_machine_num_states, bias=False)
             if causal_machine_enabled
@@ -4119,6 +4124,10 @@ class GPT(nn.Module):
                 nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.causal_machine_prefix_down is not None:
             nn.init.normal_(self.causal_machine_prefix_down.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.causal_machine_decoder_hidden is not None:
+            nn.init.normal_(self.causal_machine_decoder_hidden.weight, mean=0.0, std=self.tied_embed_init_std)
+            if self.causal_machine_decoder_hidden.bias is not None:
+                nn.init.zeros_(self.causal_machine_decoder_hidden.bias)
         if self.causal_machine_state_head is not None:
             nn.init.normal_(self.causal_machine_state_head.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.causal_machine_transition_context is not None:
@@ -4245,6 +4254,8 @@ class GPT(nn.Module):
         self,
         state_hidden: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        if self.causal_machine_decoder_hidden is not None:
+            state_hidden = torch.tanh(self._apply_output_head(self.causal_machine_decoder_hidden, state_hidden))
         if self.causal_machine_state_head is None:
             return state_hidden, torch.zeros_like(state_hidden)
         local_logits = self._apply_output_head(self.causal_machine_state_head, state_hidden)
