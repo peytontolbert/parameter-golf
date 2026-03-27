@@ -211,6 +211,13 @@ def causal_machine_scan_cuda(
     )
 
 
+def inverse_softplus_scalar(value: float) -> float:
+    value = max(float(value), 1e-6)
+    if value > 20.0:
+        return value
+    return math.log(math.expm1(value))
+
+
 @dataclass
 class CausalMachineCache:
     log_belief: Tensor | None = None
