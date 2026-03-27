@@ -300,13 +300,14 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "use_causal_machine_bias": False,
     "causal_machine_num_states": 128,
     "causal_machine_hidden_rank": 128,
-    "causal_machine_scale_init": 0.35,
-    "causal_machine_gate_init": -1.5,
-    "causal_machine_teacher_loss_coeff": 0.05,
-    "causal_machine_state_loss_coeff": 0.02,
-    "causal_machine_transition_gate_init": 0.0,
-    "causal_machine_transition_stickiness_init": 3.0,
-    "causal_machine_emit_delta_scale_init": 0.05,
+    "causal_machine_scale_init": 0.5,
+    "causal_machine_gate_init": -0.75,
+    "causal_machine_teacher_loss_coeff": 0.0,
+    "causal_machine_state_loss_coeff": 0.0,
+    "causal_machine_next_token_loss_coeff": 0.05,
+    "causal_machine_transition_gate_init": -3.0,
+    "causal_machine_transition_stickiness_init": 4.0,
+    "causal_machine_emit_delta_scale_init": 0.10,
     "orthogonal_init": True,
     "mup_proj_init": True,
     "overtone_embed_init": True,
@@ -566,6 +567,12 @@ class Hyperparameters:
             str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_state_loss_coeff"])),
         )
     )
+    causal_machine_next_token_loss_coeff = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_NEXT_TOKEN_LOSS_COEFF",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_next_token_loss_coeff"])),
+        )
+    )
     causal_machine_transition_gate_init = float(
         os.environ.get(
             "CAUSAL_MACHINE_TRANSITION_GATE_INIT",
@@ -692,6 +699,7 @@ class Hyperparameters:
             "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
             "causal_machine_teacher_loss_coeff": "CAUSAL_MACHINE_TEACHER_LOSS_COEFF",
             "causal_machine_state_loss_coeff": "CAUSAL_MACHINE_STATE_LOSS_COEFF",
+            "causal_machine_next_token_loss_coeff": "CAUSAL_MACHINE_NEXT_TOKEN_LOSS_COEFF",
             "causal_machine_transition_gate_init": "CAUSAL_MACHINE_TRANSITION_GATE_INIT",
             "causal_machine_transition_stickiness_init": "CAUSAL_MACHINE_TRANSITION_STICKINESS_INIT",
             "causal_machine_emit_delta_scale_init": "CAUSAL_MACHINE_EMIT_DELTA_SCALE_INIT",
@@ -3940,6 +3948,7 @@ class GPT(nn.Module):
         causal_machine_gate_init: float,
         causal_machine_teacher_loss_coeff: float,
         causal_machine_state_loss_coeff: float,
+        causal_machine_next_token_loss_coeff: float,
         causal_machine_transition_gate_init: float,
         causal_machine_transition_stickiness_init: float,
         causal_machine_emit_delta_scale_init: float,
@@ -3985,6 +3994,7 @@ class GPT(nn.Module):
         self.causal_machine_gate_init = float(causal_machine_gate_init)
         self.causal_machine_teacher_loss_coeff = max(float(causal_machine_teacher_loss_coeff), 0.0)
         self.causal_machine_state_loss_coeff = max(float(causal_machine_state_loss_coeff), 0.0)
+        self.causal_machine_next_token_loss_coeff = max(float(causal_machine_next_token_loss_coeff), 0.0)
         self.causal_machine_transition_gate_init = float(causal_machine_transition_gate_init)
         self.causal_machine_transition_stickiness_init = float(causal_machine_transition_stickiness_init)
         self.causal_machine_emit_delta_scale_init = max(float(causal_machine_emit_delta_scale_init), 0.0)
@@ -4741,6 +4751,18 @@ class GPT(nn.Module):
             logit_var_loss_coeff=logit_var_loss_coeff,
         )
         if causal_machine_raw_logits is not None:
+            if self.causal_machine_next_token_loss_coeff > 0.0:
+                state_ce = F.cross_entropy(
+                    causal_machine_raw_logits.reshape(-1, causal_machine_raw_logits.size(-1)).float(),
+                    target_ids.reshape(-1),
+                    reduction="none",
+                    label_smoothing=label_smoothing,
+                ).view_as(target_ids)
+                if loss_mask is None:
+                    state_next_token_loss = state_ce.mean()
+                else:
+                    state_next_token_loss = (state_ce * loss_mask.to(dtype=state_ce.dtype)).sum() / loss_mask.sum().clamp_min(1.0)
+                loss = loss + self.causal_machine_next_token_loss_coeff * state_next_token_loss.to(dtype=loss.dtype)
             teacher_state_ids = self._compute_causal_machine_teacher_state_ids(target_ids)
             if teacher_state_ids is not None:
                 mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
@@ -5078,6 +5100,7 @@ def main() -> None:
         causal_machine_gate_init=args.causal_machine_gate_init,
         causal_machine_teacher_loss_coeff=args.causal_machine_teacher_loss_coeff,
         causal_machine_state_loss_coeff=args.causal_machine_state_loss_coeff,
+        causal_machine_next_token_loss_coeff=args.causal_machine_next_token_loss_coeff,
         causal_machine_transition_gate_init=args.causal_machine_transition_gate_init,
         causal_machine_transition_stickiness_init=args.causal_machine_transition_stickiness_init,
         causal_machine_emit_delta_scale_init=args.causal_machine_emit_delta_scale_init,
