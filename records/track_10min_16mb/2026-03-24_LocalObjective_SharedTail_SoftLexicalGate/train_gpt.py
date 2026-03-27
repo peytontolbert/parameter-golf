@@ -80,7 +80,7 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "eval_seq_len": 2048,
     "num_layers": 10,
     "num_kv_heads": 4,
-    "mlp_hidden": 448,
+    "mlp_hidden": 896,
     "use_smear_gate": True,
     "bigram_vocab_size": 16384,
     "bigram_dim": 64,
@@ -99,6 +99,18 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "residual_logit_rank": 16,
     "residual_logit_scale_init": 0.20,
     "residual_logit_gate_init": -2.0,
+    "use_fixed_spectral_logit_adapter": False,
+    "fixed_spectral_logit_rank": 16,
+    "fixed_spectral_logit_scale_init": 0.10,
+    "fixed_spectral_logit_gate_init": -2.0,
+    "fixed_spectral_logit_map": "hadamard",
+    "fixed_spectral_logit_seed": 17,
+    "use_causal_machine_bias": False,
+    "causal_machine_hidden_rank": 32,
+    "causal_machine_scale_init": 0.25,
+    "causal_machine_gate_init": -2.0,
+    "causal_machine_teacher_loss_coeff": 0.05,
+    "causal_machine_state_loss_coeff": 0.02,
     "use_online_doc_bias": True,
     "doc_bias_rank": 8,
     "doc_bias_scale_init": 0.10,
@@ -136,6 +148,11 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "shared_tail_enable_step": 0,
     "shared_tail_ramp_steps": 400,
     "shared_tail_max_mult": 1.0,
+    "use_shared_tail_lag_summary": False,
+    "shared_tail_lag_offsets": "4,8",
+    "shared_tail_lag_rank": 16,
+    "shared_tail_lag_scale_init": 0.05,
+    "shared_tail_lag_gate_init": -2.5,
     "use_alibi": True,
     "helper_path_full_steps": 1000,
     "helper_path_decay_end_step": 6000,
@@ -439,6 +456,33 @@ class Hyperparameters:
     shared_tail_max_mult = float(
         os.environ.get("SHARED_TAIL_MAX_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["shared_tail_max_mult"])))
     )
+    use_shared_tail_lag_summary = bool(
+        int(
+            os.environ.get(
+                "USE_SHARED_TAIL_LAG_SUMMARY",
+                "1" if LOCAL_PROXY_RECIPE_COMMON["use_shared_tail_lag_summary"] else "0",
+            )
+        )
+    )
+    shared_tail_lag_offsets = os.environ.get(
+        "SHARED_TAIL_LAG_OFFSETS",
+        str(LOCAL_PROXY_RECIPE_COMMON["shared_tail_lag_offsets"]),
+    ).strip()
+    shared_tail_lag_rank = int(
+        os.environ.get("SHARED_TAIL_LAG_RANK", str(int(LOCAL_PROXY_RECIPE_COMMON["shared_tail_lag_rank"])))
+    )
+    shared_tail_lag_scale_init = float(
+        os.environ.get(
+            "SHARED_TAIL_LAG_SCALE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["shared_tail_lag_scale_init"])),
+        )
+    )
+    shared_tail_lag_gate_init = float(
+        os.environ.get(
+            "SHARED_TAIL_LAG_GATE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["shared_tail_lag_gate_init"])),
+        )
+    )
     signed_skip_weights = bool(int(os.environ.get("SIGNED_SKIP_WEIGHTS", "1")))
     mid_aux_enable_step = int(
         os.environ.get("MID_AUX_ENABLE_STEP", str(int(LOCAL_PROXY_RECIPE_COMMON["mid_aux_enable_step"])))
@@ -571,6 +615,81 @@ class Hyperparameters:
             str(float(LOCAL_PROXY_RECIPE_COMMON["residual_logit_gate_init"])),
         )
     )
+    use_fixed_spectral_logit_adapter = bool(
+        int(
+            os.environ.get(
+                "USE_FIXED_SPECTRAL_LOGIT_ADAPTER",
+                "1" if LOCAL_PROXY_RECIPE_COMMON["use_fixed_spectral_logit_adapter"] else "0",
+            )
+        )
+    )
+    fixed_spectral_logit_rank = int(
+        os.environ.get(
+            "FIXED_SPECTRAL_LOGIT_RANK",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["fixed_spectral_logit_rank"])),
+        )
+    )
+    fixed_spectral_logit_scale_init = float(
+        os.environ.get(
+            "FIXED_SPECTRAL_LOGIT_SCALE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["fixed_spectral_logit_scale_init"])),
+        )
+    )
+    fixed_spectral_logit_gate_init = float(
+        os.environ.get(
+            "FIXED_SPECTRAL_LOGIT_GATE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["fixed_spectral_logit_gate_init"])),
+        )
+    )
+    fixed_spectral_logit_map = os.environ.get(
+        "FIXED_SPECTRAL_LOGIT_MAP",
+        str(LOCAL_PROXY_RECIPE_COMMON["fixed_spectral_logit_map"]),
+    ).strip().lower()
+    fixed_spectral_logit_seed = int(
+        os.environ.get(
+            "FIXED_SPECTRAL_LOGIT_SEED",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["fixed_spectral_logit_seed"])),
+        )
+    )
+    use_causal_machine_bias = bool(
+        int(
+            os.environ.get(
+                "USE_CAUSAL_MACHINE_BIAS",
+                "1" if LOCAL_PROXY_RECIPE_COMMON["use_causal_machine_bias"] else "0",
+            )
+        )
+    )
+    causal_machine_profile_json = os.environ.get("CAUSAL_MACHINE_PROFILE_JSON", "").strip()
+    causal_machine_hidden_rank = int(
+        os.environ.get(
+            "CAUSAL_MACHINE_HIDDEN_RANK",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_hidden_rank"])),
+        )
+    )
+    causal_machine_scale_init = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_SCALE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_scale_init"])),
+        )
+    )
+    causal_machine_gate_init = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_GATE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_gate_init"])),
+        )
+    )
+    causal_machine_teacher_loss_coeff = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_TEACHER_LOSS_COEFF",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_teacher_loss_coeff"])),
+        )
+    )
+    causal_machine_state_loss_coeff = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_STATE_LOSS_COEFF",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_state_loss_coeff"])),
+        )
+    )
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -693,6 +812,11 @@ class Hyperparameters:
             "shared_tail_enable_step": "SHARED_TAIL_ENABLE_STEP",
             "shared_tail_ramp_steps": "SHARED_TAIL_RAMP_STEPS",
             "shared_tail_max_mult": "SHARED_TAIL_MAX_MULT",
+            "use_shared_tail_lag_summary": "USE_SHARED_TAIL_LAG_SUMMARY",
+            "shared_tail_lag_offsets": "SHARED_TAIL_LAG_OFFSETS",
+            "shared_tail_lag_rank": "SHARED_TAIL_LAG_RANK",
+            "shared_tail_lag_scale_init": "SHARED_TAIL_LAG_SCALE_INIT",
+            "shared_tail_lag_gate_init": "SHARED_TAIL_LAG_GATE_INIT",
             "signed_skip_weights": "SIGNED_SKIP_WEIGHTS",
             "helper_path_full_steps": "HELPER_PATH_FULL_STEPS",
             "use_pairwise_logit_prior": "USE_PAIRWISE_LOGIT_PRIOR",
@@ -714,6 +838,19 @@ class Hyperparameters:
             "residual_logit_rank": "RESIDUAL_LOGIT_RANK",
             "residual_logit_scale_init": "RESIDUAL_LOGIT_SCALE_INIT",
             "residual_logit_gate_init": "RESIDUAL_LOGIT_GATE_INIT",
+            "use_fixed_spectral_logit_adapter": "USE_FIXED_SPECTRAL_LOGIT_ADAPTER",
+            "fixed_spectral_logit_rank": "FIXED_SPECTRAL_LOGIT_RANK",
+            "fixed_spectral_logit_scale_init": "FIXED_SPECTRAL_LOGIT_SCALE_INIT",
+            "fixed_spectral_logit_gate_init": "FIXED_SPECTRAL_LOGIT_GATE_INIT",
+            "fixed_spectral_logit_map": "FIXED_SPECTRAL_LOGIT_MAP",
+            "fixed_spectral_logit_seed": "FIXED_SPECTRAL_LOGIT_SEED",
+            "use_causal_machine_bias": "USE_CAUSAL_MACHINE_BIAS",
+            "causal_machine_profile_json": "CAUSAL_MACHINE_PROFILE_JSON",
+            "causal_machine_hidden_rank": "CAUSAL_MACHINE_HIDDEN_RANK",
+            "causal_machine_scale_init": "CAUSAL_MACHINE_SCALE_INIT",
+            "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
+            "causal_machine_teacher_loss_coeff": "CAUSAL_MACHINE_TEACHER_LOSS_COEFF",
+            "causal_machine_state_loss_coeff": "CAUSAL_MACHINE_STATE_LOSS_COEFF",
             "helper_path_decay_end_step": "HELPER_PATH_DECAY_END_STEP",
             "use_adaptive_rmsnorm": "USE_ADAPTIVE_RMSNORM",
             "adaptive_rmsnorm_gate_init": "ADAPTIVE_RMSNORM_GATE_INIT",
@@ -2113,6 +2250,23 @@ def parse_step_list(raw: str) -> tuple[int, ...]:
             continue
         if step > 0:
             values.append(step)
+    return tuple(sorted(set(values)))
+
+
+def parse_positive_offset_list(raw: str, default: tuple[int, ...] = (4, 8)) -> tuple[int, ...]:
+    values: list[int] = []
+    for piece in raw.replace("/", ",").split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            value = int(piece)
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    if not values:
+        values = list(default)
     return tuple(sorted(set(values)))
 
 
@@ -4872,6 +5026,19 @@ class GPT(nn.Module):
         residual_logit_rank: int,
         residual_logit_scale_init: float,
         residual_logit_gate_init: float,
+        use_fixed_spectral_logit_adapter: bool,
+        fixed_spectral_logit_rank: int,
+        fixed_spectral_logit_scale_init: float,
+        fixed_spectral_logit_gate_init: float,
+        fixed_spectral_logit_map: str,
+        fixed_spectral_logit_seed: int,
+        use_causal_machine_bias: bool,
+        causal_machine_profile_json: str,
+        causal_machine_hidden_rank: int,
+        causal_machine_scale_init: float,
+        causal_machine_gate_init: float,
+        causal_machine_teacher_loss_coeff: float,
+        causal_machine_state_loss_coeff: float,
         lexical_batch_diversity_throttle: float,
         lexical_batch_repeat_throttle: float,
         lexical_batch_min_mult: float,
@@ -4880,6 +5047,11 @@ class GPT(nn.Module):
         shared_tail_enable_step: int,
         shared_tail_ramp_steps: int,
         shared_tail_max_mult: float,
+        use_shared_tail_lag_summary: bool,
+        shared_tail_lag_offsets: str,
+        shared_tail_lag_rank: int,
+        shared_tail_lag_scale_init: float,
+        shared_tail_lag_gate_init: float,
         signed_skip_weights: bool,
         orthogonal_init: bool,
         mup_proj_init: bool,
@@ -4954,11 +5126,29 @@ class GPT(nn.Module):
         self.residual_logit_rank = max(int(residual_logit_rank), 0)
         self.residual_logit_scale_init = max(float(residual_logit_scale_init), 0.0)
         self.residual_logit_gate_init = float(residual_logit_gate_init)
+        self.use_fixed_spectral_logit_adapter = bool(use_fixed_spectral_logit_adapter)
+        self.fixed_spectral_logit_rank = max(int(fixed_spectral_logit_rank), 0)
+        self.fixed_spectral_logit_scale_init = max(float(fixed_spectral_logit_scale_init), 0.0)
+        self.fixed_spectral_logit_gate_init = float(fixed_spectral_logit_gate_init)
+        self.fixed_spectral_logit_map = str(fixed_spectral_logit_map or "hadamard").strip().lower()
+        self.fixed_spectral_logit_seed = int(fixed_spectral_logit_seed)
+        self.use_causal_machine_bias = bool(use_causal_machine_bias)
+        self.causal_machine_profile_json = str(causal_machine_profile_json or "").strip()
+        self.causal_machine_hidden_rank = max(int(causal_machine_hidden_rank), 0)
+        self.causal_machine_scale_init = max(float(causal_machine_scale_init), 0.0)
+        self.causal_machine_gate_init = float(causal_machine_gate_init)
+        self.causal_machine_teacher_loss_coeff = max(float(causal_machine_teacher_loss_coeff), 0.0)
+        self.causal_machine_state_loss_coeff = max(float(causal_machine_state_loss_coeff), 0.0)
         self.shared_tail_output_gate = bool(shared_tail_output_gate)
         self.shared_tail_output_init = float(shared_tail_output_init)
         self.shared_tail_enable_step = max(int(shared_tail_enable_step), 0)
         self.shared_tail_ramp_steps = max(int(shared_tail_ramp_steps), 0)
         self.shared_tail_max_mult = min(max(float(shared_tail_max_mult), 0.0), 1.0)
+        self.use_shared_tail_lag_summary = bool(use_shared_tail_lag_summary)
+        self.shared_tail_lag_offsets = parse_positive_offset_list(shared_tail_lag_offsets)
+        self.shared_tail_lag_rank = max(int(shared_tail_lag_rank), 0)
+        self.shared_tail_lag_scale_init = max(float(shared_tail_lag_scale_init), 0.0)
+        self.shared_tail_lag_gate_init = float(shared_tail_lag_gate_init)
         self.signed_skip_weights = bool(signed_skip_weights)
         self.rope_dims = max(int(rope_dims), 0)
         self.ln_scale = bool(ln_scale)
@@ -5071,6 +5261,30 @@ class GPT(nn.Module):
         self.shared_tail_gate = (
             nn.Parameter(torch.tensor(self.shared_tail_output_init, dtype=torch.float32))
             if self.shared_tail_output_gate
+            else None
+        )
+        lag_summary_enabled = self.use_shared_tail_lag_summary and self.shared_tail_lag_rank > 0 and bool(self.shared_tail_lag_offsets)
+        lag_input_dim = model_dim * max(len(self.shared_tail_lag_offsets), 1)
+        self.shared_tail_lag_down = (
+            CastedLinear(lag_input_dim, self.shared_tail_lag_rank, bias=False)
+            if lag_summary_enabled
+            else None
+        )
+        self.shared_tail_lag_up = (
+            CastedLinear(self.shared_tail_lag_rank, model_dim, bias=False)
+            if lag_summary_enabled
+            else None
+        )
+        if self.shared_tail_lag_up is not None:
+            self.shared_tail_lag_up._zero_init = True
+        self.shared_tail_lag_scale = (
+            nn.Parameter(torch.tensor(inverse_softplus_scalar(self.shared_tail_lag_scale_init), dtype=torch.float32))
+            if lag_summary_enabled
+            else None
+        )
+        self.shared_tail_lag_gate = (
+            nn.Parameter(torch.tensor(self.shared_tail_lag_gate_init, dtype=torch.float32))
+            if lag_summary_enabled
             else None
         )
         self.last_lexical_batch_mult = 1.0
@@ -5238,6 +5452,83 @@ class GPT(nn.Module):
             if residual_logit_enabled
             else None
         )
+        spectral_logit_enabled = self.use_fixed_spectral_logit_adapter and self.fixed_spectral_logit_rank > 0
+        self.fixed_spectral_logit_down = (
+            CastedLinear(model_dim, self.fixed_spectral_logit_rank, bias=False)
+            if spectral_logit_enabled
+            else None
+        )
+        self.fixed_spectral_logit_scale = (
+            nn.Parameter(
+                torch.tensor(inverse_softplus_scalar(self.fixed_spectral_logit_scale_init), dtype=torch.float32)
+            )
+            if spectral_logit_enabled
+            else None
+        )
+        self.fixed_spectral_logit_gate = (
+            nn.Parameter(torch.tensor(self.fixed_spectral_logit_gate_init, dtype=torch.float32))
+            if spectral_logit_enabled
+            else None
+        )
+        if spectral_logit_enabled:
+            fixed_spectral_basis = build_fixed_spectral_basis(
+                vocab_size,
+                self.fixed_spectral_logit_rank,
+                self.fixed_spectral_logit_map,
+                self.fixed_spectral_logit_seed,
+                dtype=torch.float32,
+            ).transpose(0, 1).contiguous()
+        else:
+            fixed_spectral_basis = torch.empty((0, 0), dtype=torch.float32)
+        self.register_buffer("fixed_spectral_logit_basis", fixed_spectral_basis, persistent=False)
+        causal_machine_enabled = self.use_causal_machine_bias and self.causal_machine_hidden_rank > 0 and bool(self.causal_machine_profile_json)
+        causal_machine_profile: dict[str, object] | None = None
+        if causal_machine_enabled:
+            causal_machine_profile = load_causal_machine_profile(self.causal_machine_profile_json)
+        self.causal_machine_num_states = 0 if causal_machine_profile is None else int(causal_machine_profile["num_states"])
+        self.causal_machine_sketch_dim = 0 if causal_machine_profile is None else int(causal_machine_profile["sketch_dim"])
+        self.causal_machine_horizons = [] if causal_machine_profile is None else [int(v) for v in causal_machine_profile["horizons"]]
+        self.causal_machine_prefix_down = (
+            CastedLinear(model_dim, self.causal_machine_hidden_rank, bias=False)
+            if causal_machine_profile is not None
+            else None
+        )
+        self.causal_machine_state_head = (
+            CastedLinear(self.causal_machine_hidden_rank, self.causal_machine_num_states, bias=False)
+            if causal_machine_profile is not None
+            else None
+        )
+        self.causal_machine_scale = (
+            nn.Parameter(torch.tensor(inverse_softplus_scalar(self.causal_machine_scale_init), dtype=torch.float32))
+            if causal_machine_profile is not None
+            else None
+        )
+        self.causal_machine_gate = (
+            nn.Parameter(torch.tensor(self.causal_machine_gate_init, dtype=torch.float32))
+            if causal_machine_profile is not None
+            else None
+        )
+        if causal_machine_profile is not None:
+            causal_machine_log_probs = torch.from_numpy(causal_machine_profile["log_probs"]).to(dtype=torch.float32)
+            causal_machine_state_masses = torch.from_numpy(causal_machine_profile["state_masses"]).to(dtype=torch.float32)
+            causal_machine_centroids = torch.from_numpy(causal_machine_profile["centroids_sketch"]).to(dtype=torch.float32)
+            causal_machine_horizons = torch.tensor(self.causal_machine_horizons, dtype=torch.int64)
+            bucket_ids_np, signs_np = _sketch_token_tables(vocab_size, self.causal_machine_sketch_dim)
+            bucket_ids_t = torch.from_numpy(bucket_ids_np.astype(np.int64, copy=False))
+            signs_t = torch.from_numpy(signs_np.astype(np.float32, copy=False))
+        else:
+            causal_machine_log_probs = torch.empty((0, 0), dtype=torch.float32)
+            causal_machine_state_masses = torch.empty((0,), dtype=torch.float32)
+            causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
+            causal_machine_horizons = torch.empty((0,), dtype=torch.int64)
+            bucket_ids_t = torch.empty((0,), dtype=torch.int64)
+            signs_t = torch.empty((0,), dtype=torch.float32)
+        self.register_buffer("causal_machine_log_probs", causal_machine_log_probs, persistent=True)
+        self.register_buffer("causal_machine_state_masses", causal_machine_state_masses, persistent=True)
+        self.register_buffer("causal_machine_signature_centroids", causal_machine_centroids, persistent=False)
+        self.register_buffer("causal_machine_horizon_tensor", causal_machine_horizons, persistent=False)
+        self.register_buffer("causal_machine_bucket_ids", bucket_ids_t, persistent=False)
+        self.register_buffer("causal_machine_signs", signs_t, persistent=False)
         self.mid_aux_head = CastedLinear(model_dim, vocab_size, bias=False)
         self.mid_aux_head._zero_init = True
         self.last_pairwise_logit_gate_mean = 0.0
@@ -5259,6 +5550,12 @@ class GPT(nn.Module):
             nn.init.normal_(self.doc_bias_embed.weight, mean=0.0, std=self.tied_embed_init_std)
         if self.doc_bias_head is not None:
             nn.init.normal_(self.doc_bias_head.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.shared_tail_lag_down is not None:
+            nn.init.normal_(self.shared_tail_lag_down.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.causal_machine_prefix_down is not None:
+            nn.init.normal_(self.causal_machine_prefix_down.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.causal_machine_state_head is not None:
+            nn.init.normal_(self.causal_machine_state_head.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -5458,6 +5755,85 @@ class GPT(nn.Module):
         gate = torch.sigmoid(self.residual_logit_gate).to(device=x.device, dtype=x.dtype)
         return scale * gate * adapter_logits.to(dtype=x.dtype)
 
+    def _compute_fixed_spectral_logit_adapter(self, x: Tensor) -> Tensor | None:
+        if (
+            self.fixed_spectral_logit_down is None
+            or self.fixed_spectral_logit_scale is None
+            or self.fixed_spectral_logit_gate is None
+            or self.fixed_spectral_logit_basis.numel() == 0
+        ):
+            return None
+        spectral_hidden = self._apply_output_head(self.fixed_spectral_logit_down, x)
+        basis = self.fixed_spectral_logit_basis.to(device=x.device, dtype=spectral_hidden.dtype)
+        spectral_logits = F.linear(spectral_hidden, basis)
+        scale = F.softplus(self.fixed_spectral_logit_scale).to(device=x.device, dtype=x.dtype)
+        gate = torch.sigmoid(self.fixed_spectral_logit_gate).to(device=x.device, dtype=x.dtype)
+        return scale * gate * spectral_logits.to(dtype=x.dtype)
+
+    def _compute_causal_machine_state_features(self, x: Tensor) -> Tensor:
+        prefix_cumsum = x.cumsum(dim=1)
+        prefix_sum = torch.cat([torch.zeros_like(prefix_cumsum[:, :1, :]), prefix_cumsum[:, :-1, :]], dim=1)
+        seq_len = int(x.size(1))
+        positions = torch.arange(seq_len, device=x.device, dtype=x.dtype).view(1, seq_len, 1)
+        denom = positions.clamp_min(1.0)
+        prefix_mean = prefix_sum / denom
+        return x + prefix_mean
+
+    def _compute_causal_machine_outputs(self, x: Tensor) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+        if (
+            self.causal_machine_prefix_down is None
+            or self.causal_machine_state_head is None
+            or self.causal_machine_scale is None
+            or self.causal_machine_gate is None
+            or self.causal_machine_log_probs.numel() == 0
+        ):
+            return None, None, None
+        state_features = self._compute_causal_machine_state_features(x)
+        state_hidden = self._apply_output_head(self.causal_machine_prefix_down, state_features)
+        state_logits = self._apply_output_head(self.causal_machine_state_head, state_hidden)
+        state_probs = torch.softmax(state_logits.float(), dim=-1).to(dtype=x.dtype)
+        log_probs = self.causal_machine_log_probs.to(device=x.device, dtype=x.dtype)
+        raw_machine_logits = torch.matmul(state_probs, log_probs)
+        scale = F.softplus(self.causal_machine_scale).to(device=x.device, dtype=x.dtype)
+        gate = torch.sigmoid(self.causal_machine_gate).to(device=x.device, dtype=x.dtype)
+        return scale * gate * raw_machine_logits, state_logits, raw_machine_logits
+
+    def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+        if (
+            self.causal_machine_signature_centroids.numel() == 0
+            or self.causal_machine_bucket_ids.numel() == 0
+            or self.causal_machine_signs.numel() == 0
+            or self.causal_machine_horizon_tensor.numel() == 0
+            or self.causal_machine_sketch_dim <= 0
+        ):
+            return None
+        batch_size, seq_len = target_ids.shape
+        flat_size = batch_size * seq_len
+        bucket_ids = self.causal_machine_bucket_ids.to(device=target_ids.device)
+        signs = self.causal_machine_signs.to(device=target_ids.device)
+        blocks: list[Tensor] = []
+        for horizon in self.causal_machine_horizon_tensor.tolist():
+            accum = torch.zeros((flat_size, self.causal_machine_sketch_dim), device=target_ids.device, dtype=torch.float32)
+            denom = torch.zeros((flat_size, 1), device=target_ids.device, dtype=torch.float32)
+            for offset in range(int(horizon)):
+                shifted = torch.zeros_like(target_ids)
+                valid = torch.zeros_like(target_ids, dtype=torch.float32)
+                if offset < seq_len:
+                    shifted[:, : seq_len - offset] = target_ids[:, offset:]
+                    valid[:, : seq_len - offset] = 1.0
+                flat_bucket = bucket_ids[shifted].reshape(-1, 1)
+                flat_weight = (signs[shifted] * valid).reshape(-1, 1)
+                accum.scatter_add_(1, flat_bucket, flat_weight)
+                denom = denom + valid.reshape(-1, 1)
+            accum = accum / denom.clamp_min(1.0)
+            blocks.append(accum)
+        features = torch.cat(blocks, dim=1)
+        centroids = self.causal_machine_signature_centroids.to(device=target_ids.device, dtype=features.dtype)
+        feat_norm = (features * features).sum(dim=1, keepdim=True)
+        centroid_norm = (centroids * centroids).sum(dim=1).unsqueeze(0)
+        dists = feat_norm - 2.0 * (features @ centroids.transpose(0, 1)) + centroid_norm
+        return torch.argmin(dists, dim=1).reshape(batch_size, seq_len)
+
     def _staged_mult(self, step: int, enable_step: int, ramp_steps: int) -> float:
         step = max(int(step), 0)
         enable_step = max(int(enable_step), 0)
@@ -5567,6 +5943,30 @@ class GPT(nn.Module):
         tail_mult = tail_mult * self._shared_tail_schedule_mult(device=x.device, dtype=x.dtype)
         if self.shared_tail_gate is not None:
             tail_mult = tail_mult * torch.sigmoid(self.shared_tail_gate.to(dtype=x.dtype))
+        lag_summary = None
+        if (
+            self.shared_tail_lag_down is not None
+            and self.shared_tail_lag_up is not None
+            and self.shared_tail_lag_scale is not None
+            and self.shared_tail_lag_gate is not None
+            and self.shared_tail_lag_offsets
+        ):
+            shifted_features: list[Tensor] = []
+            batch_size, seq_len, width = tail_base.shape
+            for offset in self.shared_tail_lag_offsets:
+                if seq_len <= offset:
+                    shifted = torch.zeros_like(tail_base)
+                else:
+                    prefix = torch.zeros((batch_size, offset, width), device=tail_base.device, dtype=tail_base.dtype)
+                    shifted = torch.cat((prefix, tail_base[:, :-offset, :]), dim=1)
+                shifted_features.append(shifted)
+            lag_inputs = torch.cat(shifted_features, dim=-1)
+            lag_hidden = self._apply_output_head(self.shared_tail_lag_down, lag_inputs)
+            lag_delta = self._apply_output_head(self.shared_tail_lag_up, lag_hidden)
+            lag_scale = F.softplus(self.shared_tail_lag_scale).to(device=x.device, dtype=x.dtype)
+            lag_gate = torch.sigmoid(self.shared_tail_lag_gate).to(device=x.device, dtype=x.dtype)
+            lag_summary = lag_scale * lag_gate * lag_delta.to(dtype=x.dtype)
+            x = x + tail_mult * lag_summary
         for repeat_idx in range(self.shared_layer_repeats):
             for layer_idx, block in enumerate(self.shared_blocks):
                 prev_x = x
@@ -5904,6 +6304,7 @@ class GPT(nn.Module):
         input_ids: Tensor | None = None,
         lexical_shortcut_logits: Tensor | None = None,
         lexical_confidence: Tensor | None = None,
+        causal_machine_logits: Tensor | None = None,
     ) -> Tensor:
         if self.tie_embeddings:
             embed_weight = self._embedding_weight()
@@ -5939,6 +6340,11 @@ class GPT(nn.Module):
         residual_adapter_logits = self._compute_residual_logit_adapter(x)
         if residual_adapter_logits is not None:
             logits_proj = logits_proj + residual_adapter_logits.to(dtype=logits_proj.dtype)
+        fixed_spectral_logits = self._compute_fixed_spectral_logit_adapter(x)
+        if fixed_spectral_logits is not None:
+            logits_proj = logits_proj + fixed_spectral_logits.to(dtype=logits_proj.dtype)
+        if causal_machine_logits is not None:
+            logits_proj = logits_proj + causal_machine_logits.to(dtype=logits_proj.dtype)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(
@@ -5952,11 +6358,15 @@ class GPT(nn.Module):
         mid_aux_loss_coeff: float | Tensor = 0.01,
     ) -> Tensor:
         features, h_mid, lexical_shortcut_logits, lexical_confidence = self._forward_features(input_ids)
+        causal_machine_logits, causal_machine_state_logits, causal_machine_raw_logits = self._compute_causal_machine_outputs(
+            features
+        )
         logits = self._project_logits(
             features,
             input_ids=input_ids,
             lexical_shortcut_logits=lexical_shortcut_logits,
             lexical_confidence=lexical_confidence,
+            causal_machine_logits=causal_machine_logits,
         )
         loss = self._loss_from_logits(
             logits,
@@ -5966,6 +6376,30 @@ class GPT(nn.Module):
             z_loss_coeff=z_loss_coeff,
             logit_var_loss_coeff=logit_var_loss_coeff,
         )
+        if causal_machine_raw_logits is not None:
+            teacher_state_ids = self._compute_causal_machine_teacher_state_ids(target_ids)
+            if teacher_state_ids is not None:
+                mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
+                teacher_log_probs = self.causal_machine_log_probs[teacher_state_ids].to(device=logits.device, dtype=torch.float32)
+                student_log_probs = F.log_softmax(causal_machine_raw_logits.float(), dim=-1)
+                teacher_probs = teacher_log_probs.exp()
+                teacher_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+                if mask is None:
+                    teacher_loss = teacher_kl.mean()
+                else:
+                    teacher_loss = (teacher_kl * mask).sum() / mask.sum().clamp_min(1.0)
+                loss = loss + self.causal_machine_teacher_loss_coeff * teacher_loss.to(dtype=loss.dtype)
+                if causal_machine_state_logits is not None:
+                    state_ce = F.cross_entropy(
+                        causal_machine_state_logits.reshape(-1, causal_machine_state_logits.size(-1)).float(),
+                        teacher_state_ids.reshape(-1),
+                        reduction="none",
+                    ).view_as(target_ids)
+                    if mask is None:
+                        state_loss = state_ce.mean()
+                    else:
+                        state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
+                    loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
         if h_mid is not None:
             if h_mid.size(1) == target_ids.size(1):
                 mid_logits = self._mid_aux_logits(h_mid)
@@ -5993,11 +6427,13 @@ class GPT(nn.Module):
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x, _, lexical_shortcut_logits, lexical_confidence = self._forward_features(input_ids)
+        causal_machine_logits, _, _ = self._compute_causal_machine_outputs(x)
         return self._project_logits(
             x,
             input_ids=input_ids,
             lexical_shortcut_logits=lexical_shortcut_logits,
             lexical_confidence=lexical_confidence,
+            causal_machine_logits=causal_machine_logits,
         )
 
     @torch.no_grad()
@@ -6015,6 +6451,7 @@ class GPT(nn.Module):
                 input_ids,
                 return_pre_final=True,
             )
+            causal_machine_logits, _, _ = self._compute_causal_machine_outputs(features)
             if self.tie_embeddings:
                 embed_weight = self._embedding_weight()
                 logits_proj = F.linear(features.to(dtype=embed_weight.dtype), embed_weight)
@@ -6048,6 +6485,11 @@ class GPT(nn.Module):
             residual_adapter_logits = self._compute_residual_logit_adapter(features)
             if residual_adapter_logits is not None:
                 logits_proj = logits_proj + residual_adapter_logits.to(dtype=logits_proj.dtype)
+            fixed_spectral_logits = self._compute_fixed_spectral_logit_adapter(features)
+            if fixed_spectral_logits is not None:
+                logits_proj = logits_proj + fixed_spectral_logits.to(dtype=logits_proj.dtype)
+            if causal_machine_logits is not None:
+                logits_proj = logits_proj + causal_machine_logits.to(dtype=logits_proj.dtype)
             logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
             valid = loss_mask.to(dtype=torch.bool) if loss_mask is not None else torch.ones_like(target_ids, dtype=torch.bool)
             valid_count = int(valid.sum().item())
@@ -6221,6 +6663,131 @@ def inverse_softplus_scalar(value: float) -> float:
     if value > 20.0:
         return value
     return math.log(math.expm1(value))
+
+
+def _next_power_of_two(value: int) -> int:
+    value = max(int(value), 1)
+    return 1 << (value - 1).bit_length()
+
+
+def _hadamard_matrix(size: int, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> Tensor:
+    if size <= 0 or size & (size - 1):
+        raise ValueError(f"Hadamard size must be a positive power of two, got {size}")
+    h = torch.tensor([[1.0]], device=device, dtype=dtype)
+    while int(h.size(0)) < size:
+        h = torch.cat(
+            (
+                torch.cat((h, h), dim=1),
+                torch.cat((h, -h), dim=1),
+            ),
+            dim=0,
+        )
+    return h
+
+
+def build_fixed_spectral_basis(
+    vocab_size: int,
+    rank: int,
+    map_type: str,
+    seed: int,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    vocab_size = max(int(vocab_size), 1)
+    rank = max(int(rank), 1)
+    map_type = str(map_type or "hadamard").strip().lower()
+    if map_type in {"hadamard", "signed_hadamard"}:
+        side = _next_power_of_two(max(vocab_size, rank))
+        basis = _hadamard_matrix(side, device=device, dtype=dtype)[:vocab_size, :rank]
+        return basis / math.sqrt(float(side))
+    if map_type in {"fourier", "phase"}:
+        positions = torch.arange(vocab_size, device=device, dtype=dtype).unsqueeze(1)
+        freq_idx = torch.arange(rank, device=device, dtype=dtype).unsqueeze(0)
+        phase = 2.0 * math.pi * positions * (freq_idx + 1.0) / float(max(vocab_size, 1))
+        basis = torch.cos(phase)
+        if rank > 1:
+            odd = torch.arange(1, rank, 2, device=device)
+            basis[:, odd] = torch.sin(phase[:, odd])
+        basis = basis - basis.mean(dim=0, keepdim=True)
+        basis = basis / basis.norm(dim=0, keepdim=True).clamp_min(1e-6)
+        return basis
+    if map_type in {"orthogonal", "random_orthogonal", "random"}:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        random_matrix = torch.randn((vocab_size, rank), generator=generator, dtype=torch.float32)
+        q, _ = torch.linalg.qr(random_matrix, mode="reduced")
+        if int(q.size(1)) < rank:
+            repeats = math.ceil(rank / max(int(q.size(1)), 1))
+            q = q.repeat(1, repeats)[:, :rank]
+        return q.to(device=device, dtype=dtype)
+    raise ValueError(f"Unsupported FIXED_SPECTRAL_LOGIT_MAP={map_type!r}")
+
+
+def _sketch_token_tables(vocab_size: int, sketch_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    token_ids = np.arange(vocab_size, dtype=np.int64)
+    bucket_ids = ((token_ids * np.int64(1103515245) + np.int64(12345)) % np.int64(max(sketch_dim, 1))).astype(
+        np.int64, copy=False
+    )
+    sign_bits = ((token_ids * np.int64(214013) + np.int64(2531011)) >> np.int64(4)) & np.int64(1)
+    signs = np.where(sign_bits == 0, 1.0, -1.0).astype(np.float32, copy=False)
+    return bucket_ids, signs
+
+
+def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
+    profile_path = Path(profile_json_path).expanduser()
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"CAUSAL_MACHINE_PROFILE_JSON not found: {profile_path}")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    future_profile = profile.get("future_signature_profile")
+    if not isinstance(future_profile, dict) or not bool(future_profile.get("available")):
+        raise ValueError(f"{profile_path} does not contain an available future_signature_profile")
+    horizons = [int(v) for v in future_profile.get("horizons", []) if int(v) > 0]
+    if not horizons:
+        raise ValueError(f"{profile_path} does not contain valid future_signature_profile horizons")
+    signature_dim = int(future_profile.get("signature_dim", 0))
+    if signature_dim <= 0 or signature_dim % len(horizons) != 0:
+        raise ValueError(f"{profile_path} has invalid future signature dimension {signature_dim} for horizons={horizons}")
+    per_horizon_dim = signature_dim // len(horizons)
+    sketch_dim = per_horizon_dim - 1
+    if sketch_dim <= 0:
+        raise ValueError(f"{profile_path} implies non-positive causal machine sketch dim {sketch_dim}")
+    spectral_block = profile.get("spectral_eigenbases")
+    if not isinstance(spectral_block, dict):
+        raise ValueError(f"{profile_path} is missing spectral_eigenbases metadata")
+    sidecar_path = spectral_block.get("sidecar_npz")
+    if not isinstance(sidecar_path, str) or not sidecar_path.strip():
+        candidate = profile_path.with_name(f"{profile_path.stem}_spectral_eigenbases.npz")
+        sidecar = candidate
+    else:
+        sidecar = Path(sidecar_path)
+    if not sidecar.is_absolute():
+        sidecar = (profile_path.parent / sidecar).resolve()
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"Causal machine sidecar not found: {sidecar}")
+    with np.load(sidecar) as arrays:
+        if "causal_machine_signature_centroids" not in arrays or "causal_machine_log_probs" not in arrays:
+            raise ValueError(f"{sidecar} is missing causal machine arrays")
+        centroids = arrays["causal_machine_signature_centroids"].astype(np.float32, copy=False)
+        log_probs = arrays["causal_machine_log_probs"].astype(np.float32, copy=False)
+        state_masses = (
+            arrays["causal_machine_state_masses"].astype(np.float32, copy=False)
+            if "causal_machine_state_masses" in arrays
+            else np.zeros((log_probs.shape[0],), dtype=np.float32)
+        )
+    keep_cols: list[int] = []
+    for idx in range(len(horizons)):
+        base = idx * per_horizon_dim
+        keep_cols.extend(range(base, base + sketch_dim))
+    centroids_sketch = centroids[:, keep_cols].astype(np.float32, copy=False)
+    return {
+        "num_states": int(log_probs.shape[0]),
+        "horizons": horizons,
+        "sketch_dim": int(sketch_dim),
+        "log_probs": log_probs,
+        "state_masses": state_masses,
+        "centroids_sketch": centroids_sketch,
+    }
 
 
 def linear_anneal_multiplier(step: int, full_steps: int, decay_end_step: int) -> float:
@@ -6485,6 +7052,19 @@ def main() -> None:
         residual_logit_rank=args.residual_logit_rank,
         residual_logit_scale_init=args.residual_logit_scale_init,
         residual_logit_gate_init=args.residual_logit_gate_init,
+        use_fixed_spectral_logit_adapter=args.use_fixed_spectral_logit_adapter,
+        fixed_spectral_logit_rank=args.fixed_spectral_logit_rank,
+        fixed_spectral_logit_scale_init=args.fixed_spectral_logit_scale_init,
+        fixed_spectral_logit_gate_init=args.fixed_spectral_logit_gate_init,
+        fixed_spectral_logit_map=args.fixed_spectral_logit_map,
+        fixed_spectral_logit_seed=args.fixed_spectral_logit_seed,
+        use_causal_machine_bias=args.use_causal_machine_bias,
+        causal_machine_profile_json=args.causal_machine_profile_json,
+        causal_machine_hidden_rank=args.causal_machine_hidden_rank,
+        causal_machine_scale_init=args.causal_machine_scale_init,
+        causal_machine_gate_init=args.causal_machine_gate_init,
+        causal_machine_teacher_loss_coeff=args.causal_machine_teacher_loss_coeff,
+        causal_machine_state_loss_coeff=args.causal_machine_state_loss_coeff,
         lexical_batch_diversity_throttle=args.lexical_batch_diversity_throttle,
         lexical_batch_repeat_throttle=args.lexical_batch_repeat_throttle,
         lexical_batch_min_mult=args.lexical_batch_min_mult,
@@ -6493,6 +7073,11 @@ def main() -> None:
         shared_tail_enable_step=args.shared_tail_enable_step,
         shared_tail_ramp_steps=args.shared_tail_ramp_steps,
         shared_tail_max_mult=args.shared_tail_max_mult,
+        use_shared_tail_lag_summary=args.use_shared_tail_lag_summary,
+        shared_tail_lag_offsets=args.shared_tail_lag_offsets,
+        shared_tail_lag_rank=args.shared_tail_lag_rank,
+        shared_tail_lag_scale_init=args.shared_tail_lag_scale_init,
+        shared_tail_lag_gate_init=args.shared_tail_lag_gate_init,
         signed_skip_weights=args.signed_skip_weights,
         orthogonal_init=args.orthogonal_init,
         mup_proj_init=args.mup_proj_init,
@@ -6653,6 +7238,28 @@ def main() -> None:
         other_matrix_params.append(base_model.residual_logit_down.weight)
     if getattr(base_model, "residual_logit_up", None) is not None:
         other_matrix_params.append(base_model.residual_logit_up.weight)
+    if getattr(base_model, "fixed_spectral_logit_scale", None) is not None:
+        scalar_params.append(base_model.fixed_spectral_logit_scale)
+    if getattr(base_model, "fixed_spectral_logit_gate", None) is not None:
+        scalar_params.append(base_model.fixed_spectral_logit_gate)
+    if getattr(base_model, "fixed_spectral_logit_down", None) is not None:
+        other_matrix_params.append(base_model.fixed_spectral_logit_down.weight)
+    if getattr(base_model, "causal_machine_scale", None) is not None:
+        scalar_params.append(base_model.causal_machine_scale)
+    if getattr(base_model, "causal_machine_gate", None) is not None:
+        scalar_params.append(base_model.causal_machine_gate)
+    if getattr(base_model, "causal_machine_prefix_down", None) is not None:
+        other_matrix_params.append(base_model.causal_machine_prefix_down.weight)
+    if getattr(base_model, "causal_machine_state_head", None) is not None:
+        other_matrix_params.append(base_model.causal_machine_state_head.weight)
+    if getattr(base_model, "shared_tail_lag_scale", None) is not None:
+        scalar_params.append(base_model.shared_tail_lag_scale)
+    if getattr(base_model, "shared_tail_lag_gate", None) is not None:
+        scalar_params.append(base_model.shared_tail_lag_gate)
+    if getattr(base_model, "shared_tail_lag_down", None) is not None:
+        other_matrix_params.append(base_model.shared_tail_lag_down.weight)
+    if getattr(base_model, "shared_tail_lag_up", None) is not None:
+        other_matrix_params.append(base_model.shared_tail_lag_up.weight)
     if isinstance(base_model.final_norm, AdaptiveRMSNorm):
         scalar_params.append(base_model.final_norm.base_log_scale)
         if base_model.final_norm.cond_gate is not None:
