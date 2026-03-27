@@ -323,7 +323,7 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "adaptive_rmsnorm_gate_init": -2.0,
     "num_shared_layers": 0,
     "shared_layer_repeats": 0,
-    "mid_aux_loss_coeff": 0.025,
+    "mid_aux_loss_coeff": 0.0,
     "mid_aux_enable_step": 0,
     "mid_aux_ramp_steps": 120,
     "mid_aux_decay_start_step": 280,
@@ -3470,11 +3470,19 @@ class CastedLinear(nn.Linear):
         self.fake_quant_bits = 0
 
     def forward(self, x: Tensor) -> Tensor:
-        bias = self.bias.to(x.dtype) if self.bias is not None else None
         weight = self.weight
         if self.fake_quant_bits > 0:
             weight = fake_quantize_tensor(weight, self.fake_quant_bits)
-        return F.linear(x, weight.to(x.dtype), bias)
+        bias = self.bias
+        # Let autocast handle compute dtype promotion so we do not allocate a fresh
+        # casted weight tensor on every forward and fragment CUDA memory over time.
+        if torch.is_autocast_enabled():
+            return F.linear(x, weight, bias)
+        if weight.dtype != x.dtype:
+            weight = weight.to(dtype=x.dtype)
+            if bias is not None:
+                bias = bias.to(dtype=x.dtype)
+        return F.linear(x, weight, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -4756,7 +4764,12 @@ class GPT(nn.Module):
                     else:
                         state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
                     loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
-        if h_mid is not None:
+        mid_aux_active = False
+        if torch.is_tensor(mid_aux_loss_coeff):
+            mid_aux_active = bool(mid_aux_loss_coeff.detach().abs().max().item() > 0.0)
+        else:
+            mid_aux_active = abs(float(mid_aux_loss_coeff)) > 0.0
+        if mid_aux_active and h_mid is not None:
             if h_mid.size(1) == target_ids.size(1):
                 mid_logits = self._mid_aux_logits(h_mid)
                 mid_ce = F.cross_entropy(
