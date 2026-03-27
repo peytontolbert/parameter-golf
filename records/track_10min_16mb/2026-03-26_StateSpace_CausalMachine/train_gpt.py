@@ -285,13 +285,20 @@ def inverse_softplus_scalar(value: float) -> float:
     return math.log(math.expm1(value))
 
 
+def inverse_sigmoid_scalar(value: float) -> float:
+    value = min(max(float(value), 1.0e-6), 1.0 - 1.0e-6)
+    return math.log(value / (1.0 - value))
+
+
 @dataclass
 class CausalMachineCache:
     log_belief: Tensor | None = None
+    latent_state: Tensor | None = None
     num_updates: int = 0
 
     def reset(self) -> None:
         self.log_belief = None
+        self.latent_state = None
         self.num_updates = 0
 
 
@@ -343,8 +350,11 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "causal_machine_num_states": 128,
     "causal_machine_hidden_rank": 64,
     "causal_machine_transition_rank": 8,
+    "causal_machine_latent_rank": 0,
     "causal_machine_scale_init": 0.35,
     "causal_machine_gate_init": -1.5,
+    "causal_machine_latent_gate_init": -2.0,
+    "causal_machine_latent_decay_init": 0.95,
     "causal_machine_teacher_loss_coeff": 0.0,
     "causal_machine_state_loss_coeff": 0.06,
     "causal_machine_next_token_loss_coeff": 0.0,
@@ -649,6 +659,12 @@ class Hyperparameters:
             str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_transition_rank"])),
         )
     )
+    causal_machine_latent_rank = int(
+        os.environ.get(
+            "CAUSAL_MACHINE_LATENT_RANK",
+            str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_latent_rank"])),
+        )
+    )
     causal_machine_num_states = int(
         os.environ.get(
             "CAUSAL_MACHINE_NUM_STATES",
@@ -665,6 +681,18 @@ class Hyperparameters:
         os.environ.get(
             "CAUSAL_MACHINE_GATE_INIT",
             str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_gate_init"])),
+        )
+    )
+    causal_machine_latent_gate_init = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_LATENT_GATE_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_latent_gate_init"])),
+        )
+    )
+    causal_machine_latent_decay_init = float(
+        os.environ.get(
+            "CAUSAL_MACHINE_LATENT_DECAY_INIT",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["causal_machine_latent_decay_init"])),
         )
     )
     causal_machine_teacher_loss_coeff = float(
@@ -821,8 +849,11 @@ class Hyperparameters:
             "causal_machine_num_states": "CAUSAL_MACHINE_NUM_STATES",
             "causal_machine_hidden_rank": "CAUSAL_MACHINE_HIDDEN_RANK",
             "causal_machine_transition_rank": "CAUSAL_MACHINE_TRANSITION_RANK",
+            "causal_machine_latent_rank": "CAUSAL_MACHINE_LATENT_RANK",
             "causal_machine_scale_init": "CAUSAL_MACHINE_SCALE_INIT",
             "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
+            "causal_machine_latent_gate_init": "CAUSAL_MACHINE_LATENT_GATE_INIT",
+            "causal_machine_latent_decay_init": "CAUSAL_MACHINE_LATENT_DECAY_INIT",
             "causal_machine_teacher_loss_coeff": "CAUSAL_MACHINE_TEACHER_LOSS_COEFF",
             "causal_machine_state_loss_coeff": "CAUSAL_MACHINE_STATE_LOSS_COEFF",
             "causal_machine_next_token_loss_coeff": "CAUSAL_MACHINE_NEXT_TOKEN_LOSS_COEFF",
@@ -4081,8 +4112,11 @@ class CausalStateMixer(nn.Module):
         hidden_rank: int,
         num_states: int,
         transition_rank: int,
+        latent_rank: int,
         scale_init: float,
         gate_init: float,
+        latent_gate_init: float,
+        latent_decay_init: float,
         transition_gate_init: float,
         transition_stickiness_init: float,
         emit_delta_scale_init: float,
@@ -4096,6 +4130,7 @@ class CausalStateMixer(nn.Module):
         self.hidden_rank = hidden_rank
         self.num_states = num_states
         self.transition_rank = max(1, int(transition_rank))
+        self.latent_rank = max(int(latent_rank), 0)
         self.filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
         self.transition_context_rank = max(8, min(16, hidden_rank))
         self.track_state_ce = bool(track_state_ce)
@@ -4107,10 +4142,27 @@ class CausalStateMixer(nn.Module):
         self.transition_context_in = CastedLinear(hidden_rank, self.transition_context_rank, bias=False)
         self.transition_context_out = CastedLinear(self.transition_context_rank, num_states, bias=False)
         self.transition_context_out._zero_init = True
+        self.latent_in = CastedLinear(hidden_rank, self.latent_rank, bias=False) if self.latent_rank > 0 else None
+        self.latent_gate_in = CastedLinear(hidden_rank, self.latent_rank, bias=True) if self.latent_rank > 0 else None
+        self.latent_out = CastedLinear(self.latent_rank, num_states, bias=False) if self.latent_rank > 0 else None
         self.hidden_gate = CastedLinear(hidden_rank, 1, bias=True)
         self.belief_out = CastedLinear(num_states, dim, bias=False)
         self.output_scale = nn.Parameter(torch.tensor(inverse_softplus_scalar(scale_init), dtype=torch.float32))
         self.output_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
+        self.latent_output_gate = (
+            nn.Parameter(torch.tensor(latent_gate_init, dtype=torch.float32)) if self.latent_rank > 0 else None
+        )
+        self.latent_decay_logits = (
+            nn.Parameter(
+                torch.full(
+                    (self.latent_rank,),
+                    fill_value=inverse_sigmoid_scalar(latent_decay_init),
+                    dtype=torch.float32,
+                )
+            )
+            if self.latent_rank > 0
+            else None
+        )
         self.transition_gate = nn.Parameter(torch.tensor(transition_gate_init, dtype=torch.float32))
         self.transition_source_logits = nn.Parameter(torch.zeros((num_states, self.transition_rank), dtype=torch.float32))
         self.transition_dest_logits = nn.Parameter(torch.zeros((self.transition_rank, num_states), dtype=torch.float32))
@@ -4162,6 +4214,55 @@ class CausalStateMixer(nn.Module):
         local_logits = self.state_head(state_hidden)
         transition_context = self.transition_context_out(self.transition_context_in(state_hidden))
         return state_hidden, local_logits, transition_context
+
+    def _compute_latent_logits_sequence(self, state_hidden: Tensor) -> Tensor | None:
+        if (
+            self.latent_in is None
+            or self.latent_gate_in is None
+            or self.latent_out is None
+            or self.latent_output_gate is None
+            or self.latent_decay_logits is None
+        ):
+            return None
+        drive = self.latent_in(state_hidden).float() * torch.sigmoid(self.latent_gate_in(state_hidden).float())
+        decay = torch.sigmoid(self.latent_decay_logits.float()).clamp(0.90, 0.9995)
+        prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
+        latent_chunks: list[Tensor] = []
+        chunk_size = max(int(self.filter_chunk_size), 1)
+        decay_b = decay.view(1, 1, self.latent_rank)
+        for chunk_start in range(0, int(drive.size(1)), chunk_size):
+            chunk = drive[:, chunk_start : chunk_start + chunk_size, :]
+            chunk_len = int(chunk.size(1))
+            positions = torch.arange(chunk_len, device=drive.device, dtype=torch.float32).view(1, chunk_len, 1)
+            powers = torch.pow(decay_b, positions)
+            scaled = chunk / powers.clamp_min(1.0e-8)
+            prefix = torch.cumsum(scaled, dim=1)
+            chunk_states = powers * (decay_b * prev.unsqueeze(1) + prefix)
+            latent_chunks.append(chunk_states)
+            prev = chunk_states[:, -1, :]
+        latent_hidden = torch.tanh(torch.cat(latent_chunks, dim=1)).to(dtype=state_hidden.dtype)
+        gate = torch.sigmoid(self.latent_output_gate.float()).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        return gate * self.latent_out(latent_hidden)
+
+    def _compute_latent_logits_step(self, state_hidden: Tensor, cache: CausalMachineCache) -> Tensor | None:
+        if (
+            self.latent_in is None
+            or self.latent_gate_in is None
+            or self.latent_out is None
+            or self.latent_output_gate is None
+            or self.latent_decay_logits is None
+        ):
+            return None
+        drive = self.latent_in(state_hidden).float() * torch.sigmoid(self.latent_gate_in(state_hidden).float())
+        prev = cache.latent_state
+        if prev is None:
+            prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
+        decay = torch.sigmoid(self.latent_decay_logits.float()).clamp(0.90, 0.9995).view(1, -1)
+        next_state = decay * prev + drive[:, 0, :]
+        cache.latent_state = next_state.detach()
+        latent_hidden = torch.tanh(next_state).to(dtype=state_hidden.dtype).unsqueeze(1)
+        gate = torch.sigmoid(self.latent_output_gate.float()).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        return gate * self.latent_out(latent_hidden)
 
     def _structured_transition_params(self) -> tuple[Tensor, Tensor, Tensor]:
         transition_source_probs = F.softmax(self.transition_source_logits.float(), dim=-1)
@@ -4261,6 +4362,9 @@ class CausalStateMixer(nn.Module):
     def forward_simple(self, x: Tensor) -> Tensor:
         batch_size = int(x.size(0))
         state_hidden, local_logits, transition_context = self._project_hidden(x)
+        latent_logits = self._compute_latent_logits_sequence(state_hidden)
+        if latent_logits is not None:
+            local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
         initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
         state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(local_logits, transition_context, initial_log_belief)
         future_sketch_pred = (
@@ -4281,6 +4385,9 @@ class CausalStateMixer(nn.Module):
         if x.size(1) != 1:
             raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
         state_hidden, local_logits, transition_context = self._project_hidden(x)
+        latent_logits = self._compute_latent_logits_step(state_hidden, cache)
+        if latent_logits is not None:
+            local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
         state_log_beliefs = self._filter_step(local_logits, transition_context, cache)
         return self._decode(state_hidden, state_log_beliefs)
 
@@ -4301,8 +4408,11 @@ class StateSpaceBlock(nn.Module):
         causal_machine_num_states: int,
         causal_machine_hidden_rank: int,
         causal_machine_transition_rank: int,
+        causal_machine_latent_rank: int,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
+        causal_machine_latent_gate_init: float,
+        causal_machine_latent_decay_init: float,
         causal_machine_transition_gate_init: float,
         causal_machine_transition_stickiness_init: float,
         causal_machine_emit_delta_scale_init: float,
@@ -4328,8 +4438,11 @@ class StateSpaceBlock(nn.Module):
             hidden_rank=causal_machine_hidden_rank,
             num_states=causal_machine_num_states,
             transition_rank=causal_machine_transition_rank,
+            latent_rank=causal_machine_latent_rank,
             scale_init=causal_machine_scale_init,
             gate_init=causal_machine_gate_init,
+            latent_gate_init=causal_machine_latent_gate_init,
+            latent_decay_init=causal_machine_latent_decay_init,
             transition_gate_init=causal_machine_transition_gate_init,
             transition_stickiness_init=causal_machine_transition_stickiness_init,
             emit_delta_scale_init=causal_machine_emit_delta_scale_init,
@@ -4434,8 +4547,11 @@ class GPT(nn.Module):
         causal_machine_num_states: int,
         causal_machine_hidden_rank: int,
         causal_machine_transition_rank: int,
+        causal_machine_latent_rank: int,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
+        causal_machine_latent_gate_init: float,
+        causal_machine_latent_decay_init: float,
         causal_machine_teacher_loss_coeff: float,
         causal_machine_state_loss_coeff: float,
         causal_machine_next_token_loss_coeff: float,
@@ -4497,8 +4613,11 @@ class GPT(nn.Module):
         self.causal_machine_num_states = max(int(causal_machine_num_states), 0)
         self.causal_machine_hidden_rank = max(int(causal_machine_hidden_rank), 0)
         self.causal_machine_transition_rank = max(int(causal_machine_transition_rank), 1)
+        self.causal_machine_latent_rank = max(int(causal_machine_latent_rank), 0)
         self.causal_machine_scale_init = max(float(causal_machine_scale_init), 0.0)
         self.causal_machine_gate_init = float(causal_machine_gate_init)
+        self.causal_machine_latent_gate_init = float(causal_machine_latent_gate_init)
+        self.causal_machine_latent_decay_init = float(causal_machine_latent_decay_init)
         self.causal_machine_teacher_loss_coeff = max(float(causal_machine_teacher_loss_coeff), 0.0)
         self.causal_machine_state_loss_coeff = max(float(causal_machine_state_loss_coeff), 0.0)
         self.causal_machine_next_token_loss_coeff = max(float(causal_machine_next_token_loss_coeff), 0.0)
@@ -4784,8 +4903,11 @@ class GPT(nn.Module):
                 causal_machine_num_states=self.causal_machine_num_states,
                 causal_machine_hidden_rank=self.causal_machine_hidden_rank,
                 causal_machine_transition_rank=self.causal_machine_transition_rank,
+                causal_machine_latent_rank=self.causal_machine_latent_rank,
                 causal_machine_scale_init=self.causal_machine_scale_init,
                 causal_machine_gate_init=self.causal_machine_gate_init,
+                causal_machine_latent_gate_init=self.causal_machine_latent_gate_init,
+                causal_machine_latent_decay_init=self.causal_machine_latent_decay_init,
                 causal_machine_transition_gate_init=self.causal_machine_transition_gate_init,
                 causal_machine_transition_stickiness_init=self.causal_machine_transition_stickiness_init,
                 causal_machine_emit_delta_scale_init=self.causal_machine_emit_delta_scale_init,
@@ -5917,8 +6039,11 @@ def main() -> None:
         causal_machine_num_states=args.causal_machine_num_states,
         causal_machine_hidden_rank=args.causal_machine_hidden_rank,
         causal_machine_transition_rank=args.causal_machine_transition_rank,
+        causal_machine_latent_rank=args.causal_machine_latent_rank,
         causal_machine_scale_init=args.causal_machine_scale_init,
         causal_machine_gate_init=args.causal_machine_gate_init,
+        causal_machine_latent_gate_init=args.causal_machine_latent_gate_init,
+        causal_machine_latent_decay_init=args.causal_machine_latent_decay_init,
         causal_machine_teacher_loss_coeff=args.causal_machine_teacher_loss_coeff,
         causal_machine_state_loss_coeff=args.causal_machine_state_loss_coeff,
         causal_machine_next_token_loss_coeff=args.causal_machine_next_token_loss_coeff,
