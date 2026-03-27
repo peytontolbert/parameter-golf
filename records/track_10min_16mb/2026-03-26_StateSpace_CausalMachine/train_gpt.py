@@ -4803,6 +4803,62 @@ def load_initial_model_state(model: nn.Module, path: str, strict: bool) -> tuple
     return list(getattr(incompatible, "missing_keys", [])), list(getattr(incompatible, "unexpected_keys", []))
 
 
+def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
+    profile_path = Path(profile_json_path).expanduser()
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"CAUSAL_MACHINE_PROFILE_JSON not found: {profile_path}")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    future_profile = profile.get("future_signature_profile")
+    if not isinstance(future_profile, dict) or not bool(future_profile.get("available")):
+        raise ValueError(f"{profile_path} does not contain an available future_signature_profile")
+    horizons = [int(v) for v in future_profile.get("horizons", []) if int(v) > 0]
+    if not horizons:
+        raise ValueError(f"{profile_path} does not contain valid future_signature_profile horizons")
+    signature_dim = int(future_profile.get("signature_dim", 0))
+    if signature_dim <= 0 or signature_dim % len(horizons) != 0:
+        raise ValueError(f"{profile_path} has invalid future signature dimension {signature_dim} for horizons={horizons}")
+    per_horizon_dim = signature_dim // len(horizons)
+    sketch_dim = per_horizon_dim - 1
+    if sketch_dim <= 0:
+        raise ValueError(f"{profile_path} implies non-positive causal machine sketch dim {sketch_dim}")
+    spectral_block = profile.get("spectral_eigenbases")
+    if not isinstance(spectral_block, dict):
+        raise ValueError(f"{profile_path} is missing spectral_eigenbases metadata")
+    sidecar_path = spectral_block.get("sidecar_npz")
+    if not isinstance(sidecar_path, str) or not sidecar_path.strip():
+        candidate = profile_path.with_name(f"{profile_path.stem}_spectral_eigenbases.npz")
+        sidecar = candidate
+    else:
+        sidecar = Path(sidecar_path)
+    if not sidecar.is_absolute():
+        sidecar = (profile_path.parent / sidecar).resolve()
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"Causal machine sidecar not found: {sidecar}")
+    with np.load(sidecar) as arrays:
+        if "causal_machine_signature_centroids" not in arrays or "causal_machine_log_probs" not in arrays:
+            raise ValueError(f"{sidecar} is missing causal machine arrays")
+        centroids = arrays["causal_machine_signature_centroids"].astype(np.float32, copy=False)
+        log_probs = arrays["causal_machine_log_probs"].astype(np.float32, copy=False)
+        state_masses = (
+            arrays["causal_machine_state_masses"].astype(np.float32, copy=False)
+            if "causal_machine_state_masses" in arrays
+            else np.zeros((log_probs.shape[0],), dtype=np.float32)
+        )
+    keep_cols: list[int] = []
+    for idx in range(len(horizons)):
+        base_idx = idx * per_horizon_dim
+        keep_cols.extend(range(base_idx, base_idx + sketch_dim))
+    centroids_sketch = centroids[:, keep_cols].astype(np.float32, copy=False)
+    return {
+        "num_states": int(log_probs.shape[0]),
+        "horizons": horizons,
+        "sketch_dim": int(sketch_dim),
+        "log_probs": log_probs,
+        "state_masses": state_masses,
+        "centroids_sketch": centroids_sketch,
+    }
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
