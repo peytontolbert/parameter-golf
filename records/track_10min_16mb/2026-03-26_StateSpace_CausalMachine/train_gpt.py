@@ -72,6 +72,7 @@ DEFAULT_TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
 # by default so the record script does not depend on external JSON/NPZ assets.
 DEFAULT_CAUSAL_MACHINE_PROFILE_JSON = ""
 DEFAULT_CAUSAL_MACHINE_NUM_STATES = 128
+DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA = 0.95
 DEFAULT_VOCAB_SIZE = 1024
 USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_SCAN", "1")))
 
@@ -4516,6 +4517,7 @@ class GPT(nn.Module):
         self.causal_machine_transition_gate_init = float(causal_machine_transition_gate_init)
         self.causal_machine_transition_stickiness_init = float(causal_machine_transition_stickiness_init)
         self.causal_machine_emit_delta_scale_init = max(float(causal_machine_emit_delta_scale_init), 0.0)
+        self.causal_machine_online_teacher_ema = float(DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA)
         self.causal_machine_filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
         self.shared_tail_output_gate = bool(shared_tail_output_gate)
         self.shared_tail_output_init = float(shared_tail_output_init)
@@ -4648,7 +4650,11 @@ class GPT(nn.Module):
             USE_CAUSAL_MACHINE_CUDA_SCAN and causal_machine_enabled and self.causal_machine_num_states == 128
         )
         if causal_machine_enabled:
-            causal_machine_log_probs = torch.zeros((self.causal_machine_num_states, vocab_size), dtype=torch.float32)
+            causal_machine_log_probs = torch.full(
+                (self.causal_machine_num_states, vocab_size),
+                fill_value=-math.log(max(vocab_size, 1)),
+                dtype=torch.float32,
+            )
             causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
             causal_machine_horizons = torch.empty((0,), dtype=torch.int64)
             causal_machine_log_state_priors = torch.full(
@@ -4672,6 +4678,7 @@ class GPT(nn.Module):
             causal_machine_emit_delta = torch.empty_like(causal_machine_log_probs, dtype=torch.float32)
             bucket_ids_t = torch.empty((0,), dtype=torch.int64)
             signs_t = torch.empty((0,), dtype=torch.float32)
+            online_state_counts = torch.zeros((self.causal_machine_num_states,), dtype=torch.float32)
         else:
             causal_machine_log_probs = torch.empty((0, 0), dtype=torch.float32)
             causal_machine_centroids = torch.empty((0, 0), dtype=torch.float32)
@@ -4683,6 +4690,7 @@ class GPT(nn.Module):
             causal_machine_emit_delta = torch.empty((0, 0), dtype=torch.float32)
             bucket_ids_t = torch.empty((0,), dtype=torch.int64)
             signs_t = torch.empty((0,), dtype=torch.float32)
+            online_state_counts = torch.empty((0,), dtype=torch.float32)
         self.register_buffer("causal_machine_log_probs", causal_machine_log_probs, persistent=True)
         self.register_buffer("causal_machine_log_state_priors", causal_machine_log_state_priors, persistent=True)
         self.causal_machine_transition_source_logits = (
@@ -4701,6 +4709,9 @@ class GPT(nn.Module):
         self.register_buffer("causal_machine_horizon_tensor", causal_machine_horizons, persistent=False)
         self.register_buffer("causal_machine_bucket_ids", bucket_ids_t, persistent=False)
         self.register_buffer("causal_machine_signs", signs_t, persistent=False)
+        self.register_buffer("causal_machine_online_state_counts", online_state_counts, persistent=False)
+        self.register_buffer("causal_machine_online_teacher_ready", torch.zeros((), dtype=torch.bool), persistent=False)
+        self.causal_machine_profile_loaded = False
         needs_default_online_sketch = (
             self.causal_machine_num_states > 0
             and self.vocab_size > 0
@@ -4722,6 +4733,9 @@ class GPT(nn.Module):
             total_sketch_dim = default_sketch_dim * len(default_horizons)
             self.causal_machine_signature_centroids = torch.zeros(
                 (self.causal_machine_num_states, total_sketch_dim), dtype=torch.float32
+            )
+            self.causal_machine_online_state_counts = torch.zeros(
+                (self.causal_machine_num_states,), dtype=torch.float32
             )
             for block in self.blocks:
                 if isinstance(block, StateSpaceBlock):
@@ -5092,6 +5106,9 @@ class GPT(nn.Module):
         self.causal_machine_signs = signs_t
         self.causal_machine_sketch_dim = sketch_dim
         self.causal_machine_horizons = horizons
+        self.causal_machine_profile_loaded = True
+        self.causal_machine_online_teacher_ready.fill_(True)
+        self.causal_machine_online_state_counts = state_masses.to(device=device, dtype=torch.float32).clone()
         for block in self.blocks:
             if isinstance(block, StateSpaceBlock):
                 block.attn.configure_future_sketch(total_sketch_dim)
@@ -5126,7 +5143,81 @@ class GPT(nn.Module):
             blocks.append(accum)
         return torch.cat(blocks, dim=1).reshape(batch_size, seq_len, -1)
 
+    @torch.no_grad()
+    def _update_online_causal_teacher(
+        self,
+        target_ids: Tensor,
+        state_log_beliefs: Tensor | None,
+    ) -> None:
+        if self.causal_machine_profile_loaded:
+            return
+        if state_log_beliefs is None or self.causal_machine_num_states <= 0:
+            return
+        features_3d = self._compute_causal_machine_future_sketch(target_ids)
+        if features_3d is None:
+            return
+        device = target_ids.device
+        num_states = self.causal_machine_num_states
+        features = features_3d.reshape(-1, features_3d.size(-1)).float()
+        assignments = state_log_beliefs.detach().float().argmax(dim=-1).reshape(-1)
+        if assignments.numel() == 0:
+            return
+        total_sketch_dim = int(features.size(-1))
+        if self.causal_machine_signature_centroids.shape != (num_states, total_sketch_dim):
+            self.causal_machine_signature_centroids = torch.zeros(
+                (num_states, total_sketch_dim), dtype=torch.float32, device=device
+            )
+        else:
+            self.causal_machine_signature_centroids = self.causal_machine_signature_centroids.to(
+                device=device, dtype=torch.float32
+            )
+        if self.causal_machine_online_state_counts.shape != (num_states,):
+            self.causal_machine_online_state_counts = torch.zeros(
+                (num_states,), dtype=torch.float32, device=device
+            )
+        else:
+            self.causal_machine_online_state_counts = self.causal_machine_online_state_counts.to(
+                device=device, dtype=torch.float32
+            )
+        batch_counts = torch.bincount(assignments, minlength=num_states).to(device=device, dtype=torch.float32)
+        present = batch_counts > 0
+        if not present.any():
+            return
+        batch_centroid_sums = torch.zeros_like(self.causal_machine_signature_centroids)
+        batch_centroid_sums.index_add_(0, assignments, features)
+        batch_means = batch_centroid_sums / batch_counts.unsqueeze(-1).clamp_min(1.0)
+        ema = float(self.causal_machine_online_teacher_ema)
+        updated_centroids = self.causal_machine_signature_centroids.clone()
+        updated_centroids[present] = ema * updated_centroids[present] + (1.0 - ema) * batch_means[present]
+        self.causal_machine_signature_centroids = updated_centroids
+        self.causal_machine_online_state_counts = self.causal_machine_online_state_counts + batch_counts
+
+        flat_tokens = target_ids.reshape(-1)
+        batch_token_counts = torch.zeros((num_states, self.vocab_size), device=device, dtype=torch.float32)
+        batch_token_counts.index_put_(
+            (assignments, flat_tokens),
+            torch.ones_like(flat_tokens, dtype=torch.float32),
+            accumulate=True,
+        )
+        batch_probs = batch_token_counts / batch_counts.unsqueeze(-1).clamp_min(1.0)
+        prev_probs = self.causal_machine_log_probs.to(device=device, dtype=torch.float32).exp()
+        prev_probs = prev_probs / prev_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        updated_probs = prev_probs.clone()
+        updated_probs[present] = ema * updated_probs[present] + (1.0 - ema) * batch_probs[present]
+        updated_probs = updated_probs / updated_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        self.causal_machine_log_probs = torch.log(updated_probs.clamp_min(1e-12))
+
+        total_counts = self.causal_machine_online_state_counts.sum().clamp_min(1.0)
+        self.causal_machine_log_state_priors = torch.log(
+            (self.causal_machine_online_state_counts / total_counts).clamp_min(1e-12)
+        )
+        active_states = int((self.causal_machine_online_state_counts >= 4.0).sum().item())
+        teacher_ready = active_states >= max(8, num_states // 8) and self.current_training_step >= 50
+        self.causal_machine_online_teacher_ready.fill_(bool(teacher_ready))
+
     def _compute_causal_machine_teacher_state_ids(self, target_ids: Tensor) -> Tensor | None:
+        if not self.causal_machine_profile_loaded and not bool(self.causal_machine_online_teacher_ready.item()):
+            return None
         if (
             self.causal_machine_signature_centroids.numel() == 0
             or self.causal_machine_log_probs.numel() == 0
@@ -5227,6 +5318,17 @@ class GPT(nn.Module):
         if not accum_terms:
             return None
         return sum(accum_terms) / float(max(len(state_blocks), 1))
+
+    def _select_online_teacher_beliefs(self, fallback: Tensor | None) -> Tensor | None:
+        if fallback is not None:
+            return fallback
+        for block in reversed(self.blocks):
+            if not isinstance(block, StateSpaceBlock) or not block.last_aux:
+                continue
+            state_log_beliefs = block.last_aux.get("state_log_beliefs")
+            if state_log_beliefs is not None:
+                return state_log_beliefs
+        return None
 
     def _staged_mult(self, step: int, enable_step: int, ramp_steps: int) -> float:
         step = max(int(step), 0)
@@ -5510,6 +5612,13 @@ class GPT(nn.Module):
             label_smoothing=label_smoothing,
             z_loss_coeff=z_loss_coeff,
             logit_var_loss_coeff=logit_var_loss_coeff,
+        )
+        online_teacher_beliefs = self._select_online_teacher_beliefs(
+            causal_machine_state_log_beliefs,
+        )
+        self._update_online_causal_teacher(
+            target_ids,
+            online_teacher_beliefs,
         )
         if causal_machine_raw_logits is not None:
             if self.causal_machine_next_token_loss_coeff > 0.0:
