@@ -5565,6 +5565,14 @@ def main() -> None:
                     stop_after_step = int(step)
             else:
                 regression_bad_validations = 0
+            # Validation allocates a much larger working set than replayed training.
+            # Drop the captured graph and cached allocator blocks so the next training
+            # step rebuilds the graph from a clean pool instead of accumulating
+            # fragmented segments across train/eval transitions.
+            cuda_graph_runner = None
+            cuda_graph_runner_fake_quant_bits = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
