@@ -75,11 +75,14 @@ DEFAULT_CAUSAL_MACHINE_NUM_STATES = 128
 DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA = 0.95
 DEFAULT_VOCAB_SIZE = 1024
 USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_SCAN", "1")))
+USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN", "1")))
 
 BOS_ID = -1
 
 _CAUSAL_MACHINE_SCAN_CUDA = None
 _CAUSAL_MACHINE_SCAN_CUDA_ERROR: Exception | None = None
+_CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
+_CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR: Exception | None = None
 
 
 def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
@@ -88,6 +91,20 @@ def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
         sources=[
             str(source_dir / "causal_machine_scan.cpp"),
             str(source_dir / "causal_machine_scan_kernel.cu"),
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+        build_directory=str(build_dir),
+        verbose=False,
+    )
+
+
+def _load_causal_machine_latent_scan_cuda_extension(source_dir: Path, build_dir: Path):
+    return load_cpp_extension(
+        name="causal_machine_latent_scan_cuda_ext",
+        sources=[
+            str(source_dir / "causal_machine_latent_scan.cpp"),
+            str(source_dir / "causal_machine_latent_scan_kernel.cu"),
         ],
         extra_cflags=["-O3", "-std=c++17"],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
@@ -160,6 +177,72 @@ def load_causal_machine_scan_cuda():
 
     _CAUSAL_MACHINE_SCAN_CUDA_ERROR = last_exc
     raise RuntimeError("causal_machine_scan_cuda is unavailable after retries") from last_exc
+
+
+def load_causal_machine_latent_scan_cuda():
+    global _CAUSAL_MACHINE_LATENT_SCAN_CUDA
+    global _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR
+    if _CAUSAL_MACHINE_LATENT_SCAN_CUDA is not None:
+        return _CAUSAL_MACHINE_LATENT_SCAN_CUDA
+    if _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR is not None:
+        raise RuntimeError("causal_machine_latent_scan_cuda is unavailable") from _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR
+    source_dir = Path(__file__).resolve().parent / "cuda_ext"
+    build_dir = source_dir / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    last_exc: Exception | None = None
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    attempts = 4 if distributed else 2
+    if not distributed:
+        try:
+            _CAUSAL_MACHINE_LATENT_SCAN_CUDA = _load_causal_machine_latent_scan_cuda_extension(source_dir, build_dir)
+            return _CAUSAL_MACHINE_LATENT_SCAN_CUDA
+        except Exception as exc:
+            _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR = exc
+            raise RuntimeError("causal_machine_latent_scan_cuda is unavailable") from exc
+
+    sync_device = torch.device("cuda", torch.cuda.current_device())
+    for attempt in range(attempts):
+        local_exc: Exception | None = None
+        leader_success = torch.zeros(1, device=sync_device, dtype=torch.int32)
+        try:
+            if rank == 0:
+                if _CAUSAL_MACHINE_LATENT_SCAN_CUDA is None:
+                    _CAUSAL_MACHINE_LATENT_SCAN_CUDA = _load_causal_machine_latent_scan_cuda_extension(source_dir, build_dir)
+                leader_success.fill_(1)
+        except Exception as exc:
+            local_exc = exc
+            if rank == 0:
+                _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
+            leader_success.zero_()
+
+        dist.broadcast(leader_success, src=0)
+
+        if int(leader_success.item()) == 1:
+            try:
+                if rank != 0 and _CAUSAL_MACHINE_LATENT_SCAN_CUDA is None:
+                    _CAUSAL_MACHINE_LATENT_SCAN_CUDA = _load_causal_machine_latent_scan_cuda_extension(source_dir, build_dir)
+            except Exception as exc:
+                local_exc = exc
+                _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
+
+            load_ok = torch.tensor([0 if local_exc is not None else 1], device=sync_device, dtype=torch.int32)
+            dist.all_reduce(load_ok, op=dist.ReduceOp.MIN)
+            if int(load_ok.item()) == 1:
+                return _CAUSAL_MACHINE_LATENT_SCAN_CUDA
+
+        if local_exc is None:
+            local_exc = RuntimeError(
+                f"causal_machine_latent_scan_cuda leader build failed on rank 0 during attempt {attempt + 1}/{attempts}"
+            )
+        last_exc = local_exc
+        _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+
+    _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR = last_exc
+    raise RuntimeError("causal_machine_latent_scan_cuda is unavailable after retries") from last_exc
 
 
 class _CausalMachineScanCudaFn(torch.autograd.Function):
@@ -264,6 +347,44 @@ def causal_machine_scan_cuda(
     )
 
 
+class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        drive: Tensor,
+        decay: Tensor,
+        initial_state: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_latent_scan_cuda()
+        drive_in = drive.contiguous()
+        decay_f32 = decay.contiguous().float()
+        initial_state_in = initial_state.contiguous()
+        states, final_state = ext.forward(drive_in, decay_f32, initial_state_in)
+        ctx.save_for_backward(states.contiguous(), decay_f32, initial_state_in)
+        return states, final_state
+
+    @staticmethod
+    def backward(ctx, grad_states: Tensor, grad_final_state: Tensor):
+        ext = load_causal_machine_latent_scan_cuda()
+        states, decay_f32, initial_state_in = ctx.saved_tensors
+        grad_drive, grad_decay, grad_initial = ext.backward(
+            grad_states.contiguous(),
+            grad_final_state.contiguous(),
+            states,
+            decay_f32,
+            initial_state_in,
+        )
+        return grad_drive, grad_decay.reshape_as(decay_f32), grad_initial
+
+
+def causal_machine_latent_scan_cuda(
+    drive: Tensor,
+    decay: Tensor,
+    initial_state: Tensor,
+) -> tuple[Tensor, Tensor]:
+    return _CausalMachineLatentScanCudaFn.apply(drive, decay, initial_state)
+
+
 def structured_transition_predict_log_belief(
     prev_log_belief: Tensor,
     transition_source_probs: Tensor,
@@ -351,6 +472,7 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "causal_machine_hidden_rank": 64,
     "causal_machine_transition_rank": 8,
     "causal_machine_latent_rank": 0,
+    "causal_machine_latent_mode": "off",
     "causal_machine_scale_init": 0.35,
     "causal_machine_gate_init": -1.5,
     "causal_machine_latent_gate_init": -2.0,
@@ -665,6 +787,10 @@ class Hyperparameters:
             str(int(LOCAL_PROXY_RECIPE_COMMON["causal_machine_latent_rank"])),
         )
     )
+    causal_machine_latent_mode = os.environ.get(
+        "CAUSAL_MACHINE_LATENT_MODE",
+        str(LOCAL_PROXY_RECIPE_COMMON["causal_machine_latent_mode"]),
+    ).strip().lower()
     causal_machine_num_states = int(
         os.environ.get(
             "CAUSAL_MACHINE_NUM_STATES",
@@ -850,6 +976,7 @@ class Hyperparameters:
             "causal_machine_hidden_rank": "CAUSAL_MACHINE_HIDDEN_RANK",
             "causal_machine_transition_rank": "CAUSAL_MACHINE_TRANSITION_RANK",
             "causal_machine_latent_rank": "CAUSAL_MACHINE_LATENT_RANK",
+            "causal_machine_latent_mode": "CAUSAL_MACHINE_LATENT_MODE",
             "causal_machine_scale_init": "CAUSAL_MACHINE_SCALE_INIT",
             "causal_machine_gate_init": "CAUSAL_MACHINE_GATE_INIT",
             "causal_machine_latent_gate_init": "CAUSAL_MACHINE_LATENT_GATE_INIT",
@@ -4113,6 +4240,7 @@ class CausalStateMixer(nn.Module):
         num_states: int,
         transition_rank: int,
         latent_rank: int,
+        latent_mode: str,
         scale_init: float,
         gate_init: float,
         latent_gate_init: float,
@@ -4131,6 +4259,12 @@ class CausalStateMixer(nn.Module):
         self.num_states = num_states
         self.transition_rank = max(1, int(transition_rank))
         self.latent_rank = max(int(latent_rank), 0)
+        latent_mode = str(latent_mode or "off").strip().lower()
+        if latent_mode not in {"off", "additive", "replace"}:
+            raise ValueError(f"Unsupported latent_mode={latent_mode!r}; expected off, additive, or replace")
+        if self.latent_rank <= 0:
+            latent_mode = "off"
+        self.latent_mode = latent_mode
         self.filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
         self.transition_context_rank = max(8, min(16, hidden_rank))
         self.track_state_ce = bool(track_state_ce)
@@ -4182,6 +4316,12 @@ class CausalStateMixer(nn.Module):
         self.last_aux: dict[str, Tensor | None] = {}
         self.fast_path = True
 
+    def _uses_latent_additive(self) -> bool:
+        return self.latent_mode == "additive" and self.latent_rank > 0
+
+    def _uses_latent_replace(self) -> bool:
+        return self.latent_mode == "replace" and self.latent_rank > 0
+
     def configure_future_sketch(self, total_sketch_dim: int) -> None:
         total_sketch_dim = max(int(total_sketch_dim), 0)
         if total_sketch_dim <= 0:
@@ -4215,41 +4355,66 @@ class CausalStateMixer(nn.Module):
         transition_context = self.transition_context_out(self.transition_context_in(state_hidden))
         return state_hidden, local_logits, transition_context
 
-    def _compute_latent_logits_sequence(self, state_hidden: Tensor) -> Tensor | None:
+    def _compute_latent_sequence_states(self, state_hidden: Tensor) -> tuple[Tensor, Tensor, Tensor] | None:
         if (
             self.latent_in is None
             or self.latent_gate_in is None
-            or self.latent_out is None
-            or self.latent_output_gate is None
             or self.latent_decay_logits is None
         ):
             return None
         drive = self.latent_in(state_hidden).float() * torch.sigmoid(self.latent_gate_in(state_hidden).float())
         decay = torch.sigmoid(self.latent_decay_logits.float()).clamp(0.90, 0.9995)
-        prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
-        latent_chunks: list[Tensor] = []
-        chunk_size = max(int(self.filter_chunk_size), 1)
-        decay_b = decay.view(1, 1, self.latent_rank)
-        for chunk_start in range(0, int(drive.size(1)), chunk_size):
-            chunk = drive[:, chunk_start : chunk_start + chunk_size, :]
-            chunk_len = int(chunk.size(1))
-            positions = torch.arange(chunk_len, device=drive.device, dtype=torch.float32).view(1, chunk_len, 1)
-            powers = torch.pow(decay_b, positions)
-            scaled = chunk / powers.clamp_min(1.0e-8)
-            prefix = torch.cumsum(scaled, dim=1)
-            chunk_states = powers * (decay_b * prev.unsqueeze(1) + prefix)
-            latent_chunks.append(chunk_states)
-            prev = chunk_states[:, -1, :]
-        latent_hidden = torch.tanh(torch.cat(latent_chunks, dim=1)).to(dtype=state_hidden.dtype)
-        gate = torch.sigmoid(self.latent_output_gate.float()).to(device=state_hidden.device, dtype=state_hidden.dtype)
-        return gate * self.latent_out(latent_hidden)
+        initial_state = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
+        use_cuda_latent_scan = bool(
+            USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and drive.is_cuda
+            and drive.size(-1) > 0
+        )
+        if use_cuda_latent_scan:
+            latent_states, final_state = causal_machine_latent_scan_cuda(
+                drive.to(dtype=state_hidden.dtype),
+                decay,
+                initial_state.to(dtype=state_hidden.dtype),
+            )
+            latent_states = latent_states.to(dtype=state_hidden.dtype)
+            final_state = final_state.to(dtype=state_hidden.dtype)
+        else:
+            prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
+            latent_chunks: list[Tensor] = []
+            chunk_size = max(int(self.filter_chunk_size), 1)
+            decay_b = decay.view(1, 1, self.latent_rank)
+            for chunk_start in range(0, int(drive.size(1)), chunk_size):
+                chunk = drive[:, chunk_start : chunk_start + chunk_size, :]
+                chunk_len = int(chunk.size(1))
+                positions = torch.arange(chunk_len, device=drive.device, dtype=torch.float32).view(1, chunk_len, 1)
+                powers = torch.pow(decay_b, positions)
+                scaled = chunk / powers.clamp_min(1.0e-8)
+                prefix = torch.cumsum(scaled, dim=1)
+                chunk_states = powers * (decay_b * prev.unsqueeze(1) + prefix)
+                latent_chunks.append(chunk_states)
+                prev = chunk_states[:, -1, :]
+            latent_states = torch.cat(latent_chunks, dim=1).to(dtype=state_hidden.dtype)
+            final_state = prev.to(dtype=state_hidden.dtype)
+        return latent_states, final_state, decay.to(device=state_hidden.device, dtype=state_hidden.dtype)
 
-    def _compute_latent_logits_step(self, state_hidden: Tensor, cache: CausalMachineCache) -> Tensor | None:
+    def _decode_latent_state_logits(self, latent_states: Tensor, *, out_dtype: torch.dtype) -> Tensor | None:
+        if self.latent_out is None or self.latent_output_gate is None:
+            return None
+        latent_hidden = torch.tanh(latent_states)
+        gate = torch.sigmoid(self.latent_output_gate.float()).to(device=latent_states.device, dtype=out_dtype)
+        return gate * self.latent_out(latent_hidden.to(dtype=out_dtype))
+
+    def _compute_latent_logits_sequence(self, state_hidden: Tensor) -> Tensor | None:
+        latent_scan = self._compute_latent_sequence_states(state_hidden)
+        if latent_scan is None:
+            return None
+        latent_states, _final_state, _decay = latent_scan
+        return self._decode_latent_state_logits(latent_states, out_dtype=state_hidden.dtype)
+
+    def _compute_latent_step_states(self, state_hidden: Tensor, cache: CausalMachineCache) -> tuple[Tensor, Tensor, Tensor] | None:
         if (
             self.latent_in is None
             or self.latent_gate_in is None
-            or self.latent_out is None
-            or self.latent_output_gate is None
             or self.latent_decay_logits is None
         ):
             return None
@@ -4258,11 +4423,74 @@ class CausalStateMixer(nn.Module):
         if prev is None:
             prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
         decay = torch.sigmoid(self.latent_decay_logits.float()).clamp(0.90, 0.9995).view(1, -1)
-        next_state = decay * prev + drive[:, 0, :]
+        prior_state = (decay * prev).to(dtype=state_hidden.dtype)
+        next_state = prior_state.float() + drive[:, 0, :]
         cache.latent_state = next_state.detach()
-        latent_hidden = torch.tanh(next_state).to(dtype=state_hidden.dtype).unsqueeze(1)
-        gate = torch.sigmoid(self.latent_output_gate.float()).to(device=state_hidden.device, dtype=state_hidden.dtype)
-        return gate * self.latent_out(latent_hidden)
+        return prior_state, next_state.to(dtype=state_hidden.dtype), decay.to(device=state_hidden.device, dtype=state_hidden.dtype)
+
+    def _compute_latent_logits_step(self, state_hidden: Tensor, cache: CausalMachineCache) -> Tensor | None:
+        latent_step = self._compute_latent_step_states(state_hidden, cache)
+        if latent_step is None:
+            return None
+        _prior_state, next_state, _decay = latent_step
+        return self._decode_latent_state_logits(next_state.unsqueeze(1), out_dtype=state_hidden.dtype)
+
+    def _latent_only_sequence_beliefs(self, local_logits: Tensor) -> tuple[Tensor, Tensor, None]:
+        state_log_beliefs = F.log_softmax(local_logits.float(), dim=-1).to(dtype=local_logits.dtype)
+        return state_log_beliefs, state_log_beliefs[:, -1, :].float(), None
+
+    def _latent_only_step_beliefs(self, local_logits: Tensor, cache: CausalMachineCache) -> Tensor:
+        next_log_belief = F.log_softmax(local_logits[:, 0, :].float(), dim=-1)
+        cache.log_belief = next_log_belief.detach().to(dtype=local_logits.dtype)
+        cache.num_updates += 1
+        return next_log_belief.to(dtype=local_logits.dtype).unsqueeze(1)
+
+    def _latent_replace_sequence_beliefs(
+        self,
+        local_logits: Tensor,
+        transition_context: Tensor,
+        state_hidden: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        latent_scan = self._compute_latent_sequence_states(state_hidden)
+        if latent_scan is None:
+            return self._latent_only_sequence_beliefs(local_logits)
+        latent_states, final_latent_state, decay = latent_scan
+        latent_prior_states = torch.zeros_like(latent_states)
+        if latent_states.size(1) > 1:
+            latent_prior_states[:, 1:, :] = latent_states[:, :-1, :]
+        latent_prior_states = latent_prior_states * decay.view(1, 1, -1)
+        prior_logits = self._decode_latent_state_logits(latent_prior_states, out_dtype=local_logits.dtype)
+        if prior_logits is None:
+            return self._latent_only_sequence_beliefs(local_logits)
+        transition_gate = torch.sigmoid(self.transition_gate.float()).to(device=local_logits.device, dtype=local_logits.dtype)
+        prior_with_context = prior_logits + transition_context.to(dtype=local_logits.dtype)
+        prior_log_beliefs = F.log_softmax(prior_with_context.float(), dim=-1).to(dtype=local_logits.dtype)
+        filtered_logits = local_logits + transition_gate * prior_with_context
+        state_log_beliefs = F.log_softmax(filtered_logits.float(), dim=-1).to(dtype=local_logits.dtype)
+        return state_log_beliefs, final_latent_state.float(), prior_log_beliefs
+
+    def _latent_replace_step_beliefs(
+        self,
+        local_logits: Tensor,
+        transition_context: Tensor,
+        state_hidden: Tensor,
+        cache: CausalMachineCache,
+    ) -> tuple[Tensor, Tensor | None]:
+        latent_step = self._compute_latent_step_states(state_hidden, cache)
+        if latent_step is None:
+            return self._latent_only_step_beliefs(local_logits, cache), None
+        prior_state, _next_state, _decay = latent_step
+        prior_logits = self._decode_latent_state_logits(prior_state.unsqueeze(1), out_dtype=local_logits.dtype)
+        if prior_logits is None:
+            return self._latent_only_step_beliefs(local_logits, cache), None
+        transition_gate = torch.sigmoid(self.transition_gate.float()).to(device=local_logits.device, dtype=local_logits.dtype)
+        prior_with_context = prior_logits + transition_context.to(dtype=local_logits.dtype)
+        prior_log_beliefs = F.log_softmax(prior_with_context[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
+        filtered_logits = local_logits + transition_gate * prior_with_context
+        state_log_beliefs = F.log_softmax(filtered_logits[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
+        cache.log_belief = state_log_beliefs[:, 0, :].detach()
+        cache.num_updates += 1
+        return state_log_beliefs, prior_log_beliefs
 
     def _structured_transition_params(self) -> tuple[Tensor, Tensor, Tensor]:
         transition_source_probs = F.softmax(self.transition_source_logits.float(), dim=-1)
@@ -4362,11 +4590,19 @@ class CausalStateMixer(nn.Module):
     def forward_simple(self, x: Tensor) -> Tensor:
         batch_size = int(x.size(0))
         state_hidden, local_logits, transition_context = self._project_hidden(x)
-        latent_logits = self._compute_latent_logits_sequence(state_hidden)
-        if latent_logits is not None:
-            local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
-        initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
-        state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(local_logits, transition_context, initial_log_belief)
+        if self._uses_latent_replace():
+            state_log_beliefs, _, prior_log_beliefs = self._latent_replace_sequence_beliefs(
+                local_logits,
+                transition_context,
+                state_hidden,
+            )
+        else:
+            if self._uses_latent_additive():
+                latent_logits = self._compute_latent_logits_sequence(state_hidden)
+                if latent_logits is not None:
+                    local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
+            initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
+            state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(local_logits, transition_context, initial_log_belief)
         future_sketch_pred = (
             self.future_sketch_head(state_hidden)
             if self.track_future_sketch and self.future_sketch_head is not None
@@ -4385,10 +4621,19 @@ class CausalStateMixer(nn.Module):
         if x.size(1) != 1:
             raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
         state_hidden, local_logits, transition_context = self._project_hidden(x)
-        latent_logits = self._compute_latent_logits_step(state_hidden, cache)
-        if latent_logits is not None:
-            local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
-        state_log_beliefs = self._filter_step(local_logits, transition_context, cache)
+        if self._uses_latent_replace():
+            state_log_beliefs, _prior_log_beliefs = self._latent_replace_step_beliefs(
+                local_logits,
+                transition_context,
+                state_hidden,
+                cache,
+            )
+        else:
+            if self._uses_latent_additive():
+                latent_logits = self._compute_latent_logits_step(state_hidden, cache)
+                if latent_logits is not None:
+                    local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
+            state_log_beliefs = self._filter_step(local_logits, transition_context, cache)
         return self._decode(state_hidden, state_log_beliefs)
 
 
@@ -4409,6 +4654,7 @@ class StateSpaceBlock(nn.Module):
         causal_machine_hidden_rank: int,
         causal_machine_transition_rank: int,
         causal_machine_latent_rank: int,
+        causal_machine_latent_mode: str,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
         causal_machine_latent_gate_init: float,
@@ -4435,11 +4681,12 @@ class StateSpaceBlock(nn.Module):
             self.mlp_norm = nn.RMSNorm(dim, elementwise_affine=False)
         self.attn = CausalStateMixer(
             dim=dim,
-            hidden_rank=causal_machine_hidden_rank,
-            num_states=causal_machine_num_states,
-            transition_rank=causal_machine_transition_rank,
-            latent_rank=causal_machine_latent_rank,
-            scale_init=causal_machine_scale_init,
+                hidden_rank=causal_machine_hidden_rank,
+                num_states=causal_machine_num_states,
+                transition_rank=causal_machine_transition_rank,
+                latent_rank=causal_machine_latent_rank,
+                latent_mode=causal_machine_latent_mode,
+                scale_init=causal_machine_scale_init,
             gate_init=causal_machine_gate_init,
             latent_gate_init=causal_machine_latent_gate_init,
             latent_decay_init=causal_machine_latent_decay_init,
@@ -4548,6 +4795,7 @@ class GPT(nn.Module):
         causal_machine_hidden_rank: int,
         causal_machine_transition_rank: int,
         causal_machine_latent_rank: int,
+        causal_machine_latent_mode: str,
         causal_machine_scale_init: float,
         causal_machine_gate_init: float,
         causal_machine_latent_gate_init: float,
@@ -4614,6 +4862,7 @@ class GPT(nn.Module):
         self.causal_machine_hidden_rank = max(int(causal_machine_hidden_rank), 0)
         self.causal_machine_transition_rank = max(int(causal_machine_transition_rank), 1)
         self.causal_machine_latent_rank = max(int(causal_machine_latent_rank), 0)
+        self.causal_machine_latent_mode = str(causal_machine_latent_mode or "off").strip().lower()
         self.causal_machine_scale_init = max(float(causal_machine_scale_init), 0.0)
         self.causal_machine_gate_init = float(causal_machine_gate_init)
         self.causal_machine_latent_gate_init = float(causal_machine_latent_gate_init)
@@ -4904,6 +5153,7 @@ class GPT(nn.Module):
                 causal_machine_hidden_rank=self.causal_machine_hidden_rank,
                 causal_machine_transition_rank=self.causal_machine_transition_rank,
                 causal_machine_latent_rank=self.causal_machine_latent_rank,
+                causal_machine_latent_mode=self.causal_machine_latent_mode,
                 causal_machine_scale_init=self.causal_machine_scale_init,
                 causal_machine_gate_init=self.causal_machine_gate_init,
                 causal_machine_latent_gate_init=self.causal_machine_latent_gate_init,
@@ -5241,7 +5491,8 @@ class GPT(nn.Module):
         for horizon in self.causal_machine_horizon_tensor.tolist():
             accum = torch.zeros((flat_size, self.causal_machine_sketch_dim), device=target_ids.device, dtype=torch.float32)
             denom = torch.zeros((flat_size, 1), device=target_ids.device, dtype=torch.float32)
-            for offset in range(int(horizon)):
+            # Future-sketch targets should only summarize tokens strictly after t.
+            for offset in range(1, int(horizon) + 1):
                 shifted = torch.zeros_like(target_ids)
                 valid = torch.zeros_like(target_ids, dtype=torch.float32)
                 if offset < seq_len:
@@ -6040,6 +6291,7 @@ def main() -> None:
         causal_machine_hidden_rank=args.causal_machine_hidden_rank,
         causal_machine_transition_rank=args.causal_machine_transition_rank,
         causal_machine_latent_rank=args.causal_machine_latent_rank,
+        causal_machine_latent_mode=args.causal_machine_latent_mode,
         causal_machine_scale_init=args.causal_machine_scale_init,
         causal_machine_gate_init=args.causal_machine_gate_init,
         causal_machine_latent_gate_init=args.causal_machine_latent_gate_init,
