@@ -5150,79 +5150,14 @@ class GPT(nn.Module):
         state_log_beliefs: Tensor | None,
         features_3d: Tensor | None = None,
     ) -> None:
-        if self.causal_machine_profile_loaded:
-            return
-        if state_log_beliefs is None or self.causal_machine_num_states <= 0:
-            return
-        if features_3d is None:
-            features_3d = self._compute_causal_machine_future_sketch(target_ids)
-        if features_3d is None:
-            return
-        device = target_ids.device
-        num_states = self.causal_machine_num_states
-        features = features_3d.reshape(-1, features_3d.size(-1)).float()
-        assignments = state_log_beliefs.detach().float().argmax(dim=-1).reshape(-1)
-        if assignments.numel() == 0:
-            return
-        total_sketch_dim = int(features.size(-1))
-        if self.causal_machine_signature_centroids.shape != (num_states, total_sketch_dim):
-            self.causal_machine_signature_centroids = torch.zeros(
-                (num_states, total_sketch_dim), dtype=torch.float32, device=device
-            )
-        else:
-            self.causal_machine_signature_centroids = self.causal_machine_signature_centroids.to(
-                device=device, dtype=torch.float32
-            )
-        if self.causal_machine_online_state_counts.shape != (num_states,):
-            self.causal_machine_online_state_counts = torch.zeros(
-                (num_states,), dtype=torch.float32, device=device
-            )
-        else:
-            self.causal_machine_online_state_counts = self.causal_machine_online_state_counts.to(
-                device=device, dtype=torch.float32
-            )
-        batch_counts = torch.bincount(assignments, minlength=num_states).to(device=device, dtype=torch.float32)
-        present = batch_counts > 0
-        if not present.any():
-            return
-        batch_centroid_sums = torch.zeros_like(self.causal_machine_signature_centroids)
-        batch_centroid_sums.index_add_(0, assignments, features)
-        batch_means = batch_centroid_sums / batch_counts.unsqueeze(-1).clamp_min(1.0)
-        ema = float(self.causal_machine_online_teacher_ema)
-        updated_centroids = self.causal_machine_signature_centroids.clone()
-        updated_centroids[present] = ema * updated_centroids[present] + (1.0 - ema) * batch_means[present]
-        self.causal_machine_signature_centroids = updated_centroids
-        self.causal_machine_online_state_counts = self.causal_machine_online_state_counts + batch_counts
-
-        flat_tokens = target_ids.reshape(-1)
-        batch_token_counts = torch.zeros((num_states, self.vocab_size), device=device, dtype=torch.float32)
-        batch_token_counts.index_put_(
-            (assignments, flat_tokens),
-            torch.ones_like(flat_tokens, dtype=torch.float32),
-            accumulate=True,
-        )
-        batch_probs = batch_token_counts / batch_counts.unsqueeze(-1).clamp_min(1.0)
-        prev_probs = self.causal_machine_log_probs.to(device=device, dtype=torch.float32).exp()
-        prev_probs = prev_probs / prev_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        updated_probs = prev_probs.clone()
-        updated_probs[present] = ema * updated_probs[present] + (1.0 - ema) * batch_probs[present]
-        updated_probs = updated_probs / updated_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        self.causal_machine_log_probs = torch.log(updated_probs.clamp_min(1e-12))
-
-        total_counts = self.causal_machine_online_state_counts.sum().clamp_min(1.0)
-        self.causal_machine_log_state_priors = torch.log(
-            (self.causal_machine_online_state_counts / total_counts).clamp_min(1e-12)
-        )
-        active_states = int((self.causal_machine_online_state_counts >= 4.0).sum().item())
-        teacher_ready = active_states >= max(8, num_states // 8) and self.current_training_step >= 50
-        self.causal_machine_online_teacher_ready.fill_(bool(teacher_ready))
+        return
 
     def _compute_causal_machine_teacher_state_ids(
         self,
         target_ids: Tensor,
         features_3d: Tensor | None = None,
     ) -> Tensor | None:
-        if not self.causal_machine_profile_loaded and not bool(self.causal_machine_online_teacher_ready.item()):
+        if not self.causal_machine_profile_loaded:
             return None
         if (
             self.causal_machine_signature_centroids.numel() == 0
@@ -5621,14 +5556,6 @@ class GPT(nn.Module):
             logit_var_loss_coeff=logit_var_loss_coeff,
         )
         teacher_future_sketch = self._compute_causal_machine_future_sketch(target_ids)
-        online_teacher_beliefs = self._select_online_teacher_beliefs(
-            causal_machine_state_log_beliefs,
-        )
-        self._update_online_causal_teacher(
-            target_ids,
-            online_teacher_beliefs,
-            features_3d=teacher_future_sketch,
-        )
         teacher_state_ids = self._compute_causal_machine_teacher_state_ids(
             target_ids,
             features_3d=teacher_future_sketch,
