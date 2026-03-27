@@ -4193,20 +4193,10 @@ class CausalStateMixer(nn.Module):
                 transition_stay_probs,
                 int(self.filter_chunk_size),
             )
+            # Keep the CUDA-scan competition path to a single fused recurrent pass.
+            # Transition-KL priors are not reconstructed in Python here because that
+            # would add a second token-by-token recurrence for every SSM block.
             prior_log_beliefs = None
-            if self.track_transition_kl:
-                prior_steps: list[Tensor] = []
-                prev_log_belief = initial_log_belief.float()
-                for t in range(int(local_logits.size(1))):
-                    pred_log_belief = structured_transition_predict_log_belief(
-                        prev_log_belief,
-                        transition_source_probs,
-                        transition_dest_probs,
-                        transition_stay_probs,
-                    )
-                    prior_steps.append((pred_log_belief + transition_context[:, t, :].float()).to(dtype=local_logits.dtype))
-                    prev_log_belief = state_log_beliefs[:, t, :].float()
-                prior_log_beliefs = torch.stack(prior_steps, dim=1)
             return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, prior_log_beliefs
         belief_steps: list[Tensor] = []
         prior_steps: list[Tensor] = []
