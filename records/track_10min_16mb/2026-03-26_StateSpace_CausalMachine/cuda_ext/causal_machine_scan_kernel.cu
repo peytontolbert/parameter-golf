@@ -17,7 +17,10 @@ namespace {
 constexpr int kNumStates = 128;
 constexpr int kWarpSize = 32;
 constexpr int kNumWarps = kNumStates / kWarpSize;
-constexpr int kDefaultSingleLaunchMaxSeqLen = 4096;
+// A single block stepping 1024 tokens is usually worse than chunked launches on
+// modern GPUs. Keep the one-block path for genuinely short sequences and allow
+// opt-in expansion through the env override when benchmarking.
+constexpr int kDefaultSingleLaunchMaxSeqLen = 512;
 
 int scan_single_launch_max_seq_len() {
     static const int cached = []() {
@@ -174,6 +177,38 @@ __device__ __forceinline__ float block_log_softmax_norm_128(float value, float* 
     const float value_sum = block_reduce_sum_128(exp_value, shared);
     inv_sum = 1.0f / fmaxf(value_sum, 1.0e-20f);
     return value_max + fast_log(fmaxf(value_sum, 1.0e-20f));
+}
+
+__global__ void row_softmax_forward_kernel(
+    const float* __restrict__ logits,
+    int cols,
+    float* __restrict__ probs) {
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+    __shared__ float scratch[kNumWarps];
+    const float logit = col < cols ? logits[row * cols + col] : -INFINITY;
+    const float row_max = block_reduce_max_128(logit, scratch);
+    const float shifted = col < cols ? fast_exp(logit - row_max) : 0.0f;
+    const float row_sum = block_reduce_sum_128(shifted, scratch);
+    if (col < cols) {
+        probs[row * cols + col] = shifted / fmaxf(row_sum, 1.0e-20f);
+    }
+}
+
+__global__ void row_softmax_backward_kernel(
+    const float* __restrict__ grad_probs,
+    const float* __restrict__ probs,
+    int cols,
+    float* __restrict__ grad_logits) {
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+    __shared__ float scratch[kNumWarps];
+    const float prob = col < cols ? probs[row * cols + col] : 0.0f;
+    const float grad_prob = col < cols ? grad_probs[row * cols + col] : 0.0f;
+    const float dot = block_reduce_sum_128(grad_prob * prob, scratch);
+    if (col < cols) {
+        grad_logits[row * cols + col] = (grad_prob - dot) * prob;
+    }
 }
 
 template <typename scalar_t, int StaticTransitionRank = -1>
@@ -1220,6 +1255,42 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
     return {beliefs, final_log_belief};
 }
 
+std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size) {
+    c10::cuda::CUDAGuard device_guard(local_logits.device());
+    auto transition_source_probs = torch::empty_like(transition_source_logits);
+    auto transition_dest_probs = torch::empty_like(transition_dest_logits);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const dim3 block(kNumStates);
+    const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
+    const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
+    row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
+        transition_source_logits.data_ptr<float>(),
+        static_cast<int>(transition_source_logits.size(1)),
+        transition_source_probs.data_ptr<float>());
+    row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
+        transition_dest_logits.data_ptr<float>(),
+        static_cast<int>(transition_dest_logits.size(1)),
+        transition_dest_probs.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return causal_machine_scan_forward_cuda(
+        local_logits,
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context,
+        initial_log_belief,
+        transition_gate,
+        transition_stay_probs,
+        chunk_size);
+}
+
 std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     torch::Tensor grad_beliefs,
     torch::Tensor grad_final_belief,
@@ -1606,6 +1677,62 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
         grad_transition_gate,
         grad_transition_stay_probs,
     };
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size) {
+    c10::cuda::CUDAGuard device_guard(beliefs.device());
+    auto transition_source_probs = torch::empty_like(transition_source_logits);
+    auto transition_dest_probs = torch::empty_like(transition_dest_logits);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const dim3 block(kNumStates);
+    const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
+    const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
+    row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
+        transition_source_logits.data_ptr<float>(),
+        static_cast<int>(transition_source_logits.size(1)),
+        transition_source_probs.data_ptr<float>());
+    row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
+        transition_dest_logits.data_ptr<float>(),
+        static_cast<int>(transition_dest_logits.size(1)),
+        transition_dest_probs.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto grads = causal_machine_scan_backward_cuda(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate,
+        transition_stay_probs,
+        chunk_size);
+    auto grad_transition_source_logits = torch::empty_like(transition_source_logits);
+    auto grad_transition_dest_logits = torch::empty_like(transition_dest_logits);
+    row_softmax_backward_kernel<<<source_grid, block, 0, stream>>>(
+        grads[1].data_ptr<float>(),
+        transition_source_probs.data_ptr<float>(),
+        static_cast<int>(transition_source_probs.size(1)),
+        grad_transition_source_logits.data_ptr<float>());
+    row_softmax_backward_kernel<<<dest_grid, block, 0, stream>>>(
+        grads[2].data_ptr<float>(),
+        transition_dest_probs.data_ptr<float>(),
+        static_cast<int>(transition_dest_probs.size(1)),
+        grad_transition_dest_logits.data_ptr<float>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    grads[1] = grad_transition_source_logits;
+    grads[2] = grad_transition_dest_logits;
+    return grads;
 }
 
 std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(

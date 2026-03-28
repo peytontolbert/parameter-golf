@@ -403,8 +403,10 @@ def _causal_machine_scan_shared_bytes(transition_rank: int) -> int:
     transition_rank = max(int(transition_rank), 1)
     num_states = 128
     num_warps = num_states // 32
-    forward_bytes = ((2 * num_states * transition_rank) + (2 * num_states) + transition_rank + num_warps) * 4
-    backward_bytes = ((2 * num_states * transition_rank) + (6 * num_states) + (2 * transition_rank) + num_warps) * 4
+    forward_bytes = ((2 * num_states * transition_rank) + num_states + transition_rank + num_warps) * 4
+    backward_base = ((2 * num_states * transition_rank) + (2 * num_states) + (2 * transition_rank) + num_warps) * 4
+    backward_direct = ((2 * num_states * transition_rank) + num_states) * 4
+    backward_bytes = backward_base + backward_direct
     return max(forward_bytes, backward_bytes)
 
 
