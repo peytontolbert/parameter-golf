@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstdint>
 #include <mutex>
-#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -49,28 +48,69 @@ int latent_single_kernel_max_seq_len() {
 }
 
 std::mutex g_latent_workspace_cache_mutex;
-std::unordered_map<std::string, std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>> g_latent_workspace_cache;
+
+enum class LatentWorkspaceTag : std::uint8_t {
+    Forward = 0,
+    ForwardPrior = 1,
+    Backward = 2,
+    BackwardPrior = 3,
+};
+
+struct LatentWorkspaceKey {
+    std::uintptr_t stream;
+    int device_index;
+    int batch_size;
+    int num_chunks;
+    int rank_dim;
+    LatentWorkspaceTag tag;
+
+    bool operator==(const LatentWorkspaceKey& other) const {
+        return stream == other.stream
+            && device_index == other.device_index
+            && batch_size == other.batch_size
+            && num_chunks == other.num_chunks
+            && rank_dim == other.rank_dim
+            && tag == other.tag;
+    }
+};
+
+struct LatentWorkspaceKeyHash {
+    std::size_t operator()(const LatentWorkspaceKey& key) const {
+        std::size_t hash = static_cast<std::size_t>(key.stream);
+        hash ^= static_cast<std::size_t>(key.device_index) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= static_cast<std::size_t>(key.batch_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= static_cast<std::size_t>(key.num_chunks) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= static_cast<std::size_t>(key.rank_dim) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= static_cast<std::size_t>(key.tag) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+std::unordered_map<
+    LatentWorkspaceKey,
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>,
+    LatentWorkspaceKeyHash> g_latent_workspace_cache;
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_workspace(
-    const char* tag,
+    LatentWorkspaceTag tag,
     const torch::Tensor& ref,
     int batch_size,
     int num_chunks,
     int rank_dim) {
     const auto device_index = ref.get_device();
     const auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    const std::string key = std::string(tag)
-        + ":" + std::to_string(device_index)
-        + ":" + std::to_string(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(stream)))
-        + ":" + std::to_string(batch_size)
-        + ":" + std::to_string(num_chunks)
-        + ":" + std::to_string(rank_dim);
     const auto opts = ref.options().dtype(torch::kFloat32);
-    const auto sizes = std::vector<int64_t>{
-        static_cast<int64_t>(batch_size),
-        static_cast<int64_t>(num_chunks),
-        static_cast<int64_t>(rank_dim),
+    const auto key = LatentWorkspaceKey{
+        reinterpret_cast<std::uintptr_t>(stream),
+        device_index,
+        batch_size,
+        num_chunks,
+        rank_dim,
+        tag,
     };
+    const auto batch_size_i64 = static_cast<int64_t>(batch_size);
+    const auto num_chunks_i64 = static_cast<int64_t>(num_chunks);
+    const auto rank_dim_i64 = static_cast<int64_t>(rank_dim);
     std::lock_guard<std::mutex> lock(g_latent_workspace_cache_mutex);
     auto& entry = g_latent_workspace_cache[key];
     auto ensure_tensor = [&](torch::Tensor& t) {
@@ -78,9 +118,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_wor
             !t.defined()
             || t.scalar_type() != torch::kFloat32
             || t.device() != ref.device()
-            || t.sizes().vec() != sizes
+            || t.dim() != 3
+            || t.size(0) != batch_size_i64
+            || t.size(1) != num_chunks_i64
+            || t.size(2) != rank_dim_i64
         ) {
-            t = torch::empty(sizes, opts);
+            t = torch::empty({batch_size_i64, num_chunks_i64, rank_dim_i64}, opts);
         }
     };
     ensure_tensor(std::get<0>(entry));
@@ -1022,7 +1065,8 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                 states.data_ptr<scalar_t>(),
                 final_state.data_ptr<scalar_t>());
         } else {
-            auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace("forward", drive, batch_size, num_chunks, rank_dim);
+            auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
+                LatentWorkspaceTag::Forward, drive, batch_size, num_chunks, rank_dim);
             latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
                 drive.data_ptr<scalar_t>(),
                 decay.data_ptr<float>(),
@@ -1089,7 +1133,8 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                 prior_states.data_ptr<scalar_t>(),
                 final_state.data_ptr<scalar_t>());
         } else {
-            auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace("forward_prior", drive, batch_size, num_chunks, rank_dim);
+            auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
+                LatentWorkspaceTag::ForwardPrior, drive, batch_size, num_chunks, rank_dim);
             latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
                 drive.data_ptr<scalar_t>(),
                 decay.data_ptr<float>(),
@@ -1164,7 +1209,8 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                 grad_decay.data_ptr<float>(),
                 grad_initial_state.data_ptr<scalar_t>());
         } else {
-            auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace("backward", states, batch_size, num_chunks, rank_dim);
+            auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
+                LatentWorkspaceTag::Backward, states, batch_size, num_chunks, rank_dim);
             latent_chunk_backward_summary_kernel<scalar_t, true><<<summary_grid, block, 0, stream>>>(
                 grad_states.data_ptr<scalar_t>(),
                 grad_prior_states.data_ptr<scalar_t>(),
@@ -1242,7 +1288,8 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                 grad_decay.data_ptr<float>(),
                 grad_initial_state.data_ptr<scalar_t>());
         } else {
-            auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace("backward_prior", prior_states, batch_size, num_chunks, rank_dim);
+            auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
+                LatentWorkspaceTag::BackwardPrior, prior_states, batch_size, num_chunks, rank_dim);
             latent_chunk_backward_summary_kernel<scalar_t, false><<<summary_grid, block, 0, stream>>>(
                 nullptr,
                 grad_prior_states.data_ptr<scalar_t>(),
