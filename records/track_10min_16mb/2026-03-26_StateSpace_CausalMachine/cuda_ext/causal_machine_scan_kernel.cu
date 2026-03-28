@@ -50,7 +50,7 @@ int cached_max_optin_bytes(int device_index) {
 
 size_t backward_chunk_shared_bytes(int transition_rank, bool direct_grad_reduce) {
     const size_t base_words = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (6 * kNumStates) + (2 * transition_rank) + kNumWarps
+        (2 * kNumStates * transition_rank) + (3 * kNumStates) + (2 * transition_rank) + kNumWarps
     );
     const size_t direct_words = direct_grad_reduce
         ? static_cast<size_t>((2 * kNumStates * transition_rank) + kNumStates + 1)
@@ -382,10 +382,7 @@ __global__ void causal_machine_backward_chunk_kernel(
     float* stay_shared = dest_shared + (rank * kNumStates);
     float* prev_prob = stay_shared + kNumStates;
     float* latent = prev_prob + kNumStates;
-    float* mix = latent + rank;
-    float* q_prob = mix + kNumStates;
-    float* carry = q_prob + kNumStates;
-    float* grad_mix = carry + kNumStates;
+    float* grad_mix = latent + rank;
     float* dlatent = grad_mix + kNumStates;
     float* scratch = dlatent + rank;
     float* grad_source_shared = nullptr;
@@ -427,16 +424,16 @@ __global__ void causal_machine_backward_chunk_kernel(
     }
     if (s < kNumStates) {
         stay_shared[s] = transition_stay_probs[s];
-        carry[s] = load_as_float(grad_final_belief + (b * kNumStates + s));
     }
     __syncthreads();
 
+    float carry_value = load_as_float(grad_final_belief + (b * kNumStates + s));
     float gate_grad_accum = 0.0f;
+    float q_prob_value = 0.0f;
     if (chunk_len > 0) {
         const int last_pos = chunk_start + chunk_len - 1;
-        q_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
+        q_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
     }
-    __syncthreads();
 
     for (int t = chunk_len - 1; t >= 0; --t) {
         const int pos = chunk_start + t;
@@ -471,16 +468,15 @@ __global__ void causal_machine_backward_chunk_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        mix[s] = mix_prob;
         const float stay_prob = stay_shared[s];
         const float one_minus_stay = 1.0f - stay_prob;
         const float pred_prob = fmaxf(stay_prob * prev_prob[s] + (1.0f - stay_prob) * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float transition_context_value = load_as_float(transition_context + (base + s));
 
-        const float gq = load_as_float(grad_beliefs + (base + s)) + carry[s];
+        const float gq = load_as_float(grad_beliefs + (base + s)) + carry_value;
         const float gq_sum = block_reduce_sum_128(gq, scratch);
-        const float ga = gq - q_prob[s] * gq_sum;
+        const float ga = gq - q_prob_value * gq_sum;
         const float grad_pred_log = transition_gate * ga;
         const float grad_pred_prob = grad_pred_log / pred_prob;
 
@@ -536,12 +532,12 @@ __global__ void causal_machine_backward_chunk_kernel(
                 }
             }
         }
-        carry[s] = prev_grad_prob * prev_prob[s];
-        q_prob[s] = prev_prob[s];
+        carry_value = prev_grad_prob * prev_prob[s];
+        q_prob_value = prev_prob[s];
         __syncthreads();
     }
 
-    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry[s]);
+    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry_value);
     const float gate_sum = block_reduce_sum_128(gate_grad_accum, scratch);
     if constexpr (DirectGradReduce) {
         if (s == 0) {
@@ -601,10 +597,7 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
     float* stay_shared = dest_shared + (rank * kNumStates);
     float* prev_prob = stay_shared + kNumStates;
     float* latent = prev_prob + kNumStates;
-    float* mix = latent + rank;
-    float* q_prob = mix + kNumStates;
-    float* carry = q_prob + kNumStates;
-    float* grad_mix = carry + kNumStates;
+    float* grad_mix = latent + rank;
     float* dlatent = grad_mix + kNumStates;
     float* scratch = dlatent + rank;
     float* grad_source_shared = nullptr;
@@ -648,16 +641,16 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
     }
     if (s < kNumStates) {
         stay_shared[s] = transition_stay_probs[s];
-        carry[s] = load_as_float(grad_final_belief + (b * kNumStates + s));
     }
     __syncthreads();
 
+    float carry_value = load_as_float(grad_final_belief + (b * kNumStates + s));
     float gate_grad_accum = 0.0f;
+    float q_prob_value = 0.0f;
     if (chunk_len > 0) {
         const int last_pos = chunk_start + chunk_len - 1;
-        q_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
+        q_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
     }
-    __syncthreads();
 
     for (int t = chunk_len - 1; t >= 0; --t) {
         const int pos = chunk_start + t;
@@ -692,16 +685,15 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        mix[s] = mix_prob;
         const float stay_prob = stay_shared[s];
         const float one_minus_stay = 1.0f - stay_prob;
         const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float transition_context_value = load_as_float(transition_context + (base + s));
 
-        const float gq = load_as_float(grad_beliefs + (base + s)) + carry[s];
+        const float gq = load_as_float(grad_beliefs + (base + s)) + carry_value;
         const float gq_sum = block_reduce_sum_128(gq, scratch);
-        const float ga = gq - q_prob[s] * gq_sum;
+        const float ga = gq - q_prob_value * gq_sum;
         const float grad_pred_log = transition_gate * ga;
         const float grad_pred_prob = grad_pred_log / pred_prob;
 
@@ -757,12 +749,12 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
                 }
             }
         }
-        carry[s] = prev_grad_prob * prev_prob[s];
-        q_prob[s] = prev_prob[s];
+        carry_value = prev_grad_prob * prev_prob[s];
+        q_prob_value = prev_prob[s];
         __syncthreads();
     }
 
-    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry[s]);
+    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry_value);
     const float gate_sum = block_reduce_sum_128(gate_grad_accum, scratch);
     if constexpr (DirectGradReduce) {
         if (s == 0) {
@@ -923,10 +915,7 @@ void launch_backward_chunk(
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     const dim3 grid(batch_size);
     const dim3 block(kNumStates);
-    const size_t shared_bytes = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (6 * kNumStates) + (2 * transition_rank) + kNumWarps
-        + (DirectGradReduce ? ((2 * kNumStates * transition_rank) + kNumStates + 1) : 0)
-    ) * sizeof(float);
+    const size_t shared_bytes = backward_chunk_shared_bytes(transition_rank, DirectGradReduce);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int device_index = beliefs.get_device();
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
@@ -993,10 +982,7 @@ void launch_backward_chunk_quantized(
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_q.size(1));
     const dim3 grid(batch_size);
     const dim3 block(kNumStates);
-    const size_t shared_bytes = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (6 * kNumStates) + (2 * transition_rank) + kNumWarps
-        + (DirectGradReduce ? ((2 * kNumStates * transition_rank) + kNumStates + 1) : 0)
-    ) * sizeof(float);
+    const size_t shared_bytes = backward_chunk_shared_bytes(transition_rank, DirectGradReduce);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int device_index = beliefs.get_device();
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
