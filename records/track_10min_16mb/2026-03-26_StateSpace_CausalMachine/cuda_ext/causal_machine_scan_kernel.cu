@@ -1219,19 +1219,22 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     const auto batch_size = beliefs.size(0);
     const auto seq_len = beliefs.size(1);
     const auto transition_rank = transition_source_probs.size(1);
-    const bool direct_rank8_grad = transition_rank == 8;
+    // Small structured ranks fit comfortably in shared memory even with the
+    // direct reduction scratch space. Avoid materializing [B, ...] gradient
+    // buffers for the common rank-8 / rank-16 competition settings.
+    const bool direct_small_rank_grad = transition_rank == 8 || transition_rank == 16;
     auto grad_local_logits = torch::zeros_like(beliefs);
     auto grad_transition_context = torch::zeros_like(transition_context);
-    auto grad_transition_source_per_batch = direct_rank8_grad
+    auto grad_transition_source_per_batch = direct_small_rank_grad
         ? torch::zeros({kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_dest_per_batch = direct_rank8_grad
+    auto grad_transition_dest_per_batch = direct_small_rank_grad
         ? torch::zeros({transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_stay_per_batch = direct_rank8_grad
+    auto grad_transition_stay_per_batch = direct_small_rank_grad
         ? torch::zeros({kNumStates}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, kNumStates}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_gate_per_batch = direct_rank8_grad
+    auto grad_transition_gate_per_batch = direct_small_rank_grad
         ? torch::zeros({1}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
@@ -1268,7 +1271,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
                             grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_chunk<scalar_t, 16>(
+                        launch_backward_chunk<scalar_t, 16, true>(
                             grad_beliefs,
                             carry,
                             transition_source_probs,
@@ -1411,7 +1414,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
                                 grad_transition_stay_per_batch);
                             break;
                         case 16:
-                            launch_backward_chunk<scalar_t, 16>(
+                            launch_backward_chunk<scalar_t, 16, true>(
                                 grad_beliefs,
                                 carry,
                                 transition_source_probs,
@@ -1522,16 +1525,16 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
         grad_initial_log_belief.copy_(carry);
     }
 
-    auto grad_transition_source_probs = direct_rank8_grad
+    auto grad_transition_source_probs = direct_small_rank_grad
         ? grad_transition_source_per_batch
         : grad_transition_source_per_batch.sum(0);
-    auto grad_transition_dest_probs = direct_rank8_grad
+    auto grad_transition_dest_probs = direct_small_rank_grad
         ? grad_transition_dest_per_batch
         : grad_transition_dest_per_batch.sum(0);
-    auto grad_transition_stay_probs = direct_rank8_grad
+    auto grad_transition_stay_probs = direct_small_rank_grad
         ? grad_transition_stay_per_batch
         : grad_transition_stay_per_batch.sum(0);
-    auto grad_transition_gate = direct_rank8_grad
+    auto grad_transition_gate = direct_small_rank_grad
         ? grad_transition_gate_per_batch.reshape({1})
         : grad_transition_gate_per_batch.sum().reshape({1});
     return {
@@ -1672,19 +1675,19 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
     const auto batch_size = beliefs.size(0);
     const auto seq_len = beliefs.size(1);
     const auto transition_rank = transition_source_q.size(1);
-    const bool direct_rank8_grad = transition_rank == 8;
+    const bool direct_small_rank_grad = transition_rank == 8 || transition_rank == 16;
     auto grad_local_logits = torch::zeros_like(beliefs);
     auto grad_transition_context = torch::zeros_like(transition_context);
-    auto grad_transition_source_per_batch = direct_rank8_grad
+    auto grad_transition_source_per_batch = direct_small_rank_grad
         ? torch::zeros({kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_dest_per_batch = direct_rank8_grad
+    auto grad_transition_dest_per_batch = direct_small_rank_grad
         ? torch::zeros({transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_stay_per_batch = direct_rank8_grad
+    auto grad_transition_stay_per_batch = direct_small_rank_grad
         ? torch::zeros({kNumStates}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size, kNumStates}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_gate_per_batch = direct_rank8_grad
+    auto grad_transition_gate_per_batch = direct_small_rank_grad
         ? torch::zeros({1}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
@@ -1707,7 +1710,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
                             grad_initial_log_belief, grad_transition_gate_per_batch, grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_chunk_quantized<scalar_t, 16>(
+                        launch_backward_chunk_quantized<scalar_t, 16, true>(
                             grad_beliefs, carry, transition_source_q, transition_source_scales, transition_dest_q, transition_dest_scales,
                             transition_context, initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
                             grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch, grad_transition_context,
@@ -1766,7 +1769,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
                                 chunk_grad_initial, grad_transition_gate_per_batch, grad_transition_stay_per_batch);
                             break;
                         case 16:
-                            launch_backward_chunk_quantized<scalar_t, 16>(
+                            launch_backward_chunk_quantized<scalar_t, 16, true>(
                                 grad_beliefs, carry, transition_source_q, transition_source_scales, transition_dest_q, transition_dest_scales,
                                 transition_context, prev, beliefs, transition_gate, transition_stay_probs, chunk_start, this_chunk_len,
                                 grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch, grad_transition_context,
@@ -1807,16 +1810,16 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
         grad_initial_log_belief.copy_(carry);
     }
 
-    auto grad_transition_source_probs = direct_rank8_grad
+    auto grad_transition_source_probs = direct_small_rank_grad
         ? grad_transition_source_per_batch
         : grad_transition_source_per_batch.sum(0);
-    auto grad_transition_dest_probs = direct_rank8_grad
+    auto grad_transition_dest_probs = direct_small_rank_grad
         ? grad_transition_dest_per_batch
         : grad_transition_dest_per_batch.sum(0);
-    auto grad_transition_stay_probs = direct_rank8_grad
+    auto grad_transition_stay_probs = direct_small_rank_grad
         ? grad_transition_stay_per_batch
         : grad_transition_stay_per_batch.sum(0);
-    auto grad_transition_gate = direct_rank8_grad
+    auto grad_transition_gate = direct_small_rank_grad
         ? grad_transition_gate_per_batch.reshape({1})
         : grad_transition_gate_per_batch.sum().reshape({1});
     return {
