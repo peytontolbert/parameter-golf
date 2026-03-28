@@ -211,7 +211,7 @@ __global__ void row_softmax_backward_kernel(
     }
 }
 
-template <typename scalar_t, int StaticTransitionRank = -1>
+template <typename scalar_t, int StaticTransitionRank = -1, bool InputsAreLogits = false>
 __global__ void causal_machine_forward_chunk_kernel(
     const scalar_t* __restrict__ local_logits,
     const float* __restrict__ transition_source_probs,
@@ -237,11 +237,30 @@ __global__ void causal_machine_forward_chunk_kernel(
     float* latent = prev_prob + kNumStates;
     float* scratch = latent + rank;
 
-    for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
-        source_shared[idx] = transition_source_probs[idx];
-    }
-    for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
-        dest_shared[idx] = transition_dest_probs[idx];
+    if constexpr (InputsAreLogits) {
+        for (int row = 0; row < kNumStates; ++row) {
+            const float logit = s < rank ? transition_source_probs[row * rank + s] : -INFINITY;
+            const float row_max = block_reduce_max_128(logit, scratch);
+            const float row_exp = s < rank ? fast_exp(logit - row_max) : 0.0f;
+            const float row_sum = block_reduce_sum_128(row_exp, scratch);
+            if (s < rank) {
+                source_shared[row * rank + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
+            }
+        }
+        for (int row = 0; row < rank; ++row) {
+            const float logit = transition_dest_probs[row * kNumStates + s];
+            const float row_max = block_reduce_max_128(logit, scratch);
+            const float row_exp = fast_exp(logit - row_max);
+            const float row_sum = block_reduce_sum_128(row_exp, scratch);
+            dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
+        }
+    } else {
+        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
+            source_shared[idx] = transition_source_probs[idx];
+        }
+        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
+            dest_shared[idx] = transition_dest_probs[idx];
+        }
     }
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
@@ -389,7 +408,7 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
     final_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(last_q_log);
 }
 
-template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false>
+template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false, bool InputsAreLogits = false>
 __global__ void causal_machine_backward_chunk_kernel(
     const scalar_t* __restrict__ grad_beliefs,
     const scalar_t* __restrict__ grad_final_belief,
@@ -449,11 +468,30 @@ __global__ void causal_machine_backward_chunk_kernel(
         grad_stay_batch = grad_transition_stay_per_batch + b * kNumStates;
     }
 
-    for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
-        source_shared[idx] = transition_source_probs[idx];
-    }
-    for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
-        dest_shared[idx] = transition_dest_probs[idx];
+    if constexpr (InputsAreLogits) {
+        for (int row = 0; row < kNumStates; ++row) {
+            const float logit = s < rank ? transition_source_probs[row * rank + s] : -INFINITY;
+            const float row_max = block_reduce_max_128(logit, scratch);
+            const float row_exp = s < rank ? fast_exp(logit - row_max) : 0.0f;
+            const float row_sum = block_reduce_sum_128(row_exp, scratch);
+            if (s < rank) {
+                source_shared[row * rank + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
+            }
+        }
+        for (int row = 0; row < rank; ++row) {
+            const float logit = transition_dest_probs[row * kNumStates + s];
+            const float row_max = block_reduce_max_128(logit, scratch);
+            const float row_exp = fast_exp(logit - row_max);
+            const float row_sum = block_reduce_sum_128(row_exp, scratch);
+            dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
+        }
+    } else {
+        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
+            source_shared[idx] = transition_source_probs[idx];
+        }
+        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
+            dest_shared[idx] = transition_dest_probs[idx];
+        }
     }
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
@@ -566,6 +604,38 @@ __global__ void causal_machine_backward_chunk_kernel(
         }
         carry_value = prev_grad_prob * prev_prob_value;
         q_prob_value = prev_prob_value;
+        __syncthreads();
+    }
+
+    if constexpr (InputsAreLogits) {
+        for (int row = 0; row < kNumStates; ++row) {
+            const int idx = row * rank + s;
+            const float prob = s < rank ? source_shared[idx] : 0.0f;
+            const float grad_prob = s < rank
+                ? (DirectGradReduce ? grad_source_shared[idx] : grad_source_batch[idx])
+                : 0.0f;
+            const float row_dot = block_reduce_sum_128(grad_prob * prob, scratch);
+            if (s < rank) {
+                const float grad_logit = (grad_prob - row_dot) * prob;
+                if constexpr (DirectGradReduce) {
+                    grad_source_shared[idx] = grad_logit;
+                } else {
+                    grad_source_batch[idx] = grad_logit;
+                }
+            }
+        }
+        for (int row = 0; row < rank; ++row) {
+            const int idx = row * kNumStates + s;
+            const float prob = dest_shared[idx];
+            const float grad_prob = DirectGradReduce ? grad_dest_shared[idx] : grad_dest_batch[idx];
+            const float row_dot = block_reduce_sum_128(grad_prob * prob, scratch);
+            const float grad_logit = (grad_prob - row_dot) * prob;
+            if constexpr (DirectGradReduce) {
+                grad_dest_shared[idx] = grad_logit;
+            } else {
+                grad_dest_batch[idx] = grad_logit;
+            }
+        }
         __syncthreads();
     }
 
@@ -797,7 +867,7 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
     }
 }
 
-template <typename scalar_t, int StaticTransitionRank = -1>
+template <typename scalar_t, int StaticTransitionRank = -1, bool InputsAreLogits = false>
 void launch_forward_chunk(
     const torch::Tensor& local_logits,
     const torch::Tensor& transition_source_probs,
@@ -828,10 +898,10 @@ void launch_forward_chunk(
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
     ensure_dynamic_smem_configured(
-        causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank>,
+        causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank, InputsAreLogits>,
         device_index,
         static_cast<int>(shared_bytes));
-    causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank><<<grid, block, shared_bytes, stream>>>(
+    causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank, InputsAreLogits><<<grid, block, shared_bytes, stream>>>(
         local_logits.data_ptr<scalar_t>(),
         transition_source_probs.data_ptr<float>(),
         transition_dest_probs.data_ptr<float>(),
@@ -903,7 +973,7 @@ void launch_forward_chunk_quantized(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false>
+template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false, bool InputsAreLogits = false>
 void launch_backward_chunk(
     const torch::Tensor& grad_beliefs,
     const torch::Tensor& grad_final_belief,
@@ -941,10 +1011,10 @@ void launch_backward_chunk(
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
     ensure_dynamic_smem_configured(
-        causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce>,
+        causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce, InputsAreLogits>,
         device_index,
         static_cast<int>(shared_bytes));
-    causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce><<<grid, block, shared_bytes, stream>>>(
+    causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce, InputsAreLogits><<<grid, block, shared_bytes, stream>>>(
         grad_beliefs.data_ptr<scalar_t>(),
         grad_final_belief.data_ptr<scalar_t>(),
         transition_source_probs.data_ptr<float>(),
@@ -1265,30 +1335,82 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(local_logits.device());
-    auto transition_source_probs = torch::empty_like(transition_source_logits);
-    auto transition_dest_probs = torch::empty_like(transition_dest_logits);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const dim3 block(kNumStates);
-    const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
-    const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
-    row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
-        transition_source_logits.data_ptr<float>(),
-        static_cast<int>(transition_source_logits.size(1)),
-        transition_source_probs.data_ptr<float>());
-    row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
-        transition_dest_logits.data_ptr<float>(),
-        static_cast<int>(transition_dest_logits.size(1)),
-        transition_dest_probs.data_ptr<float>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return causal_machine_scan_forward_cuda(
-        local_logits,
-        transition_source_probs,
-        transition_dest_probs,
-        transition_context,
-        initial_log_belief,
-        transition_gate,
-        transition_stay_probs,
-        chunk_size);
+    const auto seq_len = local_logits.size(1);
+    const auto transition_rank = transition_source_logits.size(1);
+    if (seq_len == 0) {
+        auto beliefs = torch::empty_like(local_logits);
+        auto final_log_belief = torch::empty_like(initial_log_belief);
+        final_log_belief.copy_(initial_log_belief);
+        return {beliefs, final_log_belief};
+    }
+    if (seq_len > scan_single_launch_max_seq_len()) {
+        auto transition_source_probs = torch::empty_like(transition_source_logits);
+        auto transition_dest_probs = torch::empty_like(transition_dest_logits);
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        const dim3 block(kNumStates);
+        const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
+        const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
+        row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
+            transition_source_logits.data_ptr<float>(),
+            static_cast<int>(transition_source_logits.size(1)),
+            transition_source_probs.data_ptr<float>());
+        row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
+            transition_dest_logits.data_ptr<float>(),
+            static_cast<int>(transition_dest_logits.size(1)),
+            transition_dest_probs.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return causal_machine_scan_forward_cuda(
+            local_logits,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            chunk_size);
+    }
+    auto beliefs = torch::empty_like(local_logits);
+    auto final_log_belief = torch::empty_like(initial_log_belief);
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        local_logits.scalar_type(),
+        "causal_machine_scan_forward_logits_chunk",
+        [&] {
+            switch (transition_rank) {
+                case 8:
+                    launch_forward_chunk<scalar_t, 8, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+                case 16:
+                    launch_forward_chunk<scalar_t, 16, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+                case 32:
+                    launch_forward_chunk<scalar_t, 32, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+                case 64:
+                    launch_forward_chunk<scalar_t, 64, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+                case 128:
+                    launch_forward_chunk<scalar_t, 128, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+                default:
+                    launch_forward_chunk<scalar_t, -1, true>(
+                        local_logits, transition_source_logits, transition_dest_logits, transition_context,
+                        initial_log_belief, transition_gate, transition_stay_probs, 0, seq_len, beliefs, final_log_belief);
+                    break;
+            }
+        });
+    return {beliefs, final_log_belief};
 }
 
 std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
@@ -1691,48 +1813,162 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(beliefs.device());
-    auto transition_source_probs = torch::empty_like(transition_source_logits);
-    auto transition_dest_probs = torch::empty_like(transition_dest_logits);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const dim3 block(kNumStates);
-    const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
-    const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
-    row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
-        transition_source_logits.data_ptr<float>(),
-        static_cast<int>(transition_source_logits.size(1)),
-        transition_source_probs.data_ptr<float>());
-    row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
-        transition_dest_logits.data_ptr<float>(),
-        static_cast<int>(transition_dest_logits.size(1)),
-        transition_dest_probs.data_ptr<float>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grads = causal_machine_scan_backward_cuda(
-        grad_beliefs,
-        grad_final_belief,
-        transition_source_probs,
-        transition_dest_probs,
-        transition_context,
-        initial_log_belief,
-        beliefs,
-        transition_gate,
-        transition_stay_probs,
-        chunk_size);
-    auto grad_transition_source_logits = torch::empty_like(transition_source_logits);
-    auto grad_transition_dest_logits = torch::empty_like(transition_dest_logits);
-    row_softmax_backward_kernel<<<source_grid, block, 0, stream>>>(
-        grads[1].data_ptr<float>(),
-        transition_source_probs.data_ptr<float>(),
-        static_cast<int>(transition_source_probs.size(1)),
-        grad_transition_source_logits.data_ptr<float>());
-    row_softmax_backward_kernel<<<dest_grid, block, 0, stream>>>(
-        grads[2].data_ptr<float>(),
-        transition_dest_probs.data_ptr<float>(),
-        static_cast<int>(transition_dest_probs.size(1)),
-        grad_transition_dest_logits.data_ptr<float>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    grads[1] = grad_transition_source_logits;
-    grads[2] = grad_transition_dest_logits;
-    return grads;
+    const auto seq_len = beliefs.size(1);
+    if (seq_len > scan_single_launch_max_seq_len()) {
+        auto transition_source_probs = torch::empty_like(transition_source_logits);
+        auto transition_dest_probs = torch::empty_like(transition_dest_logits);
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        const dim3 block(kNumStates);
+        const dim3 source_grid(static_cast<unsigned int>(transition_source_logits.size(0)));
+        const dim3 dest_grid(static_cast<unsigned int>(transition_dest_logits.size(0)));
+        row_softmax_forward_kernel<<<source_grid, block, 0, stream>>>(
+            transition_source_logits.data_ptr<float>(),
+            static_cast<int>(transition_source_logits.size(1)),
+            transition_source_probs.data_ptr<float>());
+        row_softmax_forward_kernel<<<dest_grid, block, 0, stream>>>(
+            transition_dest_logits.data_ptr<float>(),
+            static_cast<int>(transition_dest_logits.size(1)),
+            transition_dest_probs.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        auto grads = causal_machine_scan_backward_cuda(
+            grad_beliefs,
+            grad_final_belief,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            beliefs,
+            transition_gate,
+            transition_stay_probs,
+            chunk_size);
+        auto grad_transition_source_logits = torch::empty_like(transition_source_logits);
+        auto grad_transition_dest_logits = torch::empty_like(transition_dest_logits);
+        row_softmax_backward_kernel<<<source_grid, block, 0, stream>>>(
+            grads[1].data_ptr<float>(),
+            transition_source_probs.data_ptr<float>(),
+            static_cast<int>(transition_source_probs.size(1)),
+            grad_transition_source_logits.data_ptr<float>());
+        row_softmax_backward_kernel<<<dest_grid, block, 0, stream>>>(
+            grads[2].data_ptr<float>(),
+            transition_dest_probs.data_ptr<float>(),
+            static_cast<int>(transition_dest_probs.size(1)),
+            grad_transition_dest_logits.data_ptr<float>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        grads[1] = grad_transition_source_logits;
+        grads[2] = grad_transition_dest_logits;
+        return grads;
+    }
+    const auto batch_size = beliefs.size(0);
+    const auto transition_rank = transition_source_logits.size(1);
+    const bool direct_small_rank_grad = can_use_direct_grad_reduce(beliefs.get_device(), static_cast<int>(transition_rank));
+    auto grad_local_logits = torch::zeros_like(beliefs);
+    auto grad_transition_context = torch::zeros_like(transition_context);
+    auto grad_transition_source_per_batch = direct_small_rank_grad
+        ? torch::zeros({kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, kNumStates, transition_rank}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_dest_per_batch = direct_small_rank_grad
+        ? torch::zeros({transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, transition_rank, kNumStates}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_stay_per_batch = direct_small_rank_grad
+        ? torch::zeros({kNumStates}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, kNumStates}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_gate_per_batch = direct_small_rank_grad
+        ? torch::zeros({1}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
+    auto carry = grad_final_belief.contiguous();
+    if (seq_len == 0) {
+        grad_initial_log_belief.copy_(grad_final_belief);
+    } else {
+        AT_DISPATCH_FLOATING_TYPES_AND2(
+            at::ScalarType::Half,
+            at::ScalarType::BFloat16,
+            beliefs.scalar_type(),
+            "causal_machine_scan_backward_logits_chunk",
+            [&] {
+                switch (transition_rank) {
+                    case 8:
+                        launch_backward_chunk<scalar_t, 8, true, true>(
+                            grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                            initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                            grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                            grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
+                        break;
+                    case 16:
+                        launch_backward_chunk<scalar_t, 16, true, true>(
+                            grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                            initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                            grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                            grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
+                        break;
+                    case 32:
+                        if (direct_small_rank_grad) {
+                            launch_backward_chunk<scalar_t, 32, true, true>(
+                                grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                                initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                                grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                                grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        } else {
+                            launch_backward_chunk<scalar_t, 32, false, true>(
+                                grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                                initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                                grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                                grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        }
+                        break;
+                    case 64:
+                        launch_backward_chunk<scalar_t, 64, false, true>(
+                            grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                            initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                            grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                            grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
+                        break;
+                    case 128:
+                        launch_backward_chunk<scalar_t, 128, false, true>(
+                            grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                            initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                            grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                            grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
+                        break;
+                    default:
+                        launch_backward_chunk<scalar_t, -1, false, true>(
+                            grad_beliefs, carry, transition_source_logits, transition_dest_logits, transition_context,
+                            initial_log_belief, beliefs, transition_gate, transition_stay_probs, 0, seq_len,
+                            grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
+                            grad_transition_context, grad_initial_log_belief, grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
+                        break;
+                }
+            });
+    }
+
+    auto grad_transition_source_logits = direct_small_rank_grad
+        ? grad_transition_source_per_batch
+        : grad_transition_source_per_batch.sum(0);
+    auto grad_transition_dest_logits = direct_small_rank_grad
+        ? grad_transition_dest_per_batch
+        : grad_transition_dest_per_batch.sum(0);
+    auto grad_transition_stay_probs = direct_small_rank_grad
+        ? grad_transition_stay_per_batch
+        : grad_transition_stay_per_batch.sum(0);
+    auto grad_transition_gate = direct_small_rank_grad
+        ? grad_transition_gate_per_batch.reshape({1})
+        : grad_transition_gate_per_batch.sum().reshape({1});
+    return {
+        grad_local_logits,
+        grad_transition_source_logits,
+        grad_transition_dest_logits,
+        grad_transition_context,
+        grad_initial_log_belief,
+        grad_transition_gate,
+        grad_transition_stay_probs,
+    };
 }
 
 std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(

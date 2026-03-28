@@ -12,6 +12,16 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
     torch::Tensor transition_stay_probs,
     int64_t chunk_size);
 
+std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size);
+
 std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(
     torch::Tensor local_logits,
     torch::Tensor transition_source_q,
@@ -29,6 +39,18 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     torch::Tensor grad_final_belief,
     torch::Tensor transition_source_probs,
     torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size);
+
+std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
@@ -206,12 +228,10 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    auto transition_source_probs = torch::softmax(transition_source_logits, -1).contiguous();
-    auto transition_dest_probs = torch::softmax(transition_dest_logits, -1).contiguous();
-    return causal_machine_scan_forward_cuda(
+    return causal_machine_scan_forward_logits_cuda(
         local_logits,
-        transition_source_probs,
-        transition_dest_probs,
+        transition_source_logits,
+        transition_dest_logits,
         transition_context,
         initial_log_belief,
         transition_gate,
@@ -466,26 +486,17 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
             torch::zeros_like(transition_stay_probs),
         };
     }
-    auto transition_source_probs = torch::softmax(transition_source_logits, -1).contiguous();
-    auto transition_dest_probs = torch::softmax(transition_dest_logits, -1).contiguous();
-    auto grads = causal_machine_scan_backward_cuda(
+    return causal_machine_scan_backward_logits_cuda(
         grad_beliefs,
         grad_final_belief,
-        transition_source_probs,
-        transition_dest_probs,
+        transition_source_logits,
+        transition_dest_logits,
         transition_context,
         initial_log_belief,
         beliefs,
         transition_gate,
         transition_stay_probs,
         chunk_size);
-    auto grad_source_probs = grads[1];
-    auto grad_dest_probs = grads[2];
-    auto grad_source_logits = (grad_source_probs - (grad_source_probs * transition_source_probs).sum(-1, true)) * transition_source_probs;
-    auto grad_dest_logits = (grad_dest_probs - (grad_dest_probs * transition_dest_probs).sum(-1, true)) * transition_dest_probs;
-    grads[1] = grad_source_logits.contiguous();
-    grads[2] = grad_dest_logits.contiguous();
-    return grads;
 }
 
 std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
