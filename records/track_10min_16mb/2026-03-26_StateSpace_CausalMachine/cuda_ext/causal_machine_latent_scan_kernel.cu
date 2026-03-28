@@ -5,13 +5,62 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace {
 
 constexpr int kThreads = 256;
 constexpr int kLatentChunkSize = 64;
-constexpr int kChunkScanThreads = 64;
+// Keep the prefix-scan fast path active for substantially longer sequences.
+// With chunk size 64, 256 scan threads covers up to 16384 tokens before the
+// kernel has to fall back to the sequential carry path.
+constexpr int kChunkScanThreads = 256;
+
+std::mutex g_latent_workspace_cache_mutex;
+std::unordered_map<std::string, std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>> g_latent_workspace_cache;
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_workspace(
+    const char* tag,
+    const torch::Tensor& ref,
+    int batch_size,
+    int num_chunks,
+    int rank_dim) {
+    const auto device_index = ref.get_device();
+    const auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
+    const std::string key = std::string(tag)
+        + ":" + std::to_string(device_index)
+        + ":" + std::to_string(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(stream)))
+        + ":" + std::to_string(batch_size)
+        + ":" + std::to_string(num_chunks)
+        + ":" + std::to_string(rank_dim);
+    const auto opts = ref.options().dtype(torch::kFloat32);
+    const auto sizes = std::vector<int64_t>{
+        static_cast<int64_t>(batch_size),
+        static_cast<int64_t>(num_chunks),
+        static_cast<int64_t>(rank_dim),
+    };
+    std::lock_guard<std::mutex> lock(g_latent_workspace_cache_mutex);
+    auto& entry = g_latent_workspace_cache[key];
+    auto ensure_tensor = [&](torch::Tensor& t) {
+        if (
+            !t.defined()
+            || t.scalar_type() != torch::kFloat32
+            || t.device() != ref.device()
+            || t.sizes().vec() != sizes
+        ) {
+            t = torch::empty(sizes, opts);
+        }
+    };
+    ensure_tensor(std::get<0>(entry));
+    ensure_tensor(std::get<1>(entry));
+    ensure_tensor(std::get<2>(entry));
+    return entry;
+}
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* ptr) {
@@ -207,6 +256,132 @@ __global__ void latent_chunk_prefix_scan_kernel(
     }
 }
 
+__global__ void latent_group_summary_kernel(
+    const float* __restrict__ in_mul,
+    const float* __restrict__ in_add,
+    int in_chunks,
+    int rank_dim,
+    int out_chunks,
+    float* __restrict__ out_mul,
+    float* __restrict__ out_add) {
+    const int b = blockIdx.x;
+    const int group_id = blockIdx.y;
+    const int r = blockIdx.z * blockDim.x + threadIdx.x;
+    if (group_id >= out_chunks || r >= rank_dim) {
+        return;
+    }
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+    float mul = 1.0f;
+    float add = 0.0f;
+    for (int i = 0; i < group_len; ++i) {
+        const int idx = (b * in_chunks + (group_start + i)) * rank_dim + r;
+        const float cur_mul = in_mul[idx];
+        const float cur_add = in_add[idx];
+        add = cur_mul * add + cur_add;
+        mul *= cur_mul;
+    }
+    const int out_idx = (b * out_chunks + group_id) * rank_dim + r;
+    out_mul[out_idx] = mul;
+    out_add[out_idx] = add;
+}
+
+__global__ void latent_chunk_group_prefix_scan_kernel(
+    const float* __restrict__ chunk_mul,
+    const float* __restrict__ chunk_add,
+    const float* __restrict__ group_prev,
+    int num_chunks,
+    int rank_dim,
+    int num_groups,
+    float* __restrict__ chunk_prev) {
+    const int b = blockIdx.x;
+    const int group_id = blockIdx.y;
+    const int r = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
+        return;
+    }
+
+    __shared__ float mul_shared[kChunkScanThreads];
+    __shared__ float add_shared[kChunkScanThreads];
+    __shared__ float mul_tmp[kChunkScanThreads];
+    __shared__ float add_tmp[kChunkScanThreads];
+
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+    if (tid < group_len) {
+        const int idx = (b * num_chunks + (group_start + tid)) * rank_dim + r;
+        mul_shared[tid] = chunk_mul[idx];
+        add_shared[tid] = chunk_add[idx];
+    } else {
+        mul_shared[tid] = 1.0f;
+        add_shared[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int offset = 1; offset < group_len; offset <<= 1) {
+        if (tid < group_len) {
+            float cur_mul = mul_shared[tid];
+            float cur_add = add_shared[tid];
+            if (tid >= offset) {
+                const float left_mul = mul_shared[tid - offset];
+                const float left_add = add_shared[tid - offset];
+                mul_tmp[tid] = cur_mul * left_mul;
+                add_tmp[tid] = cur_mul * left_add + cur_add;
+            } else {
+                mul_tmp[tid] = cur_mul;
+                add_tmp[tid] = cur_add;
+            }
+        }
+        __syncthreads();
+        if (tid < group_len) {
+            mul_shared[tid] = mul_tmp[tid];
+            add_shared[tid] = add_tmp[tid];
+        }
+        __syncthreads();
+    }
+
+    if (tid < group_len) {
+        float prev = group_prev[(b * num_groups + group_id) * rank_dim + r];
+        if (tid > 0) {
+            const float excl_mul = mul_shared[tid - 1];
+            const float excl_add = add_shared[tid - 1];
+            prev = excl_mul * prev + excl_add;
+        }
+        chunk_prev[(b * num_chunks + (group_start + tid)) * rank_dim + r] = prev;
+    }
+}
+
+__global__ void latent_group_summary_reverse_kernel(
+    const float* __restrict__ in_mul,
+    const float* __restrict__ in_add,
+    int in_chunks,
+    int rank_dim,
+    int out_chunks,
+    float* __restrict__ out_mul,
+    float* __restrict__ out_add) {
+    const int b = blockIdx.x;
+    const int group_id = blockIdx.y;
+    const int r = blockIdx.z * blockDim.x + threadIdx.x;
+    if (group_id >= out_chunks || r >= rank_dim) {
+        return;
+    }
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+    float mul = 1.0f;
+    float add = 0.0f;
+    for (int i = group_len - 1; i >= 0; --i) {
+        const int idx = (b * in_chunks + (group_start + i)) * rank_dim + r;
+        const float cur_mul = in_mul[idx];
+        const float cur_add = in_add[idx];
+        add = cur_mul * add + cur_add;
+        mul *= cur_mul;
+    }
+    const int out_idx = (b * out_chunks + group_id) * rank_dim + r;
+    out_mul[out_idx] = mul;
+    out_add[out_idx] = add;
+}
+
 template <typename scalar_t, bool StoreStates>
 __global__ void latent_chunk_finalize_kernel(
     const scalar_t* __restrict__ drive,
@@ -383,6 +558,75 @@ __global__ void latent_chunk_reverse_prefix_scan_kernel(
             carry = excl_mul * final_grad + excl_add;
         }
         chunk_carry[(b * num_chunks + rev) * rank_dim + r] = carry;
+    }
+}
+
+__global__ void latent_chunk_group_reverse_prefix_scan_kernel(
+    const float* __restrict__ chunk_mul,
+    const float* __restrict__ chunk_add,
+    const float* __restrict__ group_carry,
+    int num_chunks,
+    int rank_dim,
+    int num_groups,
+    float* __restrict__ chunk_carry) {
+    const int b = blockIdx.x;
+    const int group_id = blockIdx.y;
+    const int r = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
+        return;
+    }
+
+    __shared__ float mul_shared[kChunkScanThreads];
+    __shared__ float add_shared[kChunkScanThreads];
+    __shared__ float mul_tmp[kChunkScanThreads];
+    __shared__ float add_tmp[kChunkScanThreads];
+
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+    if (tid < group_len) {
+        const int rev_local = group_len - 1 - tid;
+        const int idx = (b * num_chunks + (group_start + rev_local)) * rank_dim + r;
+        mul_shared[tid] = chunk_mul[idx];
+        add_shared[tid] = chunk_add[idx];
+    } else {
+        mul_shared[tid] = 1.0f;
+        add_shared[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int offset = 1; offset < group_len; offset <<= 1) {
+        if (tid < group_len) {
+            float cur_mul = mul_shared[tid];
+            float cur_add = add_shared[tid];
+            if (tid >= offset) {
+                const float left_mul = mul_shared[tid - offset];
+                const float left_add = add_shared[tid - offset];
+                mul_tmp[tid] = cur_mul * left_mul;
+                add_tmp[tid] = cur_mul * left_add + cur_add;
+            } else {
+                mul_tmp[tid] = cur_mul;
+                add_tmp[tid] = cur_add;
+            }
+        }
+        __syncthreads();
+        if (tid < group_len) {
+            mul_shared[tid] = mul_tmp[tid];
+            add_shared[tid] = add_tmp[tid];
+        }
+        __syncthreads();
+    }
+
+    if (tid < group_len) {
+        const int rev_local = group_len - 1 - tid;
+        const int actual_chunk = group_start + rev_local;
+        float carry = group_carry[(b * num_groups + group_id) * rank_dim + r];
+        if (tid > 0) {
+            const float excl_mul = mul_shared[tid - 1];
+            const float excl_add = add_shared[tid - 1];
+            carry = excl_mul * carry + excl_add;
+        }
+        chunk_carry[(b * num_chunks + actual_chunk) * rank_dim + r] = carry;
     }
 }
 
@@ -595,6 +839,125 @@ __global__ void latent_prior_scan_backward_kernel(
     atomicAdd(grad_decay + r, decay_grad);
 }
 
+template <typename scalar_t>
+void latent_prefix_scan_dispatch(
+    const torch::Tensor& chunk_mul,
+    const torch::Tensor& chunk_add,
+    const torch::Tensor& initial_state,
+    int batch_size,
+    int num_chunks,
+    int rank_dim,
+    cudaStream_t stream,
+    torch::Tensor& chunk_prev,
+    torch::Tensor& final_state) {
+    if (num_chunks <= kChunkScanThreads) {
+        const dim3 scan_grid(batch_size, rank_dim);
+        latent_chunk_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<float>(),
+            chunk_add.data_ptr<float>(),
+            initial_state.data_ptr<scalar_t>(),
+            num_chunks,
+            rank_dim,
+            chunk_prev.data_ptr<float>(),
+            final_state.data_ptr<scalar_t>());
+        return;
+    }
+
+    const int num_groups = static_cast<int>((num_chunks + kChunkScanThreads - 1) / kChunkScanThreads);
+    auto summary_opts = chunk_mul.options().dtype(torch::kFloat32);
+    auto group_mul = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    auto group_add = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    auto group_prev = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    auto group_final = torch::empty_like(initial_state);
+    const dim3 block(kThreads);
+    const dim3 summary_grid(batch_size, num_groups, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
+    latent_group_summary_kernel<<<summary_grid, block, 0, stream>>>(
+        chunk_mul.data_ptr<float>(),
+        chunk_add.data_ptr<float>(),
+        num_chunks,
+        rank_dim,
+        num_groups,
+        group_mul.data_ptr<float>(),
+        group_add.data_ptr<float>());
+    latent_prefix_scan_dispatch<scalar_t>(
+        group_mul,
+        group_add,
+        initial_state,
+        batch_size,
+        num_groups,
+        rank_dim,
+        stream,
+        group_prev,
+        group_final);
+    const dim3 group_scan_grid(batch_size, num_groups, rank_dim);
+    latent_chunk_group_prefix_scan_kernel<<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
+        chunk_mul.data_ptr<float>(),
+        chunk_add.data_ptr<float>(),
+        group_prev.data_ptr<float>(),
+        num_chunks,
+        rank_dim,
+        num_groups,
+        chunk_prev.data_ptr<float>());
+    final_state.copy_(group_final);
+}
+
+template <typename scalar_t>
+void latent_reverse_prefix_scan_dispatch(
+    const torch::Tensor& chunk_mul,
+    const torch::Tensor& chunk_add,
+    const torch::Tensor& grad_final_state,
+    int batch_size,
+    int num_chunks,
+    int rank_dim,
+    cudaStream_t stream,
+    torch::Tensor& chunk_carry) {
+    if (num_chunks <= kChunkScanThreads) {
+        const dim3 scan_grid(batch_size, rank_dim);
+        latent_chunk_reverse_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<float>(),
+            chunk_add.data_ptr<float>(),
+            grad_final_state.data_ptr<scalar_t>(),
+            num_chunks,
+            rank_dim,
+            chunk_carry.data_ptr<float>());
+        return;
+    }
+
+    const int num_groups = static_cast<int>((num_chunks + kChunkScanThreads - 1) / kChunkScanThreads);
+    auto summary_opts = chunk_mul.options().dtype(torch::kFloat32);
+    auto group_mul = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    auto group_add = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    auto group_carry = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
+    const dim3 block(kThreads);
+    const dim3 summary_grid(batch_size, num_groups, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
+    latent_group_summary_reverse_kernel<<<summary_grid, block, 0, stream>>>(
+        chunk_mul.data_ptr<float>(),
+        chunk_add.data_ptr<float>(),
+        num_chunks,
+        rank_dim,
+        num_groups,
+        group_mul.data_ptr<float>(),
+        group_add.data_ptr<float>());
+    latent_reverse_prefix_scan_dispatch<scalar_t>(
+        group_mul,
+        group_add,
+        grad_final_state,
+        batch_size,
+        num_groups,
+        rank_dim,
+        stream,
+        group_carry);
+    const dim3 group_scan_grid(batch_size, num_groups, rank_dim);
+    latent_chunk_group_reverse_prefix_scan_kernel<<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
+        chunk_mul.data_ptr<float>(),
+        chunk_add.data_ptr<float>(),
+        group_carry.data_ptr<float>(),
+        num_chunks,
+        rank_dim,
+        num_groups,
+        chunk_carry.data_ptr<float>());
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
@@ -606,22 +969,17 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
     const auto seq_len = static_cast<int>(drive.size(1));
     const auto rank_dim = static_cast<int>(drive.size(2));
     const auto num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
-    auto float_opts = drive.options().dtype(torch::kFloat32);
-    auto chunk_mul = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto chunk_add = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto chunk_prev = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto prior_states = torch::zeros_like(drive);
-    auto states = torch::zeros_like(drive);
-    auto final_state = torch::zeros_like(initial_state);
+    auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace("forward", drive, batch_size, num_chunks, rank_dim);
+    auto prior_states = torch::empty_like(drive);
+    auto states = torch::empty_like(drive);
+    auto final_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         final_state.copy_(initial_state);
         return {states, prior_states, final_state};
     }
     const dim3 block(kThreads);
     const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 carry_grid(batch_size, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 scan_grid(batch_size, rank_dim);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_scan_forward_cuda", [&] {
         latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
@@ -632,25 +990,16 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
             num_chunks,
             chunk_mul.data_ptr<float>(),
             chunk_add.data_ptr<float>());
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_prev.data_ptr<float>(),
-                final_state.data_ptr<scalar_t>());
-        } else {
-            latent_chunk_carry_kernel<scalar_t><<<carry_grid, block, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_prev.data_ptr<float>(),
-                final_state.data_ptr<scalar_t>());
-        }
+        latent_prefix_scan_dispatch<scalar_t>(
+            chunk_mul,
+            chunk_add,
+            initial_state,
+            batch_size,
+            num_chunks,
+            rank_dim,
+            stream,
+            chunk_prev,
+            final_state);
         latent_chunk_finalize_kernel<scalar_t, true><<<finalize_grid, block, 0, stream>>>(
             drive.data_ptr<scalar_t>(),
             decay.data_ptr<float>(),
@@ -674,21 +1023,16 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
     const auto seq_len = static_cast<int>(drive.size(1));
     const auto rank_dim = static_cast<int>(drive.size(2));
     const auto num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
-    auto float_opts = drive.options().dtype(torch::kFloat32);
-    auto chunk_mul = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto chunk_add = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto chunk_prev = torch::zeros({batch_size, num_chunks, rank_dim}, float_opts);
-    auto prior_states = torch::zeros_like(drive);
-    auto final_state = torch::zeros_like(initial_state);
+    auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace("forward_prior", drive, batch_size, num_chunks, rank_dim);
+    auto prior_states = torch::empty_like(drive);
+    auto final_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         final_state.copy_(initial_state);
         return {prior_states, final_state};
     }
     const dim3 block(kThreads);
     const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 carry_grid(batch_size, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 scan_grid(batch_size, rank_dim);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_prior_scan_forward_cuda", [&] {
         latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
@@ -699,25 +1043,16 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
             num_chunks,
             chunk_mul.data_ptr<float>(),
             chunk_add.data_ptr<float>());
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_prev.data_ptr<float>(),
-                final_state.data_ptr<scalar_t>());
-        } else {
-            latent_chunk_carry_kernel<scalar_t><<<carry_grid, block, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_prev.data_ptr<float>(),
-                final_state.data_ptr<scalar_t>());
-        }
+        latent_prefix_scan_dispatch<scalar_t>(
+            chunk_mul,
+            chunk_add,
+            initial_state,
+            batch_size,
+            num_chunks,
+            rank_dim,
+            stream,
+            chunk_prev,
+            final_state);
         latent_chunk_finalize_kernel<scalar_t, false><<<finalize_grid, block, 0, stream>>>(
             drive.data_ptr<scalar_t>(),
             decay.data_ptr<float>(),
@@ -743,22 +1078,18 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
     const auto batch_size = static_cast<int>(states.size(0));
     const auto seq_len = static_cast<int>(states.size(1));
     const auto rank_dim = static_cast<int>(states.size(2));
-    auto grad_drive = torch::zeros_like(states);
+    auto grad_drive = torch::empty_like(states);
     auto grad_decay = torch::zeros_like(decay);
-    auto grad_initial_state = torch::zeros_like(initial_state);
+    auto grad_initial_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
-    auto chunk_mul = torch::zeros({batch_size, (seq_len + kLatentChunkSize - 1) / kLatentChunkSize, rank_dim}, states.options().dtype(torch::kFloat32));
-    auto chunk_add = torch::zeros_like(chunk_mul);
-    auto chunk_carry = torch::zeros_like(chunk_mul);
     const dim3 block(kThreads);
-    const dim3 grid(batch_size, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const int num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
+    auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace("backward", states, batch_size, num_chunks, rank_dim);
     const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 scan_grid(batch_size, rank_dim);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, states.scalar_type(), "latent_scan_backward_cuda", [&] {
         latent_chunk_backward_summary_kernel<scalar_t, true><<<summary_grid, block, 0, stream>>>(
@@ -770,49 +1101,29 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
             num_chunks,
             chunk_mul.data_ptr<float>(),
             chunk_add.data_ptr<float>());
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_reverse_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                grad_final_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_carry.data_ptr<float>());
-        } else {
-            auto carry = grad_final_state.to(torch::kFloat32).contiguous();
-            for (int chunk_id = num_chunks - 1; chunk_id >= 0; --chunk_id) {
-                latent_chunk_backward_kernel<scalar_t, true, true><<<grid, block, 0, stream>>>(
-                    grad_states.data_ptr<scalar_t>(),
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    states.data_ptr<scalar_t>(),
-                    nullptr,
-                    initial_state.data_ptr<scalar_t>(),
-                    decay.data_ptr<float>(),
-                    seq_len,
-                    rank_dim,
-                    chunk_id,
-                    carry.data_ptr<float>(),
-                    grad_drive.data_ptr<scalar_t>(),
-                    grad_decay.data_ptr<float>(),
-                    grad_initial_state.data_ptr<scalar_t>());
-            }
-        }
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_backward_finalize_kernel<scalar_t, true, true><<<finalize_grid, block, 0, stream>>>(
-                grad_states.data_ptr<scalar_t>(),
-                grad_prior_states.data_ptr<scalar_t>(),
-                states.data_ptr<scalar_t>(),
-                nullptr,
-                initial_state.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_carry.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
-        }
+        latent_reverse_prefix_scan_dispatch<scalar_t>(
+            chunk_mul,
+            chunk_add,
+            grad_final_state,
+            batch_size,
+            num_chunks,
+            rank_dim,
+            stream,
+            chunk_carry);
+        latent_chunk_backward_finalize_kernel<scalar_t, true, true><<<finalize_grid, block, 0, stream>>>(
+            grad_states.data_ptr<scalar_t>(),
+            grad_prior_states.data_ptr<scalar_t>(),
+            states.data_ptr<scalar_t>(),
+            nullptr,
+            initial_state.data_ptr<scalar_t>(),
+            decay.data_ptr<float>(),
+            chunk_carry.data_ptr<float>(),
+            seq_len,
+            rank_dim,
+            num_chunks,
+            grad_drive.data_ptr<scalar_t>(),
+            grad_decay.data_ptr<float>(),
+            grad_initial_state.data_ptr<scalar_t>());
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {grad_drive, grad_decay, grad_initial_state};
@@ -828,22 +1139,18 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
     const auto batch_size = static_cast<int>(prior_states.size(0));
     const auto seq_len = static_cast<int>(prior_states.size(1));
     const auto rank_dim = static_cast<int>(prior_states.size(2));
-    auto grad_drive = torch::zeros_like(prior_states);
+    auto grad_drive = torch::empty_like(prior_states);
     auto grad_decay = torch::zeros_like(decay);
-    auto grad_initial_state = torch::zeros_like(initial_state);
+    auto grad_initial_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
-    auto chunk_mul = torch::zeros({batch_size, (seq_len + kLatentChunkSize - 1) / kLatentChunkSize, rank_dim}, prior_states.options().dtype(torch::kFloat32));
-    auto chunk_add = torch::zeros_like(chunk_mul);
-    auto chunk_carry = torch::zeros_like(chunk_mul);
     const dim3 block(kThreads);
-    const dim3 grid(batch_size, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const int num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
+    auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace("backward_prior", prior_states, batch_size, num_chunks, rank_dim);
     const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
     const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    const dim3 scan_grid(batch_size, rank_dim);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, prior_states.scalar_type(), "latent_prior_scan_backward_cuda", [&] {
         latent_chunk_backward_summary_kernel<scalar_t, false><<<summary_grid, block, 0, stream>>>(
@@ -855,49 +1162,29 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
             num_chunks,
             chunk_mul.data_ptr<float>(),
             chunk_add.data_ptr<float>());
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_reverse_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>(),
-                grad_final_state.data_ptr<scalar_t>(),
-                num_chunks,
-                rank_dim,
-                chunk_carry.data_ptr<float>());
-        } else {
-            auto carry = grad_final_state.to(torch::kFloat32).contiguous();
-            for (int chunk_id = num_chunks - 1; chunk_id >= 0; --chunk_id) {
-                latent_chunk_backward_kernel<scalar_t, false, false><<<grid, block, 0, stream>>>(
-                    nullptr,
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    nullptr,
-                    prior_states.data_ptr<scalar_t>(),
-                    initial_state.data_ptr<scalar_t>(),
-                    decay.data_ptr<float>(),
-                    seq_len,
-                    rank_dim,
-                    chunk_id,
-                    carry.data_ptr<float>(),
-                    grad_drive.data_ptr<scalar_t>(),
-                    grad_decay.data_ptr<float>(),
-                    grad_initial_state.data_ptr<scalar_t>());
-            }
-        }
-        if (num_chunks <= kChunkScanThreads) {
-            latent_chunk_backward_finalize_kernel<scalar_t, false, false><<<finalize_grid, block, 0, stream>>>(
-                nullptr,
-                grad_prior_states.data_ptr<scalar_t>(),
-                nullptr,
-                prior_states.data_ptr<scalar_t>(),
-                initial_state.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_carry.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
-        }
+        latent_reverse_prefix_scan_dispatch<scalar_t>(
+            chunk_mul,
+            chunk_add,
+            grad_final_state,
+            batch_size,
+            num_chunks,
+            rank_dim,
+            stream,
+            chunk_carry);
+        latent_chunk_backward_finalize_kernel<scalar_t, false, false><<<finalize_grid, block, 0, stream>>>(
+            nullptr,
+            grad_prior_states.data_ptr<scalar_t>(),
+            nullptr,
+            prior_states.data_ptr<scalar_t>(),
+            initial_state.data_ptr<scalar_t>(),
+            decay.data_ptr<float>(),
+            chunk_carry.data_ptr<float>(),
+            seq_len,
+            rank_dim,
+            num_chunks,
+            grad_drive.data_ptr<scalar_t>(),
+            grad_decay.data_ptr<float>(),
+            grad_initial_state.data_ptr<scalar_t>());
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {grad_drive, grad_decay, grad_initial_state};
