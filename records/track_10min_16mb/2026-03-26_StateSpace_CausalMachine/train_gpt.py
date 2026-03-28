@@ -273,11 +273,13 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
         transition_source_logits_f32 = transition_source_logits.contiguous().float()
         transition_dest_logits_f32 = transition_dest_logits.contiguous().float()
         gate_value = float(transition_gate.detach().float().item())
+        approx_packed_training = _env_enabled("CAUSAL_MACHINE_SCAN_APPROX_PACKED_TRAINING", default=False)
         # The packed structured-scan path executes on quantized transition tables.
         # Keep it for inference/eval, but do not use it for training-time autograd:
         # the packed CUDA op is not the exact gradient of its own forward pass.
         packed_grad_safe = not (ctx.needs_input_grad[1] or ctx.needs_input_grad[2])
-        ctx.use_packed = bool(use_packed) and packed_grad_safe
+        ctx.use_packed = bool(use_packed) and (packed_grad_safe or approx_packed_training)
+        ctx.approx_packed_training = bool(ctx.use_packed and approx_packed_training and not packed_grad_safe)
         if ctx.use_packed:
             beliefs, final_belief = ext.forward_quantized(
                 local_logits_in,
@@ -344,21 +346,38 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_gate_f32,
                 transition_stay_probs_f32,
             ) = ctx.saved_tensors
-            grads = ext.backward_quantized(
-                grad_beliefs.contiguous(),
-                grad_final_belief.contiguous(),
-                packed_source_q.contiguous(),
-                packed_source_scales.contiguous(),
-                packed_dest_q.contiguous(),
-                packed_dest_scales.contiguous(),
-                transition_context_saved.contiguous(),
-                initial_log_belief_saved.contiguous(),
-                beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
-                transition_stay_probs_f32,
-                int(ctx.chunk_size),
-            )
-            grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
+            if bool(getattr(ctx, "approx_packed_training", False)):
+                grads = ext.backward_logits(
+                    grad_beliefs.contiguous(),
+                    grad_final_belief.contiguous(),
+                    transition_source_logits_f32,
+                    transition_dest_logits_f32,
+                    transition_context_saved.contiguous(),
+                    initial_log_belief_saved.contiguous(),
+                    beliefs_saved.contiguous(),
+                    float(transition_gate_f32.detach().float().item()),
+                    transition_stay_probs_f32,
+                    int(ctx.chunk_size),
+                )
+                grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = grads
+            else:
+                grads = ext.backward_quantized(
+                    grad_beliefs.contiguous(),
+                    grad_final_belief.contiguous(),
+                    packed_source_q.contiguous(),
+                    packed_source_scales.contiguous(),
+                    packed_dest_q.contiguous(),
+                    packed_dest_scales.contiguous(),
+                    transition_context_saved.contiguous(),
+                    initial_log_belief_saved.contiguous(),
+                    beliefs_saved.contiguous(),
+                    float(transition_gate_f32.detach().float().item()),
+                    transition_stay_probs_f32,
+                    int(ctx.chunk_size),
+                )
+                grad_local, _grad_source_probs, _grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
+                grad_source = None
+                grad_dest = None
         else:
             (
                 transition_context_saved,
@@ -451,6 +470,11 @@ def _cached_env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(float(default))))
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_env_str(name: str, default: str) -> str:
+    return str(os.environ.get(name, default)).strip().lower()
+
+
 def _bounded_latent_decay(logits: Tensor) -> Tensor:
     min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.995)
     max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9999)
@@ -471,6 +495,24 @@ def _bounded_gate(logits: Tensor, min_env: str, max_env: str, *, default_min: fl
 def _env_enabled(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "1" if default else "0").strip().lower()
     return raw not in {"", "0", "false", "no", "off"}
+
+
+def _structured_filter_mode() -> str:
+    return _cached_env_str("CAUSAL_MACHINE_STRUCTURED_FILTER_MODE", "coupled")
+
+
+def _prepare_structured_filter_inputs(
+    transition_context: Tensor,
+    transition_gate: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if _structured_filter_mode() != "composable":
+        return transition_context, transition_gate
+    effective_context = transition_context * transition_gate.to(
+        device=transition_context.device,
+        dtype=transition_context.dtype,
+    )
+    effective_gate = torch.ones_like(transition_gate, dtype=torch.float32)
+    return effective_context, effective_gate
 
 
 def causal_machine_scan_cuda(
@@ -4844,13 +4886,17 @@ class CausalStateMixer(nn.Module):
             default_min=0.10,
             default_max=0.995,
         ).to(device=local_logits.device, dtype=local_logits.dtype)
-        prior_with_context = prior_logits + transition_context.to(dtype=local_logits.dtype)
+        effective_context, effective_gate = _prepare_structured_filter_inputs(
+            transition_context.to(dtype=local_logits.dtype),
+            transition_gate,
+        )
+        prior_with_context = prior_logits + effective_context
         prior_log_beliefs = (
             F.log_softmax(prior_with_context[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
             if self.track_transition_kl
             else None
         )
-        filtered_logits = local_logits + transition_gate * prior_with_context
+        filtered_logits = local_logits + effective_gate.to(dtype=local_logits.dtype) * prior_with_context
         state_log_beliefs = F.log_softmax(filtered_logits[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
         cache.log_belief = state_log_beliefs[:, 0, :].detach()
         cache.num_updates += 1
@@ -4883,6 +4929,10 @@ class CausalStateMixer(nn.Module):
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
             default_min=0.10,
             default_max=0.995,
+        )
+        transition_context, transition_gate = _prepare_structured_filter_inputs(
+            transition_context,
+            transition_gate,
         )
         packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
         use_cuda_scan = (
@@ -4953,6 +5003,10 @@ class CausalStateMixer(nn.Module):
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
             default_min=0.10,
             default_max=0.995,
+        )
+        transition_context, transition_gate = _prepare_structured_filter_inputs(
+            transition_context,
+            transition_gate,
         )
         pred_log_belief = structured_transition_predict_log_belief(
             prev_log_belief,
@@ -5944,6 +5998,10 @@ class GPT(nn.Module):
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
             default_min=0.10,
             default_max=0.995,
+        )
+        transition_context, transition_gate = _prepare_structured_filter_inputs(
+            transition_context,
+            transition_gate,
         )
         packed_transition_tables = self._get_global_packed_transition_tables(state_hidden.device)
         if cache is not None and cache.log_belief is not None:
