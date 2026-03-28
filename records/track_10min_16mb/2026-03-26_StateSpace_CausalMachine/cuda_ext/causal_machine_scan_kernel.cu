@@ -5,7 +5,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -14,6 +17,42 @@ constexpr int kNumStates = 128;
 constexpr int kWarpSize = 32;
 constexpr int kNumWarps = kNumStates / kWarpSize;
 constexpr int kSingleLaunchMaxSeqLen = 4096;
+
+int cached_max_optin_bytes(int device_index) {
+    static std::mutex mutex;
+    static std::unordered_map<int, int> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(device_index);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    int value = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &value,
+        cudaDevAttrMaxSharedMemoryPerBlockOptin,
+        device_index));
+    cache.emplace(device_index, value);
+    return value;
+}
+
+template <typename KernelT>
+void ensure_dynamic_smem_configured(KernelT kernel, int device_index, int shared_bytes) {
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, bool> configured;
+    const auto kernel_id = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(kernel));
+    const auto key = kernel_id
+        ^ (static_cast<std::uint64_t>(device_index & 0xffff) << 48)
+        ^ (static_cast<std::uint64_t>(shared_bytes & 0xffffffff) << 8);
+    std::lock_guard<std::mutex> lock(mutex);
+    if (configured.find(key) != configured.end()) {
+        return;
+    }
+    C10_CUDA_CHECK(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shared_bytes));
+    configured.emplace(key, true);
+}
 
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* ptr) {
@@ -472,8 +511,9 @@ __global__ void causal_machine_backward_chunk_kernel(
             atomicAdd(grad_transition_gate_per_batch, gate_shared[0]);
         }
     } else {
-    if (s == 0) {
-        grad_transition_gate_per_batch[b] += gate_sum;
+        if (s == 0) {
+            grad_transition_gate_per_batch[b] += gate_sum;
+        }
     }
 }
 
@@ -695,7 +735,6 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
         }
     }
 }
-}
 
 template <typename scalar_t, int StaticTransitionRank = -1>
 void launch_forward_chunk(
@@ -719,11 +758,8 @@ void launch_forward_chunk(
         (2 * kNumStates * transition_rank) + (2 * kNumStates) + transition_rank + kNumWarps
     ) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    int max_optin_bytes = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(
-        &max_optin_bytes,
-        cudaDevAttrMaxSharedMemoryPerBlockOptin,
-        local_logits.get_device()));
+    const int device_index = local_logits.get_device();
+    const int max_optin_bytes = cached_max_optin_bytes(device_index);
     TORCH_CHECK(
         shared_bytes <= static_cast<size_t>(max_optin_bytes),
         "causal_machine_scan forward requires ",
@@ -732,10 +768,10 @@ void launch_forward_chunk(
         max_optin_bytes,
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
+    ensure_dynamic_smem_configured(
         causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes)));
+        device_index,
+        static_cast<int>(shared_bytes));
     causal_machine_forward_chunk_kernel<scalar_t, StaticTransitionRank><<<grid, block, shared_bytes, stream>>>(
         local_logits.data_ptr<scalar_t>(),
         transition_source_probs.data_ptr<float>(),
@@ -777,11 +813,8 @@ void launch_forward_chunk_quantized(
         (2 * kNumStates * transition_rank) + (2 * kNumStates) + transition_rank + kNumWarps
     ) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    int max_optin_bytes = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(
-        &max_optin_bytes,
-        cudaDevAttrMaxSharedMemoryPerBlockOptin,
-        local_logits.get_device()));
+    const int device_index = local_logits.get_device();
+    const int max_optin_bytes = cached_max_optin_bytes(device_index);
     TORCH_CHECK(
         shared_bytes <= static_cast<size_t>(max_optin_bytes),
         "causal_machine_scan quantized forward requires ",
@@ -790,10 +823,10 @@ void launch_forward_chunk_quantized(
         max_optin_bytes,
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
+    ensure_dynamic_smem_configured(
         causal_machine_forward_chunk_quantized_kernel<scalar_t, StaticTransitionRank>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes)));
+        device_index,
+        static_cast<int>(shared_bytes));
     causal_machine_forward_chunk_quantized_kernel<scalar_t, StaticTransitionRank><<<grid, block, shared_bytes, stream>>>(
         local_logits.data_ptr<scalar_t>(),
         transition_source_q.data_ptr<int8_t>(),
@@ -843,11 +876,8 @@ void launch_backward_chunk(
         + (DirectGradReduce ? ((2 * kNumStates * transition_rank) + kNumStates + 1) : 0)
     ) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    int max_optin_bytes = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(
-        &max_optin_bytes,
-        cudaDevAttrMaxSharedMemoryPerBlockOptin,
-        beliefs.get_device()));
+    const int device_index = beliefs.get_device();
+    const int max_optin_bytes = cached_max_optin_bytes(device_index);
     TORCH_CHECK(
         shared_bytes <= static_cast<size_t>(max_optin_bytes),
         "causal_machine_scan backward requires ",
@@ -856,10 +886,10 @@ void launch_backward_chunk(
         max_optin_bytes,
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
+    ensure_dynamic_smem_configured(
         causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes)));
+        device_index,
+        static_cast<int>(shared_bytes));
     causal_machine_backward_chunk_kernel<scalar_t, StaticTransitionRank, DirectGradReduce><<<grid, block, shared_bytes, stream>>>(
         grad_beliefs.data_ptr<scalar_t>(),
         grad_final_belief.data_ptr<scalar_t>(),
@@ -916,11 +946,8 @@ void launch_backward_chunk_quantized(
         + (DirectGradReduce ? ((2 * kNumStates * transition_rank) + kNumStates + 1) : 0)
     ) * sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    int max_optin_bytes = 0;
-    C10_CUDA_CHECK(cudaDeviceGetAttribute(
-        &max_optin_bytes,
-        cudaDevAttrMaxSharedMemoryPerBlockOptin,
-        beliefs.get_device()));
+    const int device_index = beliefs.get_device();
+    const int max_optin_bytes = cached_max_optin_bytes(device_index);
     TORCH_CHECK(
         shared_bytes <= static_cast<size_t>(max_optin_bytes),
         "causal_machine_scan quantized backward requires ",
@@ -929,10 +956,10 @@ void launch_backward_chunk_quantized(
         max_optin_bytes,
         " bytes. Reduce CAUSAL_MACHINE_TRANSITION_RANK, disable USE_CAUSAL_MACHINE_CUDA_SCAN, or use a higher-SMEM GPU."
     );
-    C10_CUDA_CHECK(cudaFuncSetAttribute(
+    ensure_dynamic_smem_configured(
         causal_machine_backward_chunk_quantized_kernel<scalar_t, StaticTransitionRank, DirectGradReduce>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared_bytes)));
+        device_index,
+        static_cast<int>(shared_bytes));
     causal_machine_backward_chunk_quantized_kernel<scalar_t, StaticTransitionRank, DirectGradReduce><<<grid, block, shared_bytes, stream>>>(
         grad_beliefs.data_ptr<scalar_t>(),
         grad_final_belief.data_ptr<scalar_t>(),

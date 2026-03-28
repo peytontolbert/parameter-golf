@@ -7,6 +7,7 @@ Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `t
 from __future__ import annotations
 
 import copy
+import functools
 import glob
 import io
 import json
@@ -76,7 +77,7 @@ DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA = 0.95
 DEFAULT_VOCAB_SIZE = 1024
 USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_SCAN", "1")))
 USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN", "1")))
-USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT = bool(int(os.environ.get("USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT", "0")))
+USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT = bool(int(os.environ.get("USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT", "1")))
 
 BOS_ID = -1
 
@@ -272,7 +273,11 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
         transition_source_logits_f32 = transition_source_logits.contiguous().float()
         transition_dest_logits_f32 = transition_dest_logits.contiguous().float()
         gate_value = float(transition_gate.detach().float().item())
-        ctx.use_packed = bool(use_packed)
+        # The packed structured-scan path executes on quantized transition tables.
+        # Keep it for inference/eval, but do not use it for training-time autograd:
+        # the packed CUDA op is not the exact gradient of its own forward pass.
+        packed_grad_safe = not (ctx.needs_input_grad[1] or ctx.needs_input_grad[2])
+        ctx.use_packed = bool(use_packed) and packed_grad_safe
         if ctx.use_packed:
             beliefs, final_belief = ext.forward_quantized(
                 local_logits_in,
@@ -449,17 +454,22 @@ def _estimate_latent_scan_cost(seq_len: int, latent_rank: int, chunk_size: int =
     return scan_work + summary_work + finalize_work
 
 
+@functools.lru_cache(maxsize=None)
+def _cached_env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(float(default))))
+
+
 def _bounded_latent_decay(logits: Tensor) -> Tensor:
-    min_decay = float(os.environ.get("CAUSAL_MACHINE_LATENT_DECAY_MIN", "0.995"))
-    max_decay = float(os.environ.get("CAUSAL_MACHINE_LATENT_DECAY_MAX", "0.9999"))
+    min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.995)
+    max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9999)
     min_decay = min(max(min_decay, 0.0), 0.999999)
     max_decay = min(max(max_decay, min_decay + 1e-6), 0.999999)
     return torch.sigmoid(logits.float()).clamp(min_decay, max_decay)
 
 
 def _bounded_gate(logits: Tensor, min_env: str, max_env: str, *, default_min: float = 0.10, default_max: float = 0.99) -> Tensor:
-    min_gate = float(os.environ.get(min_env, str(float(default_min))))
-    max_gate = float(os.environ.get(max_env, str(float(default_max))))
+    min_gate = _cached_env_float(min_env, default_min)
+    max_gate = _cached_env_float(max_env, default_max)
     min_gate = min(max(min_gate, 0.0), 0.999999)
     max_gate = min(max(max_gate, min_gate + 1e-6), 0.999999)
     sig = torch.sigmoid(logits.float())
@@ -535,6 +545,10 @@ def get_or_update_scan_transition_prepack(
         or device.type != "cuda"
         or not supports_structured_scan_cuda_rank(transition_rank)
     ):
+        return None
+    # Training needs the exact float-table path; the packed CUDA op is kept as
+    # an eval/inference optimization only.
+    if torch.is_grad_enabled() and (source_logits.requires_grad or dest_logits.requires_grad):
         return None
     device_index = int(device.index if device.index is not None else torch.cuda.current_device())
     source_version = int(getattr(source_logits, "_version", -1))
@@ -3778,6 +3792,9 @@ class DistributedTokenLoader:
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self._prefetched_batch: dict[str, object] | None = None
         self._prefetched_kind: str | None = None
+        self._x_host_buffer: Tensor | None = None
+        self._y_host_buffer: Tensor | None = None
+        self._loss_mask_host_buffer: Tensor | None = None
         batch_prep_workers = _resolve_loader_worker_count("TOKEN_LOADER_BATCH_PREP_WORKERS")
         self._batch_prep_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=batch_prep_workers)
         self._prepared_batch_future: Future[dict[str, object]] | None = None
@@ -3867,13 +3884,31 @@ class DistributedTokenLoader:
         assert isinstance(x_cpu, Tensor) and isinstance(y_cpu, Tensor)
         assert loss_mask_cpu is None or isinstance(loss_mask_cpu, Tensor)
 
-        x_host = x_cpu.pin_memory()
-        y_host = y_cpu.pin_memory()
+        if (
+            self._x_host_buffer is None
+            or self._x_host_buffer.shape != x_cpu.shape
+            or self._x_host_buffer.dtype != x_cpu.dtype
+        ):
+            self._x_host_buffer = torch.empty_like(x_cpu, pin_memory=True)
+        if (
+            self._y_host_buffer is None
+            or self._y_host_buffer.shape != y_cpu.shape
+            or self._y_host_buffer.dtype != y_cpu.dtype
+        ):
+            self._y_host_buffer = torch.empty_like(y_cpu, pin_memory=True)
+        x_host = self._x_host_buffer
+        y_host = self._y_host_buffer
         x_host.copy_(x_cpu)
         y_host.copy_(y_cpu)
         loss_mask_host = None
         if loss_mask_cpu is not None:
-            loss_mask_host = loss_mask_cpu.pin_memory()
+            if (
+                self._loss_mask_host_buffer is None
+                or self._loss_mask_host_buffer.shape != loss_mask_cpu.shape
+                or self._loss_mask_host_buffer.dtype != loss_mask_cpu.dtype
+            ):
+                self._loss_mask_host_buffer = torch.empty_like(loss_mask_cpu, pin_memory=True)
+            loss_mask_host = self._loss_mask_host_buffer
             loss_mask_host.copy_(loss_mask_cpu)
 
         if self.prefetch_stream is None:
@@ -3893,9 +3928,6 @@ class DistributedTokenLoader:
             "y": y_dev,
             "loss_mask": loss_mask_dev,
             "batch_info": prepared["batch_info"],
-            "x_host": x_host,
-            "y_host": y_host,
-            "loss_mask_host": loss_mask_host,
         }
 
     def _submit_prepared_batch(
@@ -4651,32 +4683,35 @@ class CausalStateMixer(nn.Module):
             or self.latent_decay_logits is None
         ):
             return None
-        drive = self.latent_in(state_hidden).float() * torch.sigmoid(self.latent_gate_in(state_hidden).float())
+        drive_hidden = self.latent_in(state_hidden)
+        gate_hidden = torch.sigmoid(self.latent_gate_in(state_hidden))
         decay = _bounded_latent_decay(self.latent_decay_logits)
-        initial_state = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
         use_cuda_latent_scan = bool(
             USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
-            and drive.is_cuda
-            and drive.size(-1) > 0
+            and state_hidden.is_cuda
+            and drive_hidden.size(-1) > 0
         )
         if use_cuda_latent_scan:
+            drive = (drive_hidden * gate_hidden).contiguous()
+            initial_state = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=state_hidden.dtype)
             if prior_only:
                 prior_states, final_state = causal_machine_latent_prior_scan_cuda(
-                    drive.to(dtype=state_hidden.dtype),
+                    drive,
                     decay,
-                    initial_state.to(dtype=state_hidden.dtype),
+                    initial_state,
                 )
                 latent_states = None
             else:
                 latent_states, prior_states, final_state = causal_machine_latent_scan_cuda(
-                    drive.to(dtype=state_hidden.dtype),
+                    drive,
                     decay,
-                    initial_state.to(dtype=state_hidden.dtype),
+                    initial_state,
                 )
                 latent_states = latent_states.to(dtype=state_hidden.dtype)
             prior_states = prior_states.to(dtype=state_hidden.dtype)
             final_state = final_state.to(dtype=state_hidden.dtype)
         else:
+            drive = drive_hidden.float() * gate_hidden.float()
             prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
             latent_chunks: list[Tensor] = []
             prior_chunks: list[Tensor] = []
@@ -4739,7 +4774,7 @@ class CausalStateMixer(nn.Module):
             or self.latent_decay_logits is None
         ):
             return None
-        drive = self.latent_in(state_hidden).float() * torch.sigmoid(self.latent_gate_in(state_hidden).float())
+        drive = (self.latent_in(state_hidden) * torch.sigmoid(self.latent_gate_in(state_hidden))).float()
         prev = cache.latent_state
         if prev is None:
             prev = torch.zeros((drive.size(0), self.latent_rank), device=drive.device, dtype=torch.float32)
