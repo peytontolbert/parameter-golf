@@ -50,10 +50,10 @@ int cached_max_optin_bytes(int device_index) {
 
 size_t backward_chunk_shared_bytes(int transition_rank, bool direct_grad_reduce) {
     const size_t base_words = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (3 * kNumStates) + (2 * transition_rank) + kNumWarps
+        (2 * kNumStates * transition_rank) + (2 * kNumStates) + (2 * transition_rank) + kNumWarps
     );
     const size_t direct_words = direct_grad_reduce
-        ? static_cast<size_t>((2 * kNumStates * transition_rank) + kNumStates + 1)
+        ? static_cast<size_t>((2 * kNumStates * transition_rank) + kNumStates)
         : 0;
     return (base_words + direct_words) * sizeof(float);
 }
@@ -67,6 +67,12 @@ bool can_use_direct_grad_reduce(int device_index, int transition_rank) {
     }
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
     return backward_chunk_shared_bytes(transition_rank, true) <= static_cast<size_t>(max_optin_bytes);
+}
+
+size_t forward_chunk_shared_bytes(int transition_rank) {
+    return static_cast<size_t>(
+        (2 * kNumStates * transition_rank) + kNumStates + transition_rank + kNumWarps
+    ) * sizeof(float);
 }
 
 template <typename KernelT>
@@ -192,8 +198,7 @@ __global__ void causal_machine_forward_chunk_kernel(
     extern __shared__ float shared_mem[];
     float* source_shared = shared_mem;
     float* dest_shared = source_shared + (kNumStates * rank);
-    float* stay_shared = dest_shared + (rank * kNumStates);
-    float* prev_prob = stay_shared + kNumStates;
+    float* prev_prob = dest_shared + (rank * kNumStates);
     float* latent = prev_prob + kNumStates;
     float* scratch = latent + rank;
 
@@ -203,10 +208,9 @@ __global__ void causal_machine_forward_chunk_kernel(
     for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
         dest_shared[idx] = transition_dest_probs[idx];
     }
-    if (s < kNumStates) {
-        stay_shared[s] = transition_stay_probs[s];
-        prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
-    }
+    const float stay_prob = transition_stay_probs[s];
+    const float one_minus_stay = 1.0f - stay_prob;
+    prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
     __syncthreads();
 
     float last_q_log = load_as_float(initial_log_belief + (b * kNumStates + s));
@@ -226,7 +230,6 @@ __global__ void causal_machine_forward_chunk_kernel(
         __syncthreads();
 
         float mix_prob = 0.0f;
-        const float one_minus_stay = 1.0f - stay_shared[s];
         if constexpr (StaticTransitionRank > 0) {
             #pragma unroll
             for (int r = 0; r < StaticTransitionRank; ++r) {
@@ -238,7 +241,7 @@ __global__ void causal_machine_forward_chunk_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_shared[s] * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float obs = load_as_float(local_logits + (base + s)) + transition_gate * (
             pred_log + load_as_float(transition_context + (base + s))
@@ -282,8 +285,7 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
     extern __shared__ float shared_mem[];
     float* source_shared = shared_mem;
     float* dest_shared = source_shared + (kNumStates * rank);
-    float* stay_shared = dest_shared + (rank * kNumStates);
-    float* prev_prob = stay_shared + kNumStates;
+    float* prev_prob = dest_shared + (rank * kNumStates);
     float* latent = prev_prob + kNumStates;
     float* scratch = latent + rank;
 
@@ -295,10 +297,9 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
         const int row = idx / kNumStates;
         dest_shared[idx] = static_cast<float>(transition_dest_q[idx]) * transition_dest_scales[row];
     }
-    if (s < kNumStates) {
-        stay_shared[s] = transition_stay_probs[s];
-        prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
-    }
+    const float stay_prob = transition_stay_probs[s];
+    const float one_minus_stay = 1.0f - stay_prob;
+    prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
     __syncthreads();
 
     float last_q_log = load_as_float(initial_log_belief + (b * kNumStates + s));
@@ -318,7 +319,6 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
         __syncthreads();
 
         float mix_prob = 0.0f;
-        const float one_minus_stay = 1.0f - stay_shared[s];
         if constexpr (StaticTransitionRank > 0) {
             #pragma unroll
             for (int r = 0; r < StaticTransitionRank; ++r) {
@@ -330,7 +330,7 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_shared[s] * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float obs = load_as_float(local_logits + (base + s)) + transition_gate * (
             pred_log + load_as_float(transition_context + (base + s))
@@ -379,8 +379,7 @@ __global__ void causal_machine_backward_chunk_kernel(
     extern __shared__ float shared_mem[];
     float* source_shared = shared_mem;
     float* dest_shared = source_shared + (kNumStates * rank);
-    float* stay_shared = dest_shared + (rank * kNumStates);
-    float* prev_prob = stay_shared + kNumStates;
+    float* prev_prob = dest_shared + (rank * kNumStates);
     float* latent = prev_prob + kNumStates;
     float* grad_mix = latent + rank;
     float* dlatent = grad_mix + kNumStates;
@@ -388,12 +387,10 @@ __global__ void causal_machine_backward_chunk_kernel(
     float* grad_source_shared = nullptr;
     float* grad_dest_shared = nullptr;
     float* grad_stay_shared = nullptr;
-    float* gate_shared = nullptr;
     if constexpr (DirectGradReduce) {
         grad_source_shared = scratch + kNumWarps;
         grad_dest_shared = grad_source_shared + (kNumStates * rank);
         grad_stay_shared = grad_dest_shared + (rank * kNumStates);
-        gate_shared = grad_stay_shared + kNumStates;
         for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
             grad_source_shared[idx] = 0.0f;
         }
@@ -402,9 +399,6 @@ __global__ void causal_machine_backward_chunk_kernel(
         }
         if (s < kNumStates) {
             grad_stay_shared[s] = 0.0f;
-        }
-        if (s == 0) {
-            gate_shared[0] = 0.0f;
         }
     }
     float* grad_source_batch = nullptr;
@@ -422,9 +416,8 @@ __global__ void causal_machine_backward_chunk_kernel(
     for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
         dest_shared[idx] = transition_dest_probs[idx];
     }
-    if (s < kNumStates) {
-        stay_shared[s] = transition_stay_probs[s];
-    }
+    const float stay_prob = transition_stay_probs[s];
+    const float one_minus_stay = 1.0f - stay_prob;
     __syncthreads();
 
     float carry_value = load_as_float(grad_final_belief + (b * kNumStates + s));
@@ -468,225 +461,6 @@ __global__ void causal_machine_backward_chunk_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float stay_prob = stay_shared[s];
-        const float one_minus_stay = 1.0f - stay_prob;
-        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + (1.0f - stay_prob) * mix_prob, 1.0e-20f);
-        const float pred_log = fast_log(pred_prob);
-        const float transition_context_value = load_as_float(transition_context + (base + s));
-
-        const float gq = load_as_float(grad_beliefs + (base + s)) + carry_value;
-        const float gq_sum = block_reduce_sum_128(gq, scratch);
-        const float ga = gq - q_prob_value * gq_sum;
-        const float grad_pred_log = transition_gate * ga;
-        const float grad_pred_prob = grad_pred_log / pred_prob;
-
-        grad_local_logits[base + s] = store_from_float<scalar_t>(ga);
-        grad_transition_context[base + s] = store_from_float<scalar_t>(transition_gate * ga);
-        grad_mix[s] = grad_pred_prob * one_minus_stay;
-        if constexpr (DirectGradReduce) {
-            grad_stay_shared[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
-        } else {
-            grad_stay_batch[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
-        }
-        gate_grad_accum += ga * (pred_log + transition_context_value);
-        const float direct_prev_grad_prob = grad_pred_prob * stay_prob;
-        __syncthreads();
-
-        if (s < rank) {
-            float dlatent_val = 0.0f;
-            #pragma unroll 4
-            for (int j = 0; j < kNumStates; ++j) {
-                dlatent_val += grad_mix[j] * dest_shared[s * kNumStates + j];
-            }
-            dlatent[s] = dlatent_val;
-            #pragma unroll 4
-            for (int j = 0; j < kNumStates; ++j) {
-                if constexpr (DirectGradReduce) {
-                    grad_dest_shared[s * kNumStates + j] += latent[s] * grad_mix[j];
-                } else {
-                    grad_dest_batch[s * kNumStates + j] += latent[s] * grad_mix[j];
-                }
-            }
-        }
-        __syncthreads();
-
-        float prev_grad_prob = direct_prev_grad_prob;
-        if constexpr (StaticTransitionRank > 0) {
-            #pragma unroll
-            for (int r = 0; r < StaticTransitionRank; ++r) {
-                prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
-                if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
-                } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
-                }
-            }
-        } else {
-            #pragma unroll 4
-            for (int r = 0; r < rank; ++r) {
-                prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
-                if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
-                } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
-                }
-            }
-        }
-        carry_value = prev_grad_prob * prev_prob[s];
-        q_prob_value = prev_prob[s];
-        __syncthreads();
-    }
-
-    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry_value);
-    const float gate_sum = block_reduce_sum_128(gate_grad_accum, scratch);
-    if constexpr (DirectGradReduce) {
-        if (s == 0) {
-            gate_shared[0] = gate_sum;
-        }
-        __syncthreads();
-        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
-            atomicAdd(grad_transition_source_per_batch + idx, grad_source_shared[idx]);
-        }
-        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
-            atomicAdd(grad_transition_dest_per_batch + idx, grad_dest_shared[idx]);
-        }
-        if (s < kNumStates) {
-            atomicAdd(grad_transition_stay_per_batch + s, grad_stay_shared[s]);
-        }
-        if (s == 0) {
-            atomicAdd(grad_transition_gate_per_batch, gate_shared[0]);
-        }
-    } else {
-        if (s == 0) {
-            grad_transition_gate_per_batch[b] += gate_sum;
-        }
-    }
-}
-
-template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false>
-__global__ void causal_machine_backward_chunk_quantized_kernel(
-    const scalar_t* __restrict__ grad_beliefs,
-    const scalar_t* __restrict__ grad_final_belief,
-    const int8_t* __restrict__ transition_source_q,
-    const float* __restrict__ transition_source_scales,
-    const int8_t* __restrict__ transition_dest_q,
-    const float* __restrict__ transition_dest_scales,
-    const scalar_t* __restrict__ transition_context,
-    const scalar_t* __restrict__ initial_log_belief,
-    const scalar_t* __restrict__ beliefs,
-    float transition_gate,
-    const float* __restrict__ transition_stay_probs,
-    int transition_rank,
-    int seq_len,
-    int chunk_start,
-    int chunk_len,
-    scalar_t* __restrict__ grad_local_logits,
-    float* __restrict__ grad_transition_source_per_batch,
-    float* __restrict__ grad_transition_dest_per_batch,
-    scalar_t* __restrict__ grad_transition_context,
-    scalar_t* __restrict__ grad_initial_log_belief,
-    float* __restrict__ grad_transition_gate_per_batch,
-    float* __restrict__ grad_transition_stay_per_batch) {
-    const int b = blockIdx.x;
-    const int s = threadIdx.x;
-    const int rank = StaticTransitionRank > 0 ? StaticTransitionRank : transition_rank;
-
-    extern __shared__ float shared_mem[];
-    float* source_shared = shared_mem;
-    float* dest_shared = source_shared + (kNumStates * rank);
-    float* stay_shared = dest_shared + (rank * kNumStates);
-    float* prev_prob = stay_shared + kNumStates;
-    float* latent = prev_prob + kNumStates;
-    float* grad_mix = latent + rank;
-    float* dlatent = grad_mix + kNumStates;
-    float* scratch = dlatent + rank;
-    float* grad_source_shared = nullptr;
-    float* grad_dest_shared = nullptr;
-    float* grad_stay_shared = nullptr;
-    float* gate_shared = nullptr;
-    if constexpr (DirectGradReduce) {
-        grad_source_shared = scratch + kNumWarps;
-        grad_dest_shared = grad_source_shared + (kNumStates * rank);
-        grad_stay_shared = grad_dest_shared + (rank * kNumStates);
-        gate_shared = grad_stay_shared + kNumStates;
-        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
-            grad_source_shared[idx] = 0.0f;
-        }
-        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
-            grad_dest_shared[idx] = 0.0f;
-        }
-        if (s < kNumStates) {
-            grad_stay_shared[s] = 0.0f;
-        }
-        if (s == 0) {
-            gate_shared[0] = 0.0f;
-        }
-    }
-    float* grad_source_batch = nullptr;
-    float* grad_dest_batch = nullptr;
-    float* grad_stay_batch = nullptr;
-    if constexpr (!DirectGradReduce) {
-        grad_source_batch = grad_transition_source_per_batch + b * kNumStates * rank;
-        grad_dest_batch = grad_transition_dest_per_batch + b * rank * kNumStates;
-        grad_stay_batch = grad_transition_stay_per_batch + b * kNumStates;
-    }
-
-    for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
-        const int row = idx / rank;
-        source_shared[idx] = static_cast<float>(transition_source_q[idx]) * transition_source_scales[row];
-    }
-    for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
-        const int row = idx / kNumStates;
-        dest_shared[idx] = static_cast<float>(transition_dest_q[idx]) * transition_dest_scales[row];
-    }
-    if (s < kNumStates) {
-        stay_shared[s] = transition_stay_probs[s];
-    }
-    __syncthreads();
-
-    float carry_value = load_as_float(grad_final_belief + (b * kNumStates + s));
-    float gate_grad_accum = 0.0f;
-    float q_prob_value = 0.0f;
-    if (chunk_len > 0) {
-        const int last_pos = chunk_start + chunk_len - 1;
-        q_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
-    }
-
-    for (int t = chunk_len - 1; t >= 0; --t) {
-        const int pos = chunk_start + t;
-        const int base = (b * seq_len + pos) * kNumStates;
-
-        if (pos == 0) {
-            prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
-        } else {
-            prev_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
-        }
-        __syncthreads();
-
-        if (s < rank) {
-            float latent_val = 0.0f;
-            #pragma unroll 4
-            for (int i = 0; i < kNumStates; ++i) {
-                latent_val += prev_prob[i] * source_shared[i * rank + s];
-            }
-            latent[s] = latent_val;
-        }
-        __syncthreads();
-
-        float mix_prob = 0.0f;
-        if constexpr (StaticTransitionRank > 0) {
-            #pragma unroll
-            for (int r = 0; r < StaticTransitionRank; ++r) {
-                mix_prob += latent[r] * dest_shared[r * kNumStates + s];
-            }
-        } else {
-            #pragma unroll 4
-            for (int r = 0; r < rank; ++r) {
-                mix_prob += latent[r] * dest_shared[r * kNumStates + s];
-            }
-        }
-        const float stay_prob = stay_shared[s];
-        const float one_minus_stay = 1.0f - stay_prob;
         const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float transition_context_value = load_as_float(transition_context + (base + s));
@@ -757,10 +531,6 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
     grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry_value);
     const float gate_sum = block_reduce_sum_128(gate_grad_accum, scratch);
     if constexpr (DirectGradReduce) {
-        if (s == 0) {
-            gate_shared[0] = gate_sum;
-        }
-        __syncthreads();
         for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
             atomicAdd(grad_transition_source_per_batch + idx, grad_source_shared[idx]);
         }
@@ -771,7 +541,211 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
             atomicAdd(grad_transition_stay_per_batch + s, grad_stay_shared[s]);
         }
         if (s == 0) {
-            atomicAdd(grad_transition_gate_per_batch, gate_shared[0]);
+            atomicAdd(grad_transition_gate_per_batch, gate_sum);
+        }
+    } else {
+        if (s == 0) {
+            grad_transition_gate_per_batch[b] += gate_sum;
+        }
+    }
+}
+
+template <typename scalar_t, int StaticTransitionRank = -1, bool DirectGradReduce = false>
+__global__ void causal_machine_backward_chunk_quantized_kernel(
+    const scalar_t* __restrict__ grad_beliefs,
+    const scalar_t* __restrict__ grad_final_belief,
+    const int8_t* __restrict__ transition_source_q,
+    const float* __restrict__ transition_source_scales,
+    const int8_t* __restrict__ transition_dest_q,
+    const float* __restrict__ transition_dest_scales,
+    const scalar_t* __restrict__ transition_context,
+    const scalar_t* __restrict__ initial_log_belief,
+    const scalar_t* __restrict__ beliefs,
+    float transition_gate,
+    const float* __restrict__ transition_stay_probs,
+    int transition_rank,
+    int seq_len,
+    int chunk_start,
+    int chunk_len,
+    scalar_t* __restrict__ grad_local_logits,
+    float* __restrict__ grad_transition_source_per_batch,
+    float* __restrict__ grad_transition_dest_per_batch,
+    scalar_t* __restrict__ grad_transition_context,
+    scalar_t* __restrict__ grad_initial_log_belief,
+    float* __restrict__ grad_transition_gate_per_batch,
+    float* __restrict__ grad_transition_stay_per_batch) {
+    const int b = blockIdx.x;
+    const int s = threadIdx.x;
+    const int rank = StaticTransitionRank > 0 ? StaticTransitionRank : transition_rank;
+
+    extern __shared__ float shared_mem[];
+    float* source_shared = shared_mem;
+    float* dest_shared = source_shared + (kNumStates * rank);
+    float* prev_prob = dest_shared + (rank * kNumStates);
+    float* latent = prev_prob + kNumStates;
+    float* grad_mix = latent + rank;
+    float* dlatent = grad_mix + kNumStates;
+    float* scratch = dlatent + rank;
+    float* grad_source_shared = nullptr;
+    float* grad_dest_shared = nullptr;
+    float* grad_stay_shared = nullptr;
+    if constexpr (DirectGradReduce) {
+        grad_source_shared = scratch + kNumWarps;
+        grad_dest_shared = grad_source_shared + (kNumStates * rank);
+        grad_stay_shared = grad_dest_shared + (rank * kNumStates);
+        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
+            grad_source_shared[idx] = 0.0f;
+        }
+        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
+            grad_dest_shared[idx] = 0.0f;
+        }
+        if (s < kNumStates) {
+            grad_stay_shared[s] = 0.0f;
+        }
+    }
+    float* grad_source_batch = nullptr;
+    float* grad_dest_batch = nullptr;
+    float* grad_stay_batch = nullptr;
+    if constexpr (!DirectGradReduce) {
+        grad_source_batch = grad_transition_source_per_batch + b * kNumStates * rank;
+        grad_dest_batch = grad_transition_dest_per_batch + b * rank * kNumStates;
+        grad_stay_batch = grad_transition_stay_per_batch + b * kNumStates;
+    }
+
+    for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
+        const int row = idx / rank;
+        source_shared[idx] = static_cast<float>(transition_source_q[idx]) * transition_source_scales[row];
+    }
+    for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
+        const int row = idx / kNumStates;
+        dest_shared[idx] = static_cast<float>(transition_dest_q[idx]) * transition_dest_scales[row];
+    }
+    const float stay_prob = transition_stay_probs[s];
+    const float one_minus_stay = 1.0f - stay_prob;
+    __syncthreads();
+
+    float carry_value = load_as_float(grad_final_belief + (b * kNumStates + s));
+    float gate_grad_accum = 0.0f;
+    float q_prob_value = 0.0f;
+    if (chunk_len > 0) {
+        const int last_pos = chunk_start + chunk_len - 1;
+        q_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + last_pos) * kNumStates + s)));
+    }
+
+    for (int t = chunk_len - 1; t >= 0; --t) {
+        const int pos = chunk_start + t;
+        const int base = (b * seq_len + pos) * kNumStates;
+
+        if (pos == 0) {
+            prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+        } else {
+            prev_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
+        }
+        __syncthreads();
+
+        if (s < rank) {
+            float latent_val = 0.0f;
+            #pragma unroll 4
+            for (int i = 0; i < kNumStates; ++i) {
+                latent_val += prev_prob[i] * source_shared[i * rank + s];
+            }
+            latent[s] = latent_val;
+        }
+        __syncthreads();
+
+        float mix_prob = 0.0f;
+        if constexpr (StaticTransitionRank > 0) {
+            #pragma unroll
+            for (int r = 0; r < StaticTransitionRank; ++r) {
+                mix_prob += latent[r] * dest_shared[r * kNumStates + s];
+            }
+        } else {
+            #pragma unroll 4
+            for (int r = 0; r < rank; ++r) {
+                mix_prob += latent[r] * dest_shared[r * kNumStates + s];
+            }
+        }
+        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_log = fast_log(pred_prob);
+        const float transition_context_value = load_as_float(transition_context + (base + s));
+
+        const float gq = load_as_float(grad_beliefs + (base + s)) + carry_value;
+        const float gq_sum = block_reduce_sum_128(gq, scratch);
+        const float ga = gq - q_prob_value * gq_sum;
+        const float grad_pred_log = transition_gate * ga;
+        const float grad_pred_prob = grad_pred_log / pred_prob;
+
+        grad_local_logits[base + s] = store_from_float<scalar_t>(ga);
+        grad_transition_context[base + s] = store_from_float<scalar_t>(transition_gate * ga);
+        grad_mix[s] = grad_pred_prob * one_minus_stay;
+        if constexpr (DirectGradReduce) {
+            grad_stay_shared[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+        } else {
+            grad_stay_batch[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+        }
+        gate_grad_accum += ga * (pred_log + transition_context_value);
+        const float direct_prev_grad_prob = grad_pred_prob * stay_prob;
+        __syncthreads();
+
+        if (s < rank) {
+            float dlatent_val = 0.0f;
+            #pragma unroll 4
+            for (int j = 0; j < kNumStates; ++j) {
+                dlatent_val += grad_mix[j] * dest_shared[s * kNumStates + j];
+            }
+            dlatent[s] = dlatent_val;
+            #pragma unroll 4
+            for (int j = 0; j < kNumStates; ++j) {
+                if constexpr (DirectGradReduce) {
+                    grad_dest_shared[s * kNumStates + j] += latent[s] * grad_mix[j];
+                } else {
+                    grad_dest_batch[s * kNumStates + j] += latent[s] * grad_mix[j];
+                }
+            }
+        }
+        __syncthreads();
+
+        float prev_grad_prob = direct_prev_grad_prob;
+        if constexpr (StaticTransitionRank > 0) {
+            #pragma unroll
+            for (int r = 0; r < StaticTransitionRank; ++r) {
+                prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
+                if constexpr (DirectGradReduce) {
+                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                } else {
+                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                }
+            }
+        } else {
+            #pragma unroll 4
+            for (int r = 0; r < rank; ++r) {
+                prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
+                if constexpr (DirectGradReduce) {
+                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                } else {
+                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                }
+            }
+        }
+        carry_value = prev_grad_prob * prev_prob[s];
+        q_prob_value = prev_prob[s];
+        __syncthreads();
+    }
+
+    grad_initial_log_belief[b * kNumStates + s] = store_from_float<scalar_t>(carry_value);
+    const float gate_sum = block_reduce_sum_128(gate_grad_accum, scratch);
+    if constexpr (DirectGradReduce) {
+        for (int idx = s; idx < kNumStates * rank; idx += blockDim.x) {
+            atomicAdd(grad_transition_source_per_batch + idx, grad_source_shared[idx]);
+        }
+        for (int idx = s; idx < rank * kNumStates; idx += blockDim.x) {
+            atomicAdd(grad_transition_dest_per_batch + idx, grad_dest_shared[idx]);
+        }
+        if (s < kNumStates) {
+            atomicAdd(grad_transition_stay_per_batch + s, grad_stay_shared[s]);
+        }
+        if (s == 0) {
+            atomicAdd(grad_transition_gate_per_batch, gate_sum);
         }
     } else {
         if (s == 0) {
@@ -798,9 +772,7 @@ void launch_forward_chunk(
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     const dim3 grid(batch_size);
     const dim3 block(kNumStates);
-    const size_t shared_bytes = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (2 * kNumStates) + transition_rank + kNumWarps
-    ) * sizeof(float);
+    const size_t shared_bytes = forward_chunk_shared_bytes(transition_rank);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int device_index = local_logits.get_device();
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
@@ -853,9 +825,7 @@ void launch_forward_chunk_quantized(
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_q.size(1));
     const dim3 grid(batch_size);
     const dim3 block(kNumStates);
-    const size_t shared_bytes = static_cast<size_t>(
-        (2 * kNumStates * transition_rank) + (2 * kNumStates) + transition_rank + kNumWarps
-    ) * sizeof(float);
+    const size_t shared_bytes = forward_chunk_shared_bytes(transition_rank);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int device_index = local_logits.get_device();
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
