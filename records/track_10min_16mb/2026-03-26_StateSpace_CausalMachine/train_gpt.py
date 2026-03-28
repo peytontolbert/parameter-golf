@@ -305,12 +305,10 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_stay_probs_f32,
             )
         else:
-            transition_source_probs_f32 = F.softmax(transition_source_logits_f32, dim=-1).contiguous()
-            transition_dest_probs_f32 = F.softmax(transition_dest_logits_f32, dim=-1).contiguous()
-            beliefs, final_belief = ext.forward(
+            beliefs, final_belief = ext.forward_logits(
                 local_logits_in,
-                transition_source_probs_f32,
-                transition_dest_probs_f32,
+                transition_source_logits_f32,
+                transition_dest_logits_f32,
                 transition_context_in,
                 initial_log_belief_in,
                 gate_value,
@@ -318,8 +316,6 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 int(chunk_size),
             )
             ctx.save_for_backward(
-                transition_source_probs_f32,
-                transition_dest_probs_f32,
                 transition_context_in,
                 initial_log_belief_in,
                 beliefs.contiguous(),
@@ -365,8 +361,6 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
             grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
         else:
             (
-                transition_source_probs_f32,
-                transition_dest_probs_f32,
                 transition_context_saved,
                 initial_log_belief_saved,
                 beliefs_saved,
@@ -375,11 +369,11 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_gate_f32,
                 transition_stay_probs_f32,
             ) = ctx.saved_tensors
-            grads = ext.backward(
+            grads = ext.backward_logits(
                 grad_beliefs.contiguous(),
                 grad_final_belief.contiguous(),
-                transition_source_probs_f32,
-                transition_dest_probs_f32,
+                transition_source_logits_f32,
+                transition_dest_logits_f32,
                 transition_context_saved.contiguous(),
                 initial_log_belief_saved.contiguous(),
                 beliefs_saved.contiguous(),
@@ -387,11 +381,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_stay_probs_f32,
                 int(ctx.chunk_size),
             )
-            grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
-        source_probs_f32 = F.softmax(transition_source_logits_f32, dim=-1)
-        dest_probs_f32 = F.softmax(transition_dest_logits_f32, dim=-1)
-        grad_source = (grad_source_probs - (grad_source_probs * source_probs_f32).sum(dim=-1, keepdim=True)) * source_probs_f32
-        grad_dest = (grad_dest_probs - (grad_dest_probs * dest_probs_f32).sum(dim=-1, keepdim=True)) * dest_probs_f32
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = grads
         return (
             grad_local,
             grad_source,
