@@ -210,7 +210,8 @@ __global__ void causal_machine_forward_chunk_kernel(
     }
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
-    prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+    float prev_prob_value = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+    prev_prob[s] = prev_prob_value;
     __syncthreads();
 
     float last_q_log = load_as_float(initial_log_belief + (b * kNumStates + s));
@@ -241,7 +242,7 @@ __global__ void causal_machine_forward_chunk_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob_value + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float obs = load_as_float(local_logits + (base + s)) + transition_gate * (
             pred_log + load_as_float(transition_context + (base + s))
@@ -254,7 +255,8 @@ __global__ void causal_machine_forward_chunk_kernel(
 
         beliefs[base + s] = store_from_float<scalar_t>(q_log);
         last_q_log = q_log;
-        prev_prob[s] = obs_exp * inv_obs_sum;
+        prev_prob_value = obs_exp * inv_obs_sum;
+        prev_prob[s] = prev_prob_value;
         __syncthreads();
     }
 
@@ -299,7 +301,8 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
     }
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
-    prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+    float prev_prob_value = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+    prev_prob[s] = prev_prob_value;
     __syncthreads();
 
     float last_q_log = load_as_float(initial_log_belief + (b * kNumStates + s));
@@ -330,7 +333,7 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob_value + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float obs = load_as_float(local_logits + (base + s)) + transition_gate * (
             pred_log + load_as_float(transition_context + (base + s))
@@ -343,7 +346,8 @@ __global__ void causal_machine_forward_chunk_quantized_kernel(
 
         beliefs[base + s] = store_from_float<scalar_t>(q_log);
         last_q_log = q_log;
-        prev_prob[s] = obs_exp * inv_obs_sum;
+        prev_prob_value = obs_exp * inv_obs_sum;
+        prev_prob[s] = prev_prob_value;
         __syncthreads();
     }
 
@@ -432,11 +436,13 @@ __global__ void causal_machine_backward_chunk_kernel(
         const int pos = chunk_start + t;
         const int base = (b * seq_len + pos) * kNumStates;
 
+        float prev_prob_value;
         if (pos == 0) {
-            prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+            prev_prob_value = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
         } else {
-            prev_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
+            prev_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
         }
+        prev_prob[s] = prev_prob_value;
         __syncthreads();
 
         if (s < rank) {
@@ -461,7 +467,7 @@ __global__ void causal_machine_backward_chunk_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob_value + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float transition_context_value = load_as_float(transition_context + (base + s));
 
@@ -475,9 +481,9 @@ __global__ void causal_machine_backward_chunk_kernel(
         grad_transition_context[base + s] = store_from_float<scalar_t>(transition_gate * ga);
         grad_mix[s] = grad_pred_prob * one_minus_stay;
         if constexpr (DirectGradReduce) {
-            grad_stay_shared[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+            grad_stay_shared[s] += grad_pred_prob * (prev_prob_value - mix_prob);
         } else {
-            grad_stay_batch[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+            grad_stay_batch[s] += grad_pred_prob * (prev_prob_value - mix_prob);
         }
         gate_grad_accum += ga * (pred_log + transition_context_value);
         const float direct_prev_grad_prob = grad_pred_prob * stay_prob;
@@ -507,9 +513,9 @@ __global__ void causal_machine_backward_chunk_kernel(
             for (int r = 0; r < StaticTransitionRank; ++r) {
                 prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
                 if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_shared[s * rank + r] += prev_prob_value * dlatent[r];
                 } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_batch[s * rank + r] += prev_prob_value * dlatent[r];
                 }
             }
         } else {
@@ -517,14 +523,14 @@ __global__ void causal_machine_backward_chunk_kernel(
             for (int r = 0; r < rank; ++r) {
                 prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
                 if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_shared[s * rank + r] += prev_prob_value * dlatent[r];
                 } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_batch[s * rank + r] += prev_prob_value * dlatent[r];
                 }
             }
         }
-        carry_value = prev_grad_prob * prev_prob[s];
-        q_prob_value = prev_prob[s];
+        carry_value = prev_grad_prob * prev_prob_value;
+        q_prob_value = prev_prob_value;
         __syncthreads();
     }
 
@@ -636,11 +642,13 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
         const int pos = chunk_start + t;
         const int base = (b * seq_len + pos) * kNumStates;
 
+        float prev_prob_value;
         if (pos == 0) {
-            prev_prob[s] = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
+            prev_prob_value = fast_exp(load_as_float(initial_log_belief + (b * kNumStates + s)));
         } else {
-            prev_prob[s] = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
+            prev_prob_value = fast_exp(load_as_float(beliefs + ((b * seq_len + (pos - 1)) * kNumStates + s)));
         }
+        prev_prob[s] = prev_prob_value;
         __syncthreads();
 
         if (s < rank) {
@@ -665,7 +673,7 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
                 mix_prob += latent[r] * dest_shared[r * kNumStates + s];
             }
         }
-        const float pred_prob = fmaxf(stay_prob * prev_prob[s] + one_minus_stay * mix_prob, 1.0e-20f);
+        const float pred_prob = fmaxf(stay_prob * prev_prob_value + one_minus_stay * mix_prob, 1.0e-20f);
         const float pred_log = fast_log(pred_prob);
         const float transition_context_value = load_as_float(transition_context + (base + s));
 
@@ -679,9 +687,9 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
         grad_transition_context[base + s] = store_from_float<scalar_t>(transition_gate * ga);
         grad_mix[s] = grad_pred_prob * one_minus_stay;
         if constexpr (DirectGradReduce) {
-            grad_stay_shared[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+            grad_stay_shared[s] += grad_pred_prob * (prev_prob_value - mix_prob);
         } else {
-            grad_stay_batch[s] += grad_pred_prob * (prev_prob[s] - mix_prob);
+            grad_stay_batch[s] += grad_pred_prob * (prev_prob_value - mix_prob);
         }
         gate_grad_accum += ga * (pred_log + transition_context_value);
         const float direct_prev_grad_prob = grad_pred_prob * stay_prob;
@@ -711,9 +719,9 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
             for (int r = 0; r < StaticTransitionRank; ++r) {
                 prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
                 if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_shared[s * rank + r] += prev_prob_value * dlatent[r];
                 } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_batch[s * rank + r] += prev_prob_value * dlatent[r];
                 }
             }
         } else {
@@ -721,14 +729,14 @@ __global__ void causal_machine_backward_chunk_quantized_kernel(
             for (int r = 0; r < rank; ++r) {
                 prev_grad_prob += dlatent[r] * source_shared[s * rank + r];
                 if constexpr (DirectGradReduce) {
-                    grad_source_shared[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_shared[s * rank + r] += prev_prob_value * dlatent[r];
                 } else {
-                    grad_source_batch[s * rank + r] += prev_prob[s] * dlatent[r];
+                    grad_source_batch[s * rank + r] += prev_prob_value * dlatent[r];
                 }
             }
         }
-        carry_value = prev_grad_prob * prev_prob[s];
-        q_prob_value = prev_prob[s];
+        carry_value = prev_grad_prob * prev_prob_value;
+        q_prob_value = prev_prob_value;
         __syncthreads();
     }
 
