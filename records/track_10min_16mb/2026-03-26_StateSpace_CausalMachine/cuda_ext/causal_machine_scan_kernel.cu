@@ -539,7 +539,11 @@ size_t forward_tiled_packed_shared_bytes(int num_states, int tile_size, int spli
     const int num_warps = (block_threads + kWarpSize - 1) / kWarpSize;
     const int staged_rank_chunk = std::max(1, std::min(split_size, kAsyncTileRankChunk));
     size_t bytes = static_cast<size_t>(
-        (2 * num_states) + staged_rank_chunk + (2 * staged_rank_chunk * std::max(tile_size, 1)) + num_warps + 4
+        (2 * num_states)
+        + staged_rank_chunk
+        + (async_tile_pipeline_stages<false>() * staged_rank_chunk * std::max(tile_size, 1))
+        + num_warps
+        + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
     return bytes;
@@ -549,7 +553,11 @@ size_t forward_tiled_packed_shared_bytes_sm90(int num_states, int tile_size, int
     const int num_warps = (block_threads + kWarpSize - 1) / kWarpSize;
     const int staged_rank_chunk = std::max(1, std::min(split_size, kSm90AsyncTileRankChunk));
     size_t bytes = static_cast<size_t>(
-        (2 * num_states) + staged_rank_chunk + (2 * staged_rank_chunk * std::max(tile_size, 1)) + num_warps + 4
+        (2 * num_states)
+        + staged_rank_chunk
+        + (async_tile_pipeline_stages<true>() * staged_rank_chunk * std::max(tile_size, 1))
+        + num_warps
+        + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
     return bytes;
@@ -7172,6 +7180,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
     const int staged_rank_chunk = max(1, min(split_size, Sm90Path ? kSm90AsyncTileRankChunk : kAsyncTileRankChunk));
+    const int pipeline_stages = async_tile_pipeline_stages<Sm90Path>();
     extern __shared__ float shared_mem[];
     float* prev_log = shared_mem;
     float* prev_prob = prev_log + num_states;
@@ -7181,9 +7190,9 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     float* tile_stats = scratch + num_warps;
     float* dest_tile_shared = tile_stats + 2;
     float* source_tile_shared = dest_tile_shared
-        + static_cast<int64_t>(kAsyncTilePipelineStages) * staged_rank_chunk * tile_size;
+        + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size;
     char* tensor_core_workspace_raw = reinterpret_cast<char*>(
-        source_tile_shared + static_cast<int64_t>(kAsyncTilePipelineStages) * num_states * staged_rank_chunk);
+        source_tile_shared + static_cast<int64_t>(pipeline_stages) * num_states * staged_rank_chunk);
     std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
     tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
     char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
@@ -7250,32 +7259,40 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                     }
                     __syncthreads();
                     if (transition_rank > 0) {
-                        int current_rank_start = 0;
-                        int current_active_rank = min(staged_rank_chunk, transition_rank);
-                        int current_stage = 0;
-                        enqueue_float_matrix_pair_slice_async(
-                            tile_pipe,
-                            dest_tile_shared,
-                            transition_dest_probs + state_start,
-                            num_states,
-                            current_active_rank,
-                            active_states,
-                            static_cast<int>(tile_size),
-                            source_tile_shared,
-                            transition_source_probs,
-                            transition_rank,
-                            num_states,
-                            current_active_rank,
-                            staged_rank_chunk);
-                        wait_for_async_tile(tile_pipe);
-                        __syncthreads();
-                        while (current_rank_start < transition_rank) {
-                            const int next_rank_start = current_rank_start + current_active_rank;
-                            const int next_active_rank = next_rank_start < transition_rank
-                                ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                                : 0;
-                            const int next_stage = current_stage ^ 1;
-                            if (next_active_rank > 0) {
+                        const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                        int next_tile_to_launch = 0;
+                        const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                        for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                            const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                            const int stage_slot = next_tile_to_launch % pipeline_stages;
+                            enqueue_float_matrix_pair_slice_async(
+                                tile_pipe,
+                                dest_tile_shared + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size,
+                                transition_dest_probs + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                num_states,
+                                active_rank,
+                                active_states,
+                                static_cast<int>(tile_size),
+                                source_tile_shared + static_cast<int64_t>(stage_slot) * num_states * staged_rank_chunk,
+                                transition_source_probs + rank_start,
+                                transition_rank,
+                                num_states,
+                                active_rank,
+                                staged_rank_chunk);
+                        }
+                        if (initial_prefetch > 0) {
+                            wait_for_async_tile(tile_pipe);
+                            __syncthreads();
+                        }
+                        for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                            const int current_stage = rank_tile_idx % pipeline_stages;
+                            const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                            const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                            if (next_tile_to_launch < total_rank_tiles) {
+                                const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                                const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                                const int next_stage = next_tile_to_launch % pipeline_stages;
                                 enqueue_float_matrix_pair_slice_async(
                                     tile_pipe,
                                     dest_tile_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
@@ -7290,6 +7307,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     num_states,
                                     next_active_rank,
                                     staged_rank_chunk);
+                                ++next_tile_to_launch;
                             }
                             const float* current_source_tile = source_tile_shared
                                 + static_cast<int64_t>(current_stage) * num_states * staged_rank_chunk;
@@ -7370,13 +7388,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                         current_active_rank);
                                 }
                             }
-                            if (next_active_rank > 0) {
+                            if (rank_tile_idx + 1 < total_rank_tiles) {
                                 wait_for_async_tile(tile_pipe);
                             }
                             __syncthreads();
-                            current_rank_start = next_rank_start;
-                            current_active_rank = next_active_rank;
-                            current_stage = next_stage;
                         }
                     }
                     for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {
@@ -8413,6 +8428,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
     const int staged_rank_chunk = max(1, min(split_size, Sm90Path ? kSm90AsyncTileRankChunk : kAsyncTileRankChunk));
+    const int pipeline_stages = async_tile_pipeline_stages<Sm90Path>();
     extern __shared__ float shared_mem[];
     float* prev_log = shared_mem;
     float* prev_prob = prev_log + num_states;
@@ -8422,7 +8438,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     float* tile_stats = scratch + num_warps;
     float* dest_tile_shared = tile_stats + 2;
     packed_t* dest_tile_packed_shared = reinterpret_cast<packed_t*>(
-        dest_tile_shared + static_cast<int64_t>(staged_rank_chunk) * tile_size);
+        dest_tile_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
     auto tile_pipe = cuda::make_pipeline();
     const bool use_global_score_cache = native_score_filtering_enabled(score_threshold, score_topk, num_states);
 
@@ -8474,27 +8490,35 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                     }
                     __syncthreads();
 
-                    for (int rank_start = 0; rank_start < transition_rank; rank_start += staged_rank_chunk) {
-                        int current_rank_start = rank_start;
-                        int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
-                        int current_stage = 0;
-                        enqueue_packed_matrix_slice_async(
-                            tile_pipe,
-                            dest_tile_packed_shared,
-                            transition_dest_packed + static_cast<int64_t>(current_rank_start) * num_states + state_start,
-                            num_states,
-                            current_active_rank,
-                            active_states,
-                            tile_size);
-                        wait_for_async_tile(tile_pipe);
-                        __syncthreads();
-                        while (current_rank_start < transition_rank) {
-                            const int next_rank_start = current_rank_start + current_active_rank;
-                            const int next_active_rank = next_rank_start < transition_rank
-                                ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                                : 0;
-                            const int next_stage = current_stage ^ 1;
-                            if (next_active_rank > 0) {
+                    {
+                        const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                        int next_tile_to_launch = 0;
+                        const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                        for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                            const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                            const int stage_slot = next_tile_to_launch % pipeline_stages;
+                            enqueue_packed_matrix_slice_async(
+                                tile_pipe,
+                                dest_tile_packed_shared + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size,
+                                transition_dest_packed + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                num_states,
+                                active_rank,
+                                active_states,
+                                tile_size);
+                        }
+                        if (initial_prefetch > 0) {
+                            wait_for_async_tile(tile_pipe);
+                            __syncthreads();
+                        }
+                        for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                            const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                            const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                            const int current_stage = rank_tile_idx % pipeline_stages;
+                            if (next_tile_to_launch < total_rank_tiles) {
+                                const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                                const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                                const int next_stage = next_tile_to_launch % pipeline_stages;
                                 enqueue_packed_matrix_slice_async(
                                     tile_pipe,
                                     dest_tile_packed_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
@@ -8503,6 +8527,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     next_active_rank,
                                     active_states,
                                     tile_size);
+                                ++next_tile_to_launch;
                             }
                             for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                 latent[r] = packed_column_dot_lowp<packed_t, Format>(
@@ -8542,15 +8567,11 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     tile_size,
                                     current_active_rank);
                             }
-                            if (next_active_rank > 0) {
+                            if (rank_tile_idx + 1 < total_rank_tiles) {
                                 wait_for_async_tile(tile_pipe);
                             }
                             __syncthreads();
-                            current_rank_start = next_rank_start;
-                            current_active_rank = next_active_rank;
-                            current_stage = next_stage;
                         }
-                        break;
                     }
 
                     for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {

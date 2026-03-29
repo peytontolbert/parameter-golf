@@ -1039,6 +1039,7 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     const bool forward_vectorized_io = bool(runtime_value_at(forward_runtime, 5));
     const bool forward_async_copy_path = bool(runtime_value_at(forward_runtime, 6));
     const bool forward_tensor_core_math = bool(runtime_value_at(forward_runtime, 7));
+    const int64_t forward_async_pipeline_stages = capability_major >= 9 ? 3 : 2;
     const bool forward_persisting_l2 = bool(runtime_value_at(forward_runtime, 16));
     const bool backward_vectorized_io = bool(runtime_value_at(backward_runtime, 17));
     const bool backward_async_copy_path = bool(runtime_value_at(backward_runtime, 18));
@@ -1067,6 +1068,7 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     info["forward_vectorized_io"] = forward_vectorized_io;
     info["async_pipeline_forward_supported"] = forward_async_copy_path;
     info["forward_async_copy_path"] = forward_async_copy_path;
+    info["forward_async_pipeline_stages"] = forward_async_pipeline_stages;
     info["forward_tensor_core_math_supported"] = forward_tensor_core_math;
     info["forward_active_blocks_per_sm"] = runtime_value_at(forward_runtime, 8);
     info["forward_active_warps_per_sm"] = runtime_value_at(forward_runtime, 9);
@@ -1106,11 +1108,11 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     info["backward_estimated_sync_points"] = runtime_value_at(backward_runtime, 24);
     info["custom_kernel_supported"] = custom_forward_kernel_supported;
     info["forward_kernel_family"] = forward_tensor_core_math
-        ? (capability_major >= 9 ? "sm90_wmma_tiled_custom" : "sm80_wmma_tiled_custom")
+        ? (capability_major >= 9 ? "sm90_wmma_async3_tiled_custom" : "sm80_wmma_tiled_custom")
         : forward_kernel_family;
     info["forward_kernel_reason"] = custom_forward_kernel_supported
         ? (forward_tensor_core_math
-            ? "custom_tiled_async_memcpy_wmma"
+            ? (capability_major >= 9 ? "custom_tiled_async_memcpy_wmma_async3" : "custom_tiled_async_memcpy_wmma")
             : (forward_async_copy_path ? "custom_tiled_async_memcpy" : "custom_tiled_shared_copy"))
         : "split_combine_fallback";
     info["custom_backward_kernel_smem_supported"] = custom_backward_kernel_smem_supported;
