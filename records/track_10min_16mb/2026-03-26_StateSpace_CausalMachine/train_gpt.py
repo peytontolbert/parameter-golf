@@ -6440,6 +6440,128 @@ def autotune_structured_scan_kernel_config(
     )
 
 
+def _structured_scan_kernel_config_cache_key(
+    device: torch.device,
+    *,
+    seq_len: int,
+    needs_grad: bool,
+) -> tuple[str, int, int, bool]:
+    device_index = int(device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else -1))
+    return (str(device.type), device_index, int(seq_len), bool(needs_grad))
+
+
+def _structured_scan_runtime_allows_precomputed_kernel_config(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> bool:
+    return runtime_config is None
+
+
+def _get_precomputed_structured_scan_kernel_config(
+    owner: object,
+    *,
+    cache_attr: str,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    device: torch.device,
+    default_chunk_size: int,
+    needs_grad: bool,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> StructuredScanKernelConfig:
+    cache_key = _structured_scan_kernel_config_cache_key(
+        device,
+        seq_len=int(seq_len),
+        needs_grad=bool(needs_grad),
+    )
+    if _structured_scan_runtime_allows_precomputed_kernel_config(runtime_config):
+        cache = getattr(owner, cache_attr, None)
+        if isinstance(cache, dict):
+            cached = cache.get(cache_key)
+            if isinstance(cached, StructuredScanKernelConfig):
+                return cached
+    kernel_config = autotune_structured_scan_kernel_config(
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+        seq_len=int(seq_len),
+        device=device,
+        default_chunk_size=int(default_chunk_size),
+        needs_grad=bool(needs_grad),
+        runtime_config=runtime_config,
+    )
+    if _structured_scan_runtime_allows_precomputed_kernel_config(runtime_config):
+        cache = getattr(owner, cache_attr, None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(owner, cache_attr, cache)
+        cache[cache_key] = kernel_config
+    return kernel_config
+
+
+def _preload_compiled_runtime_extensions(args: Any) -> None:
+    if not bool(getattr(args, "enable_torch_compile", False)):
+        return
+    if USE_CAUSAL_MACHINE_CUDA_SCAN:
+        load_causal_machine_scan_cuda()
+    if USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and int(getattr(args, "causal_machine_latent_rank", 0)) > 0:
+        load_causal_machine_latent_scan_cuda()
+    if bool(getattr(args, "use_muon", False)) and USE_MUON_CUDA:
+        load_muon_cuda()
+
+
+def _prime_compiled_structured_scan_kernel_configs(
+    model: nn.Module,
+    *,
+    train_seq_len: int,
+    eval_seq_len: int,
+    device: torch.device,
+) -> None:
+    if device.type != "cuda":
+        return
+    seq_specs = (
+        (max(int(train_seq_len), 1), True),
+        (1, False),
+        (max(int(eval_seq_len), 1), False),
+    )
+    for module in model.modules():
+        if all(hasattr(module, name) for name in ("num_states", "transition_rank", "filter_chunk_size")):
+            num_states = int(getattr(module, "num_states"))
+            transition_rank = int(getattr(module, "transition_rank"))
+            default_chunk_size = int(getattr(module, "filter_chunk_size"))
+            if num_states > 0 and transition_rank > 0:
+                for seq_len, needs_grad in seq_specs:
+                    _get_precomputed_structured_scan_kernel_config(
+                        module,
+                        cache_attr="_compiled_kernel_config_cache",
+                        num_states=num_states,
+                        transition_rank=transition_rank,
+                        seq_len=seq_len,
+                        device=device,
+                        default_chunk_size=default_chunk_size,
+                        needs_grad=needs_grad,
+                        runtime_config=None,
+                    )
+        if all(
+            hasattr(module, name)
+            for name in ("causal_machine_num_states", "causal_machine_transition_rank", "causal_machine_filter_chunk_size")
+        ):
+            num_states = int(getattr(module, "causal_machine_num_states"))
+            transition_rank = int(getattr(module, "causal_machine_transition_rank"))
+            default_chunk_size = int(getattr(module, "causal_machine_filter_chunk_size"))
+            if num_states > 0 and transition_rank > 0:
+                for seq_len, needs_grad in seq_specs:
+                    _get_precomputed_structured_scan_kernel_config(
+                        module,
+                        cache_attr="_compiled_global_kernel_config_cache",
+                        num_states=num_states,
+                        transition_rank=transition_rank,
+                        seq_len=seq_len,
+                        device=device,
+                        default_chunk_size=default_chunk_size,
+                        needs_grad=needs_grad,
+                        runtime_config=None,
+                    )
+
+
 def describe_structured_scan_cuda_runtime_config(
     *,
     batch_size: int = 1,
@@ -11315,6 +11437,7 @@ class CausalStateMixer(nn.Module):
         self._packed_transition_cache: dict[str, object] = {}
         self._sparse_transition_cache: dict[str, object] = {}
         self._reduced_transition_cache: dict[str, object] = {}
+        self._compiled_kernel_config_cache: dict[tuple[str, int, int, bool], StructuredScanKernelConfig] = {}
 
     def _uses_latent_additive(self) -> bool:
         return self.latent_mode == "additive" and self.latent_rank > 0
@@ -11708,7 +11831,9 @@ class CausalStateMixer(nn.Module):
             )
         )
         packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
-        kernel_config = autotune_structured_scan_kernel_config(
+        kernel_config = _get_precomputed_structured_scan_kernel_config(
+            self,
+            cache_attr="_compiled_kernel_config_cache",
             num_states=self.num_states,
             transition_rank=self.transition_rank,
             seq_len=int(local_logits.size(1)),
@@ -11916,7 +12041,9 @@ class CausalStateMixer(nn.Module):
             )
         )
         packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
-        kernel_config = autotune_structured_scan_kernel_config(
+        kernel_config = _get_precomputed_structured_scan_kernel_config(
+            self,
+            cache_attr="_compiled_kernel_config_cache",
             num_states=self.num_states,
             transition_rank=self.transition_rank,
             seq_len=1,
@@ -12578,6 +12705,7 @@ class GPT(nn.Module):
         self._global_packed_transition_cache: dict[str, object] = {}
         self._global_sparse_transition_cache: dict[str, object] = {}
         self._global_reduced_transition_cache: dict[str, object] = {}
+        self._compiled_global_kernel_config_cache: dict[tuple[str, int, int, bool], StructuredScanKernelConfig] = {}
         self.shared_tail_output_gate = bool(shared_tail_output_gate)
         self.shared_tail_output_init = float(shared_tail_output_init)
         self.shared_tail_enable_step = max(int(shared_tail_enable_step), 0)
@@ -13388,7 +13516,9 @@ class GPT(nn.Module):
                 or transition_stay_probs.requires_grad
             )
         )
-        kernel_config = autotune_structured_scan_kernel_config(
+        kernel_config = _get_precomputed_structured_scan_kernel_config(
+            self,
+            cache_attr="_compiled_global_kernel_config_cache",
             num_states=self.causal_machine_num_states,
             transition_rank=self.causal_machine_transition_rank,
             seq_len=int(seq_len),
@@ -14618,6 +14748,14 @@ def main() -> None:
         if unexpected_keys:
             log0(f"init_model_unexpected:{','.join(unexpected_keys[:12])}")
     enable_model_compile = args.enable_torch_compile
+    if enable_model_compile:
+        _preload_compiled_runtime_extensions(args)
+        _prime_compiled_structured_scan_kernel_configs(
+            base_model,
+            train_seq_len=int(args.train_seq_len),
+            eval_seq_len=int(args.eval_seq_len),
+            device=device,
+        )
     if enable_model_compile:
         pass
     compiled_model = (
