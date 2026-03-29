@@ -14728,12 +14728,6 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(
-        f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
-        f"muon_cuda_graph_mode:{args.muon_cuda_graph_mode} "
-        f"cuda_graph_full_step:{int(graph_full_step_supported and args.use_cuda_graphs)} "
-        f"cuda_graph_reason:{cuda_graph_disable_reason}"
-    )
     positional_mode = "rope_only"
     log0(f"positional_mode:{positional_mode} train_seq_len:{args.train_seq_len} iterations:{args.iterations}")
 
@@ -14813,6 +14807,12 @@ def main() -> None:
     else:
         cuda_graph_disable_reason = "eligible"
     cuda_graph_eligible = cuda_graph_disable_reason == "eligible"
+    log0(
+        f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
+        f"muon_cuda_graph_mode:{args.muon_cuda_graph_mode} "
+        f"cuda_graph_full_step:{int(graph_full_step_supported and args.use_cuda_graphs)} "
+        f"cuda_graph_reason:{cuda_graph_disable_reason}"
+    )
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
