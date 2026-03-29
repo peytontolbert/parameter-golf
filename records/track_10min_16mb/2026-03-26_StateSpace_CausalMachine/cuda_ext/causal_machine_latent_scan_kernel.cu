@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <type_traits>
 #include <tuple>
@@ -2960,8 +2961,8 @@ __global__ __launch_bounds__(kThreads) void latent_replace_forward_kernel(
     const float gate = load_as_float(token_gate + row);
     const float scale = fmaxf(load_as_float(pred_scale + row), 1.0e-4f);
 
-    float thread_max_filtered = -CUDART_INF_F;
-    float thread_max_prior = -CUDART_INF_F;
+    float thread_max_filtered = -std::numeric_limits<float>::infinity();
+    float thread_max_prior = -std::numeric_limits<float>::infinity();
     for (int64_t state = tid; state < num_states; state += blockDim.x) {
         const float raw_unscaled = load_as_float(prior_logits + base + state) + load_as_float(transition_context + base + state);
         const float raw = raw_unscaled / scale;
