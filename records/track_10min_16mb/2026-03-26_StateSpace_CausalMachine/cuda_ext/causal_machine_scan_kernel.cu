@@ -1673,8 +1673,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_ke
     float* latent = dest_shared + (kTransitionRank * kNumStates);
     float* scratch = latent + kTransitionRank;
 
-    copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * kTransitionRank);
-    copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, kTransitionRank * kNumStates);
+    copy_float_matrix_pair_to_shared_async_or_sync(
+        source_shared,
+        transition_source_probs,
+        kTransitionRank,
+        kNumStates,
+        kTransitionRank,
+        kTransitionRank,
+        dest_shared,
+        transition_dest_probs,
+        kNumStates,
+        kTransitionRank,
+        kNumStates,
+        kNumStates);
     __syncthreads();
 
     const float stay_prob = transition_stay_probs[s];
@@ -1797,8 +1808,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_pa
     float* latent = dest_shared + (kTransitionRank * kNumStates);
     float* scratch = latent + kTransitionRank;
 
-    copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * kTransitionRank);
-    copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, kTransitionRank * kNumStates);
+    copy_float_matrix_pair_to_shared_async_or_sync(
+        source_shared,
+        transition_source_probs,
+        kTransitionRank,
+        kNumStates,
+        kTransitionRank,
+        kTransitionRank,
+        dest_shared,
+        transition_dest_probs,
+        kNumStates,
+        kTransitionRank,
+        kNumStates,
+        kNumStates);
     __syncthreads();
 
     const FloatPair stay_prob{
@@ -2814,6 +2836,54 @@ __device__ __forceinline__ void wait_for_async_tile(Pipe& pipe) {
     pipe.consumer_release();
 #else
     (void)pipe;
+#endif
+}
+
+__device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
+    float* __restrict__ dst0,
+    const float* __restrict__ src0,
+    int src0_stride,
+    int rows0,
+    int cols0,
+    int dst0_stride,
+    float* __restrict__ dst1,
+    const float* __restrict__ src1,
+    int src1_stride,
+    int rows1,
+    int cols1,
+    int dst1_stride) {
+#if __CUDA_ARCH__ >= 800
+    auto pipe = cuda::make_pipeline();
+    enqueue_float_matrix_pair_slice_async(
+        pipe,
+        dst0,
+        src0,
+        src0_stride,
+        rows0,
+        cols0,
+        dst0_stride,
+        dst1,
+        src1,
+        src1_stride,
+        rows1,
+        cols1,
+        dst1_stride);
+    wait_for_async_tile(pipe);
+#else
+    for (int row = 0; row < rows0; ++row) {
+        float* dst_row = dst0 + static_cast<int64_t>(row) * dst0_stride;
+        const float* src_row = src0 + static_cast<int64_t>(row) * src0_stride;
+        for (int col = threadIdx.x; col < cols0; col += blockDim.x) {
+            dst_row[col] = src_row[col];
+        }
+    }
+    for (int row = 0; row < rows1; ++row) {
+        float* dst_row = dst1 + static_cast<int64_t>(row) * dst1_stride;
+        const float* src_row = src1 + static_cast<int64_t>(row) * src1_stride;
+        for (int col = threadIdx.x; col < cols1; col += blockDim.x) {
+            dst_row[col] = src_row[col];
+        }
+    }
 #endif
 }
 
@@ -4625,8 +4695,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
             dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
         }
     } else {
-        copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * rank);
-        copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, rank * kNumStates);
+        copy_float_matrix_pair_to_shared_async_or_sync(
+            source_shared,
+            transition_source_probs,
+            rank,
+            kNumStates,
+            rank,
+            rank,
+            dest_shared,
+            transition_dest_probs,
+            kNumStates,
+            rank,
+            kNumStates,
+            kNumStates);
     }
     __syncthreads();
     const float stay_prob = transition_stay_probs[s];
@@ -4736,8 +4817,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     float* latent = dest_shared + (kTransitionRank * kNumStates);
     float* scratch = latent + kTransitionRank;
 
-    copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * kTransitionRank);
-    copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, kTransitionRank * kNumStates);
+    copy_float_matrix_pair_to_shared_async_or_sync(
+        source_shared,
+        transition_source_probs,
+        kTransitionRank,
+        kNumStates,
+        kTransitionRank,
+        kTransitionRank,
+        dest_shared,
+        transition_dest_probs,
+        kNumStates,
+        kTransitionRank,
+        kNumStates,
+        kNumStates);
     __syncthreads();
 
     const float stay_prob = transition_stay_probs[s];
@@ -4827,8 +4919,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     float* latent = dest_shared + (kTransitionRank * kNumStates);
     float* scratch = latent + kTransitionRank;
 
-    copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * kTransitionRank);
-    copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, kTransitionRank * kNumStates);
+    copy_float_matrix_pair_to_shared_async_or_sync(
+        source_shared,
+        transition_source_probs,
+        kTransitionRank,
+        kNumStates,
+        kTransitionRank,
+        kTransitionRank,
+        dest_shared,
+        transition_dest_probs,
+        kNumStates,
+        kTransitionRank,
+        kNumStates,
+        kNumStates);
     __syncthreads();
 
     const FloatPair stay_prob{
@@ -5382,8 +5485,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_compos
             dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
         }
     } else {
-        copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * rank);
-        copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, rank * kNumStates);
+        copy_float_matrix_pair_to_shared_async_or_sync(
+            source_shared,
+            transition_source_probs,
+            rank,
+            kNumStates,
+            rank,
+            rank,
+            dest_shared,
+            transition_dest_probs,
+            kNumStates,
+            rank,
+            kNumStates,
+            kNumStates);
     }
     __syncthreads();
     const float stay_prob = transition_stay_probs[s];
@@ -5500,8 +5614,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_compos
             dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
         }
     } else {
-        copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * rank);
-        copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, rank * kNumStates);
+        copy_float_matrix_pair_to_shared_async_or_sync(
+            source_shared,
+            transition_source_probs,
+            rank,
+            kNumStates,
+            rank,
+            rank,
+            dest_shared,
+            transition_dest_probs,
+            kNumStates,
+            rank,
+            kNumStates,
+            kNumStates);
     }
     __syncthreads();
     const float stay_prob = transition_stay_probs[s];
@@ -5617,8 +5742,19 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_compos
             dest_shared[row * kNumStates + s] = row_exp / fmaxf(row_sum, 1.0e-20f);
         }
     } else {
-        copy_to_shared_async_or_sync(source_shared, transition_source_probs, kNumStates * rank);
-        copy_to_shared_async_or_sync(dest_shared, transition_dest_probs, rank * kNumStates);
+        copy_float_matrix_pair_to_shared_async_or_sync(
+            source_shared,
+            transition_source_probs,
+            rank,
+            kNumStates,
+            rank,
+            rank,
+            dest_shared,
+            transition_dest_probs,
+            kNumStates,
+            rank,
+            kNumStates,
+            kNumStates);
     }
     __syncthreads();
     const float stay_prob = transition_stay_probs[s];
@@ -8347,49 +8483,34 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
         __syncthreads();
     }
 
+    const int64_t source_total = static_cast<int64_t>(num_states) * transition_rank;
+    const int64_t dest_total = static_cast<int64_t>(transition_rank) * num_states;
+    const int64_t stay_total = num_states;
     if (gridDim.x == 1) {
-        __shared__ int combine_owner;
-        __syncthreads();
-        if (tid == 0) {
-            __threadfence();
-            const int completed = atomicAdd(work_queue_counter + 1, 1);
-            combine_owner = (completed == (gridDim.x - 1)) ? 1 : 0;
+        for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
+            grad_transition_source_probs_output[idx] = grad_transition_source_probs[idx];
         }
-        __syncthreads();
-
-        if (combine_owner != 0) {
-            const int64_t source_total = static_cast<int64_t>(num_states) * transition_rank;
-            const int64_t dest_total = static_cast<int64_t>(transition_rank) * num_states;
-            const int64_t stay_total = num_states;
-            for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_source_probs_staging[static_cast<int64_t>(worker) * source_total + idx];
-                }
-                grad_transition_source_probs_output[idx] = sum;
-            }
-            for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_dest_probs_staging[static_cast<int64_t>(worker) * dest_total + idx];
-                }
-                grad_transition_dest_probs_output[idx] = sum;
-            }
-            for (int64_t idx = tid; idx < stay_total; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_stay_staging[static_cast<int64_t>(worker) * stay_total + idx];
-                }
-                grad_transition_stay_output[idx] = sum;
-            }
-            if (tid == 0) {
-                float gate_sum_total = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    gate_sum_total += grad_transition_gate_staging[worker];
-                }
-                grad_transition_gate_output[0] = gate_sum_total;
-                work_queue_counter[1] = 0;
-            }
+        for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
+            grad_transition_dest_probs_output[idx] = grad_transition_dest_probs[idx];
+        }
+        for (int64_t idx = tid; idx < stay_total; idx += blockDim.x) {
+            grad_transition_stay_output[idx] = grad_transition_stay[idx];
+        }
+        if (tid == 0) {
+            grad_transition_gate_output[0] = grad_transition_gate[0];
+        }
+    } else {
+        for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
+            atomicAdd(grad_transition_source_probs_output + idx, grad_transition_source_probs[idx]);
+        }
+        for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
+            atomicAdd(grad_transition_dest_probs_output + idx, grad_transition_dest_probs[idx]);
+        }
+        for (int64_t idx = tid; idx < stay_total; idx += blockDim.x) {
+            atomicAdd(grad_transition_stay_output + idx, grad_transition_stay[idx]);
+        }
+        if (tid == 0) {
+            atomicAdd(grad_transition_gate_output, grad_transition_gate[0]);
         }
     }
 }
@@ -9020,47 +9141,33 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
         __syncthreads();
     }
 
+    const int64_t source_total = static_cast<int64_t>(num_states) * transition_rank;
+    const int64_t dest_total = static_cast<int64_t>(transition_rank) * num_states;
     if (gridDim.x == 1) {
-        __shared__ int combine_owner;
-        __syncthreads();
-        if (tid == 0) {
-            __threadfence();
-            const int completed = atomicAdd(work_queue_counter + 1, 1);
-            combine_owner = (completed == (gridDim.x - 1)) ? 1 : 0;
+        for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
+            grad_transition_source_probs_output[idx] = grad_transition_source_probs[idx];
         }
-        __syncthreads();
-        if (combine_owner != 0) {
-            const int64_t source_total = static_cast<int64_t>(num_states) * transition_rank;
-            const int64_t dest_total = static_cast<int64_t>(transition_rank) * num_states;
-            for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_source_probs_staging[static_cast<int64_t>(worker) * source_total + idx];
-                }
-                grad_transition_source_probs_output[idx] = sum;
-            }
-            for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_dest_probs_staging[static_cast<int64_t>(worker) * dest_total + idx];
-                }
-                grad_transition_dest_probs_output[idx] = sum;
-            }
-            for (int64_t idx = tid; idx < num_states; idx += blockDim.x) {
-                float sum = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    sum += grad_transition_stay_staging[static_cast<int64_t>(worker) * num_states + idx];
-                }
-                grad_transition_stay_output[idx] = sum;
-            }
-            if (tid == 0) {
-                float gate_sum_total = 0.0f;
-                for (int worker = 0; worker < gridDim.x; ++worker) {
-                    gate_sum_total += grad_transition_gate_staging[worker];
-                }
-                grad_transition_gate_output[0] = gate_sum_total;
-                work_queue_counter[1] = 0;
-            }
+        for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
+            grad_transition_dest_probs_output[idx] = grad_transition_dest_probs[idx];
+        }
+        for (int64_t idx = tid; idx < num_states; idx += blockDim.x) {
+            grad_transition_stay_output[idx] = grad_transition_stay[idx];
+        }
+        if (tid == 0) {
+            grad_transition_gate_output[0] = grad_transition_gate[0];
+        }
+    } else {
+        for (int64_t idx = tid; idx < source_total; idx += blockDim.x) {
+            atomicAdd(grad_transition_source_probs_output + idx, grad_transition_source_probs[idx]);
+        }
+        for (int64_t idx = tid; idx < dest_total; idx += blockDim.x) {
+            atomicAdd(grad_transition_dest_probs_output + idx, grad_transition_dest_probs[idx]);
+        }
+        for (int64_t idx = tid; idx < num_states; idx += blockDim.x) {
+            atomicAdd(grad_transition_stay_output + idx, grad_transition_stay[idx]);
+        }
+        if (tid == 0) {
+            atomicAdd(grad_transition_gate_output, grad_transition_gate[0]);
         }
     }
 }
@@ -11780,21 +11887,6 @@ void launch_backward_tiled_chunk(
         clear_persisting_l2_window(stream);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    if (launch_config.grid.x > 1) {
-        combine_block_staging_2d_cuda(
-            grad_transition_source_probs_staging,
-            grad_transition_source_probs);
-        combine_block_staging_2d_cuda(
-            grad_transition_dest_probs_staging,
-            grad_transition_dest_probs);
-        combine_block_staging_1d_cuda(
-            grad_transition_gate_staging,
-            grad_transition_gate);
-        combine_block_staging_1d_cuda(
-            grad_transition_stay_staging,
-            grad_transition_stay);
-        C10_CUDA_CHECK(cudaMemsetAsync(work_queue_counter.data_ptr<int32_t>(), 0, 2 * sizeof(int32_t), stream));
-    }
 }
 
 template <typename scalar_t, typename packed_t, PackedTransitionFormat Format>
@@ -11970,21 +12062,6 @@ void launch_backward_tiled_chunk_packed(
         clear_persisting_l2_window(stream);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    if (launch_config.grid.x > 1) {
-        combine_block_staging_2d_cuda(
-            grad_transition_source_probs_staging,
-            grad_transition_source_probs);
-        combine_block_staging_2d_cuda(
-            grad_transition_dest_probs_staging,
-            grad_transition_dest_probs);
-        combine_block_staging_1d_cuda(
-            grad_transition_gate_staging,
-            grad_transition_gate);
-        combine_block_staging_1d_cuda(
-            grad_transition_stay_staging,
-            grad_transition_stay);
-        C10_CUDA_CHECK(cudaMemsetAsync(work_queue_counter.data_ptr<int32_t>(), 0, 2 * sizeof(int32_t), stream));
-    }
 }
 
 template <typename scalar_t>
@@ -17154,19 +17231,10 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
             });
     }
 
-    if (direct_small_rank_grad) {
-        if (seq_len > 0) {
-            combine_block_staging_2d_cuda(grad_transition_source_per_batch, grad_transition_source_probs);
-            combine_block_staging_2d_cuda(grad_transition_dest_per_batch, grad_transition_dest_probs);
-            combine_block_staging_1d_cuda(grad_transition_stay_per_batch, grad_transition_stay_probs);
-            combine_block_staging_1d_cuda(grad_transition_gate_per_batch, grad_transition_gate);
-        }
-    } else {
-        grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
-        grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
-        grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
-        grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
-    }
+    grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
+    grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
+    grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
+    grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
     return {
         grad_local_logits,
         grad_transition_source_probs,
@@ -17365,17 +17433,9 @@ std::vector<torch::Tensor> causal_machine_scan_backward_composable_cuda(
             });
     }
 
-    if (direct_small_rank_grad) {
-        if (seq_len > 0) {
-            combine_block_staging_2d_cuda(grad_transition_source_per_batch, grad_transition_source_probs);
-            combine_block_staging_2d_cuda(grad_transition_dest_per_batch, grad_transition_dest_probs);
-            combine_block_staging_1d_cuda(grad_transition_stay_per_batch, grad_transition_stay_probs);
-        }
-    } else {
-        grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
-        grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
-        grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
-    }
+    grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
+    grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
+    grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
     return {
         grad_local_logits,
         grad_transition_source_probs,
@@ -17767,19 +17827,10 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
             });
     }
 
-    if (direct_small_rank_grad) {
-        if (seq_len > 0) {
-            combine_block_staging_2d_cuda(grad_transition_source_per_batch, grad_transition_source_probs);
-            combine_block_staging_2d_cuda(grad_transition_dest_per_batch, grad_transition_dest_probs);
-            combine_block_staging_1d_cuda(grad_transition_stay_per_batch, grad_transition_stay_probs);
-            combine_block_staging_1d_cuda(grad_transition_gate_per_batch, grad_transition_gate);
-        }
-    } else {
-        grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
-        grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
-        grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
-        grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
-    }
+    grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
+    grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
+    grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
+    grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
     return {
         grad_local_logits,
         grad_transition_source_probs,
@@ -17935,19 +17986,10 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
             }));
     }
 
-    if (direct_small_rank_grad) {
-        if (seq_len > 0) {
-            combine_block_staging_2d_cuda(grad_transition_source_per_batch, grad_transition_source_probs);
-            combine_block_staging_2d_cuda(grad_transition_dest_per_batch, grad_transition_dest_probs);
-            combine_block_staging_1d_cuda(grad_transition_stay_per_batch, grad_transition_stay_probs);
-            combine_block_staging_1d_cuda(grad_transition_gate_per_batch, grad_transition_gate);
-        }
-    } else {
-        grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
-        grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
-        grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
-        grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
-    }
+    grad_transition_source_probs = grad_transition_source_per_batch.sum(0);
+    grad_transition_dest_probs = grad_transition_dest_per_batch.sum(0);
+    grad_transition_stay_probs = grad_transition_stay_per_batch.sum(0);
+    grad_transition_gate = grad_transition_gate_per_batch.sum().reshape({1});
     return {
         grad_local_logits,
         grad_transition_source_probs,

@@ -127,6 +127,7 @@ def _parse_cuda_arch_list(raw: str) -> list[str]:
     return archs
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=1)
 def _causal_machine_cuda_arch_flags() -> tuple[str, ...]:
     raw = os.environ.get("CAUSAL_MACHINE_CUDA_ARCHS", "").strip()
@@ -1757,6 +1758,7 @@ def _structured_scan_tiled_candidate_sizes(limit: int, preferred: int) -> tuple[
     return tuple(values)
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _resolve_structured_scan_tiled_kernel_config_cached(
     device_index: int,
@@ -1823,6 +1825,7 @@ def _resolve_structured_scan_tiled_kernel_config_cached(
     return None
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _select_structured_scan_tiled_policy_cached(
     device_index: int,
@@ -1945,6 +1948,7 @@ def _select_structured_scan_tiled_policy(
     )
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _select_structured_scan_dense_policy_cached(
     device_index: int,
@@ -2273,6 +2277,7 @@ def create_structured_scan_workspace(
     )
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _describe_structured_scan_device_runtime_cached(device_index: int) -> dict[str, int]:
     device = torch.device("cuda", int(device_index))
@@ -2356,11 +2361,13 @@ def _estimate_latent_scan_cost(seq_len: int, latent_rank: int, chunk_size: int =
     return scan_work + summary_work + finalize_work
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _cached_env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(float(default))))
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _cached_env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(int(default))).strip()
@@ -2370,6 +2377,7 @@ def _cached_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+@_torch_dynamo_disable_if_available
 @functools.lru_cache(maxsize=None)
 def _cached_env_str(name: str, default: str) -> str:
     return str(os.environ.get(name, default)).strip().lower()
@@ -13828,11 +13836,18 @@ class GPT(nn.Module):
         bucket_ids_t = torch.from_numpy(bucket_ids_np.astype(np.int64, copy=False)).to(device=device)
         signs_t = torch.from_numpy(signs_np.astype(np.float32, copy=False)).to(device=device)
         self.causal_machine_log_probs = log_probs
-        mass_sum = state_masses.sum().item()
-        if mass_sum > 0.0:
-            priors = torch.log(state_masses / max(mass_sum, 1e-12)).clamp_min(-30.0)
-        else:
-            priors = torch.full((num_states,), fill_value=-math.log(max(num_states, 1)), dtype=torch.float32, device=device)
+        mass_sum = state_masses.sum()
+        default_prior = torch.full(
+            (num_states,),
+            fill_value=-math.log(max(num_states, 1)),
+            dtype=torch.float32,
+            device=device,
+        )
+        priors = torch.where(
+            mass_sum > 0.0,
+            torch.log(state_masses / mass_sum.clamp_min(1.0e-12)).clamp_min(-30.0),
+            default_prior,
+        )
         self.causal_machine_log_state_priors = priors
         self.causal_machine_signature_centroids = centroids
         self.causal_machine_horizon_tensor = torch.tensor(horizons, dtype=torch.int64, device=device)
@@ -13860,7 +13875,7 @@ class GPT(nn.Module):
         bucket_ids = self.causal_machine_bucket_ids.to(device=target_ids.device)
         signs = self.causal_machine_signs.to(device=target_ids.device)
         blocks: list[Tensor] = []
-        for horizon in self.causal_machine_horizon_tensor.tolist():
+        for horizon in self.causal_machine_horizons:
             accum = torch.zeros((flat_size, self.causal_machine_sketch_dim), device=target_ids.device, dtype=torch.float32)
             denom = torch.zeros((flat_size, 1), device=target_ids.device, dtype=torch.float32)
             # Future-sketch targets should only summarize tokens strictly after t.
@@ -14366,12 +14381,12 @@ class GPT(nn.Module):
         if state_space_backbone_loss is not None:
             loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
         mid_aux_coeff_tensor: Tensor | None = None
+        mid_aux_coeff_value: float | None = None
         if torch.is_tensor(mid_aux_loss_coeff):
-            mid_aux_active = bool(mid_aux_loss_coeff.detach().abs().max().item() > 0.0)
             mid_aux_coeff_tensor = mid_aux_loss_coeff
         else:
-            mid_aux_active = abs(float(mid_aux_loss_coeff)) > 0.0
-        if mid_aux_active and h_mid is not None:
+            mid_aux_coeff_value = float(mid_aux_loss_coeff)
+        if h_mid is not None and (mid_aux_coeff_tensor is not None or abs(mid_aux_coeff_value) > 0.0):
             if h_mid.size(1) == target_ids.size(1):
                 mid_logits = self._mid_aux_logits(h_mid)
                 mid_ce = F.cross_entropy(
@@ -14387,7 +14402,7 @@ class GPT(nn.Module):
                     mid_loss = (mid_ce * mid_mask).sum() / mid_mask.sum().clamp_min(1.0)
                 if mid_aux_coeff_tensor is None:
                     mid_aux_coeff_tensor = torch.tensor(
-                        float(mid_aux_loss_coeff),
+                        float(mid_aux_coeff_value),
                         device=mid_loss.device,
                         dtype=mid_loss.dtype,
                     )
