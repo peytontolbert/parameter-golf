@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -16,6 +17,9 @@ def load_train_module():
 
 
 def main() -> None:
+    # Prebuild must be allowed to compile missing extensions even when the
+    # timed training path later requires prebuilt artifacts to already exist.
+    os.environ["CAUSAL_MACHINE_REQUIRE_PREBUILT_EXTENSIONS"] = "0"
     module = load_train_module()
     print("prebuilding causal_machine_scan_cuda...")
     module.load_causal_machine_scan_cuda()
