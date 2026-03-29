@@ -2382,8 +2382,8 @@ def _bounded_latent_decay(logits: Tensor) -> Tensor:
     max_decay = min(max(max_decay, min_decay + 1e-6), 0.999999)
     logits_f32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
     decay = torch.sigmoid(logits_f32)
-    decay = torch.nan_to_num(decay, nan=min_decay, posinf=max_decay, neginf=min_decay)
-    return decay.clamp(min_decay, max_decay)
+    decay = min_decay + (max_decay - min_decay) * decay
+    return torch.nan_to_num(decay, nan=min_decay, posinf=max_decay, neginf=min_decay)
 
 
 def _bounded_gate(logits: Tensor, min_env: str, max_env: str, *, default_min: float = 0.10, default_max: float = 0.99) -> Tensor:
@@ -11629,8 +11629,15 @@ class CausalStateMixer(nn.Module):
             default_min=0.01,
             default_max=0.995,
         ).to(device=state_hidden.device, dtype=out_dtype)
-        token_gate_mult = 2.0 * torch.sigmoid(self.transition_gate_proj(state_hidden).float())
-        token_gate = (base_gate * token_gate_mult.to(device=state_hidden.device, dtype=out_dtype)).clamp_(0.0, 1.0)
+        token_gate_delta = torch.tanh(self.transition_gate_proj(state_hidden).float()).to(
+            device=state_hidden.device,
+            dtype=out_dtype,
+        )
+        token_gate = torch.where(
+            token_gate_delta >= 0,
+            base_gate + (1.0 - base_gate) * token_gate_delta,
+            base_gate * (1.0 + token_gate_delta),
+        )
         pred_scale = _bounded_gate(
             self.transition_pred_scale_proj(state_hidden),
             "CAUSAL_MACHINE_TRANSITION_PRED_SCALE_MIN",
@@ -14350,7 +14357,7 @@ class GPT(nn.Module):
             loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
         mid_aux_coeff_tensor: Tensor | None = None
         if torch.is_tensor(mid_aux_loss_coeff):
-            mid_aux_active = True
+            mid_aux_active = bool(mid_aux_loss_coeff.detach().abs().max().item() > 0.0)
             mid_aux_coeff_tensor = mid_aux_loss_coeff
         else:
             mid_aux_active = abs(float(mid_aux_loss_coeff)) > 0.0
