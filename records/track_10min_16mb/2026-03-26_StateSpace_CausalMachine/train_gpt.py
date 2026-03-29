@@ -218,6 +218,15 @@ def _extension_candidate_build_dirs(source_dir: Path, build_subdir: str) -> list
     return dirs
 
 
+def _extension_candidate_build_dirs_multi(source_dir: Path, build_subdirs: Sequence[str]) -> list[Path]:
+    dirs: list[Path] = []
+    for build_subdir in build_subdirs:
+        for candidate in _extension_candidate_build_dirs(source_dir, build_subdir):
+            if candidate not in dirs:
+                dirs.append(candidate)
+    return dirs
+
+
 @_torch_dynamo_disable_if_available
 def _load_existing_cuda_extension_module(
     module_name: str,
@@ -334,7 +343,13 @@ def load_causal_machine_scan_cuda():
     if _CAUSAL_MACHINE_SCAN_CUDA_ERROR is not None:
         raise RuntimeError("causal_machine_scan_cuda is unavailable") from _CAUSAL_MACHINE_SCAN_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
-    build_dirs = _extension_candidate_build_dirs(source_dir, "build")
+    build_dirs = _extension_candidate_build_dirs_multi(
+        source_dir,
+        (
+            "build/causal_machine_scan_cuda",
+            "build",
+        ),
+    )
     build_dir = build_dirs[0]
     build_dir.mkdir(parents=True, exist_ok=True)
     existing = _load_prebuilt_cuda_extension_or_none(
@@ -413,7 +428,13 @@ def load_causal_machine_latent_scan_cuda():
     if _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR is not None:
         raise RuntimeError("causal_machine_latent_scan_cuda is unavailable") from _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
-    build_dirs = _extension_candidate_build_dirs(source_dir, "build")
+    build_dirs = _extension_candidate_build_dirs_multi(
+        source_dir,
+        (
+            "build/causal_machine_latent_scan_cuda",
+            "build",
+        ),
+    )
     build_dir = build_dirs[0]
     build_dir.mkdir(parents=True, exist_ok=True)
     existing = _load_prebuilt_cuda_extension_or_none(
@@ -2357,9 +2378,12 @@ def _cached_env_str(name: str, default: str) -> str:
 def _bounded_latent_decay(logits: Tensor) -> Tensor:
     min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.99)
     max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9995)
-    min_decay = min(max(min_decay, 0.0), 0.999999)
+    min_decay = min(max(min_decay, 1.0e-6), 0.999999)
     max_decay = min(max(max_decay, min_decay + 1e-6), 0.999999)
-    return torch.sigmoid(logits.float()).clamp(min_decay, max_decay)
+    logits_f32 = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+    decay = torch.sigmoid(logits_f32)
+    decay = torch.nan_to_num(decay, nan=min_decay, posinf=max_decay, neginf=min_decay)
+    return decay.clamp(min_decay, max_decay)
 
 
 def _bounded_gate(logits: Tensor, min_env: str, max_env: str, *, default_min: float = 0.10, default_max: float = 0.99) -> Tensor:
@@ -2656,6 +2680,7 @@ class _CausalMachineMaskedScanCudaFn(torch.autograd.Function):
             grad_initial,
             grad_gate.reshape_as(transition_gate_f32),
             grad_stay.reshape_as(transition_stay_probs_f32),
+            None,
             None,
             None,
             None,
@@ -4237,6 +4262,7 @@ def _unpack_scan_transition_tables(
 
 class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def forward(
         ctx,
         drive: Tensor,
@@ -4252,6 +4278,7 @@ class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
         return states, prior_states, final_state
 
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def backward(ctx, grad_states: Tensor, grad_prior_states: Tensor, grad_final_state: Tensor):
         ext = load_causal_machine_latent_scan_cuda()
         states, decay_in, initial_state_in = ctx.saved_tensors
@@ -4266,6 +4293,7 @@ class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
         return grad_drive, grad_decay.reshape_as(decay_in).to(decay_in.dtype), grad_initial
 
 
+@_torch_dynamo_disable_if_available
 def causal_machine_latent_scan_cuda(
     drive: Tensor,
     decay: Tensor,
@@ -4276,6 +4304,7 @@ def causal_machine_latent_scan_cuda(
 
 class _CausalMachineLatentPriorScanCudaFn(torch.autograd.Function):
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def forward(
         ctx,
         drive: Tensor,
@@ -4291,6 +4320,7 @@ class _CausalMachineLatentPriorScanCudaFn(torch.autograd.Function):
         return prior_states, final_state
 
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def backward(ctx, grad_prior_states: Tensor, grad_final_state: Tensor):
         ext = load_causal_machine_latent_scan_cuda()
         prior_states, decay_in, initial_state_in = ctx.saved_tensors
@@ -4304,6 +4334,7 @@ class _CausalMachineLatentPriorScanCudaFn(torch.autograd.Function):
         return grad_drive, grad_decay.reshape_as(decay_in).to(decay_in.dtype), grad_initial
 
 
+@_torch_dynamo_disable_if_available
 def causal_machine_latent_prior_scan_cuda(
     drive: Tensor,
     decay: Tensor,
@@ -4314,6 +4345,7 @@ def causal_machine_latent_prior_scan_cuda(
 
 class _CausalMachineLatentReplaceCudaFn(torch.autograd.Function):
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def forward(
         ctx,
         local_logits: Tensor,
@@ -4346,6 +4378,7 @@ class _CausalMachineLatentReplaceCudaFn(torch.autograd.Function):
         return beliefs, prior_log_beliefs
 
     @staticmethod
+    @_torch_dynamo_disable_if_available
     def backward(ctx, grad_beliefs: Tensor, grad_prior_log_beliefs: Tensor | None):
         ext = load_causal_machine_latent_scan_cuda()
         (
@@ -4383,6 +4416,7 @@ class _CausalMachineLatentReplaceCudaFn(torch.autograd.Function):
         )
 
 
+@_torch_dynamo_disable_if_available
 def causal_machine_latent_replace_cuda(
     local_logits: Tensor,
     prior_logits: Tensor,
@@ -14314,9 +14348,10 @@ class GPT(nn.Module):
         )
         if state_space_backbone_loss is not None:
             loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
-        mid_aux_active = False
+        mid_aux_coeff_tensor: Tensor | None = None
         if torch.is_tensor(mid_aux_loss_coeff):
-            mid_aux_active = bool(mid_aux_loss_coeff.detach().abs().max().item() > 0.0)
+            mid_aux_active = True
+            mid_aux_coeff_tensor = mid_aux_loss_coeff
         else:
             mid_aux_active = abs(float(mid_aux_loss_coeff)) > 0.0
         if mid_aux_active and h_mid is not None:
@@ -14333,15 +14368,15 @@ class GPT(nn.Module):
                 else:
                     mid_mask = loss_mask.reshape(-1).to(dtype=mid_ce.dtype)
                     mid_loss = (mid_ce * mid_mask).sum() / mid_mask.sum().clamp_min(1.0)
-                if not torch.is_tensor(mid_aux_loss_coeff):
-                    mid_aux_loss_coeff = torch.tensor(
+                if mid_aux_coeff_tensor is None:
+                    mid_aux_coeff_tensor = torch.tensor(
                         float(mid_aux_loss_coeff),
                         device=mid_loss.device,
                         dtype=mid_loss.dtype,
                     )
                 else:
-                    mid_aux_loss_coeff = mid_aux_loss_coeff.to(device=mid_loss.device, dtype=mid_loss.dtype)
-                loss = loss + mid_aux_loss_coeff * mid_loss
+                    mid_aux_coeff_tensor = mid_aux_coeff_tensor.to(device=mid_loss.device, dtype=mid_loss.dtype)
+                loss = loss + mid_aux_coeff_tensor * mid_loss
         return loss
 
     def forward_logits(
