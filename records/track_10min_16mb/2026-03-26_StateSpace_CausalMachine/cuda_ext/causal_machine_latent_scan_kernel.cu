@@ -3,11 +3,15 @@
 #include <torch/extension.h>
 
 #include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdint>
 #include <mutex>
+#include <type_traits>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +51,60 @@ int latent_single_kernel_max_seq_len() {
     return cached;
 }
 
+int cached_sm_count(int device_index) {
+    static std::mutex mutex;
+    static std::unordered_map<int, int> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(device_index);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    int value = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(
+        &value,
+        cudaDevAttrMultiProcessorCount,
+        device_index));
+    cache.emplace(device_index, value);
+    return value;
+}
+
+int persistent_worker_blocks(int device_index, int total_tasks) {
+    if (total_tasks <= 0) {
+        return 0;
+    }
+    const int sm_count = std::max(cached_sm_count(device_index), 1);
+    const int target_blocks = sm_count * 2;
+    return std::max(1, std::min(total_tasks, target_blocks));
+}
+
+template <typename KernelT>
+int occupancy_persistent_worker_blocks(
+    KernelT kernel,
+    int device_index,
+    int total_tasks,
+    int block_threads,
+    size_t dynamic_smem_bytes = 0) {
+    if (total_tasks <= 0) {
+        return 0;
+    }
+    c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device_index));
+    int blocks_per_sm = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm,
+        kernel,
+        block_threads,
+        dynamic_smem_bytes));
+    if (blocks_per_sm <= 0) {
+        return persistent_worker_blocks(device_index, total_tasks);
+    }
+    const int target_blocks = std::max(blocks_per_sm * std::max(cached_sm_count(device_index), 1), 1);
+    return std::max(1, std::min(total_tasks, target_blocks));
+}
+
+torch::Tensor make_device_work_queue_counter(const torch::Tensor& reference) {
+    return torch::zeros({1}, reference.options().dtype(torch::kInt32));
+}
+
 std::mutex g_latent_workspace_cache_mutex;
 
 enum class LatentWorkspaceTag : std::uint8_t {
@@ -62,6 +120,7 @@ struct LatentWorkspaceKey {
     int batch_size;
     int num_chunks;
     int rank_dim;
+    int scalar_type;
     LatentWorkspaceTag tag;
 
     bool operator==(const LatentWorkspaceKey& other) const {
@@ -70,6 +129,7 @@ struct LatentWorkspaceKey {
             && batch_size == other.batch_size
             && num_chunks == other.num_chunks
             && rank_dim == other.rank_dim
+            && scalar_type == other.scalar_type
             && tag == other.tag;
     }
 };
@@ -81,6 +141,7 @@ struct LatentWorkspaceKeyHash {
         hash ^= static_cast<std::size_t>(key.batch_size) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         hash ^= static_cast<std::size_t>(key.num_chunks) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         hash ^= static_cast<std::size_t>(key.rank_dim) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= static_cast<std::size_t>(key.scalar_type) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         hash ^= static_cast<std::size_t>(key.tag) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         return hash;
     }
@@ -96,16 +157,18 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_wor
     const torch::Tensor& ref,
     int batch_size,
     int num_chunks,
-    int rank_dim) {
+    int rank_dim,
+    torch::ScalarType workspace_dtype) {
     const auto device_index = ref.get_device();
     const auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
-    const auto opts = ref.options().dtype(torch::kFloat32);
+    const auto opts = ref.options().dtype(workspace_dtype);
     const auto key = LatentWorkspaceKey{
         reinterpret_cast<std::uintptr_t>(stream),
         device_index,
         batch_size,
         num_chunks,
         rank_dim,
+        static_cast<int>(workspace_dtype),
         tag,
     };
     const auto batch_size_i64 = static_cast<int64_t>(batch_size);
@@ -116,7 +179,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_wor
     auto ensure_tensor = [&](torch::Tensor& t) {
         if (
             !t.defined()
-            || t.scalar_type() != torch::kFloat32
+            || t.scalar_type() != workspace_dtype
             || t.device() != ref.device()
             || t.dim() != 3
             || t.size(0) != batch_size_i64
@@ -140,6 +203,76 @@ __device__ __forceinline__ float load_as_float(const scalar_t* ptr) {
 template <typename scalar_t>
 __device__ __forceinline__ scalar_t store_from_float(float value) {
     return static_cast<scalar_t>(value);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ bool latent_vec2_math_enabled_for_scalar() {
+    return false;
+}
+
+template <>
+__device__ __forceinline__ bool latent_vec2_math_enabled_for_scalar<c10::Half>() {
+#if __CUDA_ARCH__ >= 530
+    return true;
+#else
+    return false;
+#endif
+}
+
+template <>
+__device__ __forceinline__ bool latent_vec2_math_enabled_for_scalar<c10::BFloat16>() {
+#if __CUDA_ARCH__ >= 800
+    return true;
+#else
+    return false;
+#endif
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ float2 load_pair_as_float2(const scalar_t* ptr) {
+    return make_float2(load_as_float(ptr), load_as_float(ptr + 1));
+}
+
+template <>
+__device__ __forceinline__ float2 load_pair_as_float2<c10::Half>(const c10::Half* ptr) {
+    return __half22float2(*reinterpret_cast<const __half2*>(ptr));
+}
+
+template <>
+__device__ __forceinline__ float2 load_pair_as_float2<c10::BFloat16>(const c10::BFloat16* ptr) {
+    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(ptr));
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void store_pair_from_float2(scalar_t* ptr, float2 value) {
+    ptr[0] = store_from_float<scalar_t>(value.x);
+    ptr[1] = store_from_float<scalar_t>(value.y);
+}
+
+template <>
+__device__ __forceinline__ void store_pair_from_float2<c10::Half>(c10::Half* ptr, float2 value) {
+    *reinterpret_cast<__half2*>(ptr) = __floats2half2_rn(value.x, value.y);
+}
+
+template <>
+__device__ __forceinline__ void store_pair_from_float2<c10::BFloat16>(c10::BFloat16* ptr, float2 value) {
+    *reinterpret_cast<__nv_bfloat162*>(ptr) = __floats2bfloat162_rn(value.x, value.y);
+}
+
+__device__ __forceinline__ __half2 load_half2_pair(const c10::Half* ptr) {
+    return *reinterpret_cast<const __half2*>(ptr);
+}
+
+__device__ __forceinline__ void store_half2_pair(c10::Half* ptr, __half2 value) {
+    *reinterpret_cast<__half2*>(ptr) = value;
+}
+
+__device__ __forceinline__ __nv_bfloat162 load_bfloat162_pair(const c10::BFloat16* ptr) {
+    return *reinterpret_cast<const __nv_bfloat162*>(ptr);
+}
+
+__device__ __forceinline__ void store_bfloat162_pair(c10::BFloat16* ptr, __nv_bfloat162 value) {
+    *reinterpret_cast<__nv_bfloat162*>(ptr) = value;
 }
 
 template <typename scalar_t, bool StoreStates>
@@ -205,15 +338,155 @@ __device__ __forceinline__ void latent_backward_chunk(
     }
 }
 
-template <typename scalar_t>
-__global__ void latent_chunk_summary_kernel(
+template <bool StoreStates>
+__device__ __forceinline__ __half2 latent_forward_chunk_half2(
+    const c10::Half* __restrict__ drive,
+    __half2 decay,
+    int seq_len,
+    int rank_dim,
+    int b,
+    int r,
+    int chunk_start,
+    int chunk_len,
+    __half2 prev,
+    c10::Half* __restrict__ prior_states,
+    c10::Half* __restrict__ states) {
+    #pragma unroll 4
+    for (int dt = 0; dt < chunk_len; ++dt) {
+        const int t = chunk_start + dt;
+        const int idx = (b * seq_len + t) * rank_dim + r;
+        const __half2 prior = __hmul2(decay, prev);
+        store_half2_pair(prior_states + idx, prior);
+        prev = __hadd2(prior, load_half2_pair(drive + idx));
+        if constexpr (StoreStates) {
+            store_half2_pair(states + idx, prev);
+        }
+    }
+    return prev;
+}
+
+template <bool UseStateGrad, bool UseStatesPrev>
+__device__ __forceinline__ void latent_backward_chunk_half2(
+    const c10::Half* __restrict__ grad_states,
+    const c10::Half* __restrict__ grad_prior_states,
+    const c10::Half* __restrict__ states,
+    const c10::Half* __restrict__ prior_states,
+    const c10::Half* __restrict__ initial_state,
+    __half2 decay,
+    int seq_len,
+    int rank_dim,
+    int b,
+    int r,
+    int chunk_start,
+    int chunk_len,
+    __half2& carry,
+    float2& decay_grad,
+    c10::Half* __restrict__ grad_drive) {
+    const float2 decay_f = __half22float2(decay);
+    for (int dt = chunk_len - 1; dt >= 0; --dt) {
+        const int t = chunk_start + dt;
+        const int idx = (b * seq_len + t) * rank_dim + r;
+        __half2 grad_state = carry;
+        if constexpr (UseStateGrad) {
+            grad_state = __hadd2(grad_state, load_half2_pair(grad_states + idx));
+        }
+        store_half2_pair(grad_drive + idx, grad_state);
+        const __half2 grad_prior = __hadd2(load_half2_pair(grad_prior_states + idx), grad_state);
+        const float2 grad_prior_f = __half22float2(grad_prior);
+        float2 prev_state_f;
+        if (t == 0) {
+            prev_state_f = load_pair_as_float2(initial_state + b * rank_dim + r);
+        } else if constexpr (UseStatesPrev) {
+            prev_state_f = load_pair_as_float2(states + ((b * seq_len + (t - 1)) * rank_dim + r));
+        } else {
+            const float2 prior_f = load_pair_as_float2(prior_states + idx);
+            prev_state_f = make_float2(prior_f.x / decay_f.x, prior_f.y / decay_f.y);
+        }
+        decay_grad.x += grad_prior_f.x * prev_state_f.x;
+        decay_grad.y += grad_prior_f.y * prev_state_f.y;
+        carry = __hmul2(grad_prior, decay);
+    }
+}
+
+template <bool StoreStates>
+__device__ __forceinline__ __nv_bfloat162 latent_forward_chunk_bfloat162(
+    const c10::BFloat16* __restrict__ drive,
+    __nv_bfloat162 decay,
+    int seq_len,
+    int rank_dim,
+    int b,
+    int r,
+    int chunk_start,
+    int chunk_len,
+    __nv_bfloat162 prev,
+    c10::BFloat16* __restrict__ prior_states,
+    c10::BFloat16* __restrict__ states) {
+    #pragma unroll 4
+    for (int dt = 0; dt < chunk_len; ++dt) {
+        const int t = chunk_start + dt;
+        const int idx = (b * seq_len + t) * rank_dim + r;
+        const __nv_bfloat162 prior = __hmul2(decay, prev);
+        store_bfloat162_pair(prior_states + idx, prior);
+        prev = __hadd2(prior, load_bfloat162_pair(drive + idx));
+        if constexpr (StoreStates) {
+            store_bfloat162_pair(states + idx, prev);
+        }
+    }
+    return prev;
+}
+
+template <bool UseStateGrad, bool UseStatesPrev>
+__device__ __forceinline__ void latent_backward_chunk_bfloat162(
+    const c10::BFloat16* __restrict__ grad_states,
+    const c10::BFloat16* __restrict__ grad_prior_states,
+    const c10::BFloat16* __restrict__ states,
+    const c10::BFloat16* __restrict__ prior_states,
+    const c10::BFloat16* __restrict__ initial_state,
+    __nv_bfloat162 decay,
+    int seq_len,
+    int rank_dim,
+    int b,
+    int r,
+    int chunk_start,
+    int chunk_len,
+    __nv_bfloat162& carry,
+    float2& decay_grad,
+    c10::BFloat16* __restrict__ grad_drive) {
+    const float2 decay_f = __bfloat1622float2(decay);
+    for (int dt = chunk_len - 1; dt >= 0; --dt) {
+        const int t = chunk_start + dt;
+        const int idx = (b * seq_len + t) * rank_dim + r;
+        __nv_bfloat162 grad_state = carry;
+        if constexpr (UseStateGrad) {
+            grad_state = __hadd2(grad_state, load_bfloat162_pair(grad_states + idx));
+        }
+        store_bfloat162_pair(grad_drive + idx, grad_state);
+        const __nv_bfloat162 grad_prior = __hadd2(load_bfloat162_pair(grad_prior_states + idx), grad_state);
+        const float2 grad_prior_f = __bfloat1622float2(grad_prior);
+        float2 prev_state_f;
+        if (t == 0) {
+            prev_state_f = load_pair_as_float2(initial_state + b * rank_dim + r);
+        } else if constexpr (UseStatesPrev) {
+            prev_state_f = load_pair_as_float2(states + ((b * seq_len + (t - 1)) * rank_dim + r));
+        } else {
+            const float2 prior_f = load_pair_as_float2(prior_states + idx);
+            prev_state_f = make_float2(prior_f.x / decay_f.x, prior_f.y / decay_f.y);
+        }
+        decay_grad.x += grad_prior_f.x * prev_state_f.x;
+        decay_grad.y += grad_prior_f.y * prev_state_f.y;
+        carry = __hmul2(grad_prior, decay);
+    }
+}
+
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_chunk_summary_kernel(
     const scalar_t* __restrict__ drive,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
-    float* __restrict__ chunk_mul,
-    float* __restrict__ chunk_add) {
+    work_t* __restrict__ chunk_mul,
+    work_t* __restrict__ chunk_add) {
     const int b = blockIdx.x;
     const int chunk_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
@@ -222,7 +495,7 @@ __global__ void latent_chunk_summary_kernel(
     }
     const int chunk_start = chunk_id * kLatentChunkSize;
     const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-    const float decay_r = decay[r];
+    const float decay_r = load_as_float(decay + r);
     float add = 0.0f;
     for (int dt = 0; dt < chunk_len; ++dt) {
         const int t = chunk_start + dt;
@@ -230,43 +503,102 @@ __global__ void latent_chunk_summary_kernel(
         add = decay_r * add + load_as_float(drive + idx);
     }
     const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
-    chunk_mul[summary_idx] = powf(decay_r, static_cast<float>(chunk_len));
-    chunk_add[summary_idx] = add;
+    chunk_mul[summary_idx] = store_from_float<work_t>(powf(decay_r, static_cast<float>(chunk_len)));
+    chunk_add[summary_idx] = store_from_float<work_t>(add);
 }
 
-template <typename scalar_t>
-__global__ void latent_chunk_carry_kernel(
-    const float* __restrict__ chunk_mul,
-    const float* __restrict__ chunk_add,
-    const scalar_t* __restrict__ initial_state,
-    int num_chunks,
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_chunk_summary_persistent_kernel(
+    const scalar_t* __restrict__ drive,
+    const work_t* __restrict__ decay,
+    int seq_len,
     int rank_dim,
-    float* __restrict__ chunk_prev,
-    scalar_t* __restrict__ final_state) {
-    const int b = blockIdx.x;
-    const int r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rank_dim) {
-        return;
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_mul,
+    work_t* __restrict__ chunk_add) {
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const float decay_r = load_as_float(decay + r);
+            float add = 0.0f;
+            for (int dt = 0; dt < chunk_len; ++dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                add = decay_r * add + load_as_float(drive + idx);
+            }
+            const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
+            chunk_mul[summary_idx] = store_from_float<work_t>(powf(decay_r, static_cast<float>(chunk_len)));
+            chunk_add[summary_idx] = store_from_float<work_t>(add);
+        }
+        __syncthreads();
     }
-    float prev = load_as_float(initial_state + b * rank_dim + r);
-    for (int chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
-        const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
-        chunk_prev[summary_idx] = prev;
-        prev = chunk_mul[summary_idx] * prev + chunk_add[summary_idx];
-    }
-    final_state[b * rank_dim + r] = store_from_float<scalar_t>(prev);
 }
 
-template <typename scalar_t>
-__global__ void latent_chunk_prefix_scan_kernel(
-    const float* __restrict__ chunk_mul,
-    const float* __restrict__ chunk_add,
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_chunk_carry_kernel(
+    const work_t* __restrict__ chunk_mul,
+    const work_t* __restrict__ chunk_add,
     const scalar_t* __restrict__ initial_state,
+    int total_batches,
     int num_chunks,
     int rank_dim,
-    float* __restrict__ chunk_prev,
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_prev,
     scalar_t* __restrict__ final_state) {
-    const int b = blockIdx.x;
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            float prev = load_as_float(initial_state + current_batch * rank_dim + r);
+            for (int chunk_id = 0; chunk_id < num_chunks; ++chunk_id) {
+                const int summary_idx = (current_batch * num_chunks + chunk_id) * rank_dim + r;
+                chunk_prev[summary_idx] = store_from_float<work_t>(prev);
+                prev = load_as_float(chunk_mul + summary_idx) * prev + load_as_float(chunk_add + summary_idx);
+            }
+            final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(prev);
+        }
+        __syncthreads();
+    }
+}
+
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_kernel(
+    const work_t* __restrict__ chunk_mul,
+    const work_t* __restrict__ chunk_add,
+    const scalar_t* __restrict__ initial_state,
+    int total_batches,
+    int num_chunks,
+    int rank_dim,
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_prev,
+    scalar_t* __restrict__ final_state) {
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
     if (r >= rank_dim || tid >= kChunkScanThreads) {
@@ -278,93 +610,122 @@ __global__ void latent_chunk_prefix_scan_kernel(
     __shared__ float mul_tmp[kChunkScanThreads];
     __shared__ float add_tmp[kChunkScanThreads];
 
-    if (tid < num_chunks) {
-        const int idx = (b * num_chunks + tid) * rank_dim + r;
-        mul_shared[tid] = chunk_mul[idx];
-        add_shared[tid] = chunk_add[idx];
-    } else {
-        mul_shared[tid] = 1.0f;
-        add_shared[tid] = 0.0f;
-    }
-    __syncthreads();
+    __shared__ int current_batch;
+    while (true) {
+        if (tid == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
 
-    for (int offset = 1; offset < num_chunks; offset <<= 1) {
         if (tid < num_chunks) {
-            float cur_mul = mul_shared[tid];
-            float cur_add = add_shared[tid];
-            if (tid >= offset) {
-                const float left_mul = mul_shared[tid - offset];
-                const float left_add = add_shared[tid - offset];
-                mul_tmp[tid] = cur_mul * left_mul;
-                add_tmp[tid] = cur_mul * left_add + cur_add;
-            } else {
-                mul_tmp[tid] = cur_mul;
-                add_tmp[tid] = cur_add;
+            const int idx = (current_batch * num_chunks + tid) * rank_dim + r;
+            mul_shared[tid] = load_as_float(chunk_mul + idx);
+            add_shared[tid] = load_as_float(chunk_add + idx);
+        } else {
+            mul_shared[tid] = 1.0f;
+            add_shared[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int offset = 1; offset < num_chunks; offset <<= 1) {
+            if (tid < num_chunks) {
+                float cur_mul = mul_shared[tid];
+                float cur_add = add_shared[tid];
+                if (tid >= offset) {
+                    const float left_mul = mul_shared[tid - offset];
+                    const float left_add = add_shared[tid - offset];
+                    mul_tmp[tid] = cur_mul * left_mul;
+                    add_tmp[tid] = cur_mul * left_add + cur_add;
+                } else {
+                    mul_tmp[tid] = cur_mul;
+                    add_tmp[tid] = cur_add;
+                }
+            }
+            __syncthreads();
+            if (tid < num_chunks) {
+                mul_shared[tid] = mul_tmp[tid];
+                add_shared[tid] = add_tmp[tid];
+            }
+            __syncthreads();
+        }
+
+        const float init = load_as_float(initial_state + current_batch * rank_dim + r);
+        if (tid < num_chunks) {
+            float prev = init;
+            if (tid > 0) {
+                const float excl_mul = mul_shared[tid - 1];
+                const float excl_add = add_shared[tid - 1];
+                prev = excl_mul * init + excl_add;
+            }
+            chunk_prev[(current_batch * num_chunks + tid) * rank_dim + r] = store_from_float<work_t>(prev);
+            if (tid == num_chunks - 1) {
+                const float final_val = mul_shared[tid] * init + add_shared[tid];
+                final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(final_val);
             }
         }
         __syncthreads();
-        if (tid < num_chunks) {
-            mul_shared[tid] = mul_tmp[tid];
-            add_shared[tid] = add_tmp[tid];
-        }
-        __syncthreads();
-    }
-
-    const float init = load_as_float(initial_state + b * rank_dim + r);
-    if (tid < num_chunks) {
-        float prev = init;
-        if (tid > 0) {
-            const float excl_mul = mul_shared[tid - 1];
-            const float excl_add = add_shared[tid - 1];
-            prev = excl_mul * init + excl_add;
-        }
-        chunk_prev[(b * num_chunks + tid) * rank_dim + r] = prev;
-        if (tid == num_chunks - 1) {
-            const float final_val = mul_shared[tid] * init + add_shared[tid];
-            final_state[b * rank_dim + r] = store_from_float<scalar_t>(final_val);
-        }
     }
 }
 
-__global__ void latent_group_summary_kernel(
-    const float* __restrict__ in_mul,
-    const float* __restrict__ in_add,
+template <typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_group_summary_kernel(
+    const work_t* __restrict__ in_mul,
+    const work_t* __restrict__ in_add,
+    int total_batches,
     int in_chunks,
     int rank_dim,
     int out_chunks,
-    float* __restrict__ out_mul,
-    float* __restrict__ out_add) {
-    const int b = blockIdx.x;
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ out_mul,
+    work_t* __restrict__ out_add) {
     const int group_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
     if (group_id >= out_chunks || r >= rank_dim) {
         return;
     }
-    const int group_start = group_id * kChunkScanThreads;
-    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
-    float mul = 1.0f;
-    float add = 0.0f;
-    for (int i = 0; i < group_len; ++i) {
-        const int idx = (b * in_chunks + (group_start + i)) * rank_dim + r;
-        const float cur_mul = in_mul[idx];
-        const float cur_add = in_add[idx];
-        add = cur_mul * add + cur_add;
-        mul *= cur_mul;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        const int group_start = group_id * kChunkScanThreads;
+        const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+        float mul = 1.0f;
+        float add = 0.0f;
+        for (int i = 0; i < group_len; ++i) {
+            const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
+            const float cur_mul = load_as_float(in_mul + idx);
+            const float cur_add = load_as_float(in_add + idx);
+            add = cur_mul * add + cur_add;
+            mul *= cur_mul;
+        }
+        const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
+        out_mul[out_idx] = store_from_float<work_t>(mul);
+        out_add[out_idx] = store_from_float<work_t>(add);
+        __syncthreads();
     }
-    const int out_idx = (b * out_chunks + group_id) * rank_dim + r;
-    out_mul[out_idx] = mul;
-    out_add[out_idx] = add;
 }
 
-__global__ void latent_chunk_group_prefix_scan_kernel(
-    const float* __restrict__ chunk_mul,
-    const float* __restrict__ chunk_add,
-    const float* __restrict__ group_prev,
+template <typename work_t>
+__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_prefix_scan_kernel(
+    const work_t* __restrict__ chunk_mul,
+    const work_t* __restrict__ chunk_add,
+    const work_t* __restrict__ group_prev,
+    int total_batches,
     int num_chunks,
     int rank_dim,
     int num_groups,
-    float* __restrict__ chunk_prev) {
-    const int b = blockIdx.x;
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_prev) {
     const int group_id = blockIdx.y;
     const int r = blockIdx.z;
     const int tid = threadIdx.x;
@@ -377,86 +738,113 @@ __global__ void latent_chunk_group_prefix_scan_kernel(
     __shared__ float mul_tmp[kChunkScanThreads];
     __shared__ float add_tmp[kChunkScanThreads];
 
-    const int group_start = group_id * kChunkScanThreads;
-    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
-    if (tid < group_len) {
-        const int idx = (b * num_chunks + (group_start + tid)) * rank_dim + r;
-        mul_shared[tid] = chunk_mul[idx];
-        add_shared[tid] = chunk_add[idx];
-    } else {
-        mul_shared[tid] = 1.0f;
-        add_shared[tid] = 0.0f;
-    }
-    __syncthreads();
+    __shared__ int current_batch;
+    while (true) {
+        if (tid == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
 
-    for (int offset = 1; offset < group_len; offset <<= 1) {
+        const int group_start = group_id * kChunkScanThreads;
+        const int group_len = min(kChunkScanThreads, num_chunks - group_start);
         if (tid < group_len) {
-            float cur_mul = mul_shared[tid];
-            float cur_add = add_shared[tid];
-            if (tid >= offset) {
-                const float left_mul = mul_shared[tid - offset];
-                const float left_add = add_shared[tid - offset];
-                mul_tmp[tid] = cur_mul * left_mul;
-                add_tmp[tid] = cur_mul * left_add + cur_add;
-            } else {
-                mul_tmp[tid] = cur_mul;
-                add_tmp[tid] = cur_add;
+            const int idx = (current_batch * num_chunks + (group_start + tid)) * rank_dim + r;
+            mul_shared[tid] = load_as_float(chunk_mul + idx);
+            add_shared[tid] = load_as_float(chunk_add + idx);
+        } else {
+            mul_shared[tid] = 1.0f;
+            add_shared[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int offset = 1; offset < group_len; offset <<= 1) {
+            if (tid < group_len) {
+                float cur_mul = mul_shared[tid];
+                float cur_add = add_shared[tid];
+                if (tid >= offset) {
+                    const float left_mul = mul_shared[tid - offset];
+                    const float left_add = add_shared[tid - offset];
+                    mul_tmp[tid] = cur_mul * left_mul;
+                    add_tmp[tid] = cur_mul * left_add + cur_add;
+                } else {
+                    mul_tmp[tid] = cur_mul;
+                    add_tmp[tid] = cur_add;
+                }
             }
+            __syncthreads();
+            if (tid < group_len) {
+                mul_shared[tid] = mul_tmp[tid];
+                add_shared[tid] = add_tmp[tid];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        if (tid < group_len) {
-            mul_shared[tid] = mul_tmp[tid];
-            add_shared[tid] = add_tmp[tid];
-        }
-        __syncthreads();
-    }
 
-    if (tid < group_len) {
-        float prev = group_prev[(b * num_groups + group_id) * rank_dim + r];
-        if (tid > 0) {
-            const float excl_mul = mul_shared[tid - 1];
-            const float excl_add = add_shared[tid - 1];
-            prev = excl_mul * prev + excl_add;
+        if (tid < group_len) {
+            float prev = load_as_float(group_prev + ((current_batch * num_groups + group_id) * rank_dim + r));
+            if (tid > 0) {
+                const float excl_mul = mul_shared[tid - 1];
+                const float excl_add = add_shared[tid - 1];
+                prev = excl_mul * prev + excl_add;
+            }
+            chunk_prev[(current_batch * num_chunks + (group_start + tid)) * rank_dim + r] = store_from_float<work_t>(prev);
         }
-        chunk_prev[(b * num_chunks + (group_start + tid)) * rank_dim + r] = prev;
+        __syncthreads();
     }
 }
 
-__global__ void latent_group_summary_reverse_kernel(
-    const float* __restrict__ in_mul,
-    const float* __restrict__ in_add,
+template <typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_group_summary_reverse_kernel(
+    const work_t* __restrict__ in_mul,
+    const work_t* __restrict__ in_add,
+    int total_batches,
     int in_chunks,
     int rank_dim,
     int out_chunks,
-    float* __restrict__ out_mul,
-    float* __restrict__ out_add) {
-    const int b = blockIdx.x;
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ out_mul,
+    work_t* __restrict__ out_add) {
     const int group_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
     if (group_id >= out_chunks || r >= rank_dim) {
         return;
     }
-    const int group_start = group_id * kChunkScanThreads;
-    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
-    float mul = 1.0f;
-    float add = 0.0f;
-    for (int i = group_len - 1; i >= 0; --i) {
-        const int idx = (b * in_chunks + (group_start + i)) * rank_dim + r;
-        const float cur_mul = in_mul[idx];
-        const float cur_add = in_add[idx];
-        add = cur_mul * add + cur_add;
-        mul *= cur_mul;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        const int group_start = group_id * kChunkScanThreads;
+        const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+        float mul = 1.0f;
+        float add = 0.0f;
+        for (int i = group_len - 1; i >= 0; --i) {
+            const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
+            const float cur_mul = load_as_float(in_mul + idx);
+            const float cur_add = load_as_float(in_add + idx);
+            add = cur_mul * add + cur_add;
+            mul *= cur_mul;
+        }
+        const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
+        out_mul[out_idx] = store_from_float<work_t>(mul);
+        out_add[out_idx] = store_from_float<work_t>(add);
+        __syncthreads();
     }
-    const int out_idx = (b * out_chunks + group_id) * rank_dim + r;
-    out_mul[out_idx] = mul;
-    out_add[out_idx] = add;
 }
 
-template <typename scalar_t, bool StoreStates>
-__global__ void latent_chunk_finalize_kernel(
+template <typename scalar_t, typename work_t, bool StoreStates>
+__global__ __launch_bounds__(kThreads) void latent_chunk_finalize_kernel(
     const scalar_t* __restrict__ drive,
-    const float* __restrict__ decay,
-    const float* __restrict__ chunk_prev,
+    const work_t* __restrict__ decay,
+    const work_t* __restrict__ chunk_prev,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -470,8 +858,8 @@ __global__ void latent_chunk_finalize_kernel(
     }
     const int chunk_start = chunk_id * kLatentChunkSize;
     const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-    const float decay_r = decay[r];
-    float prev = chunk_prev[(b * num_chunks + chunk_id) * rank_dim + r];
+    const float decay_r = load_as_float(decay + r);
+    float prev = load_as_float(chunk_prev + ((b * num_chunks + chunk_id) * rank_dim + r));
     for (int dt = 0; dt < chunk_len; ++dt) {
         const int t = chunk_start + dt;
         const int idx = (b * seq_len + t) * rank_dim + r;
@@ -484,14 +872,60 @@ __global__ void latent_chunk_finalize_kernel(
     }
 }
 
-template <typename scalar_t, bool UseStateGrad, bool UseStatesPrev>
-__global__ void latent_chunk_backward_kernel(
+template <typename scalar_t, typename work_t, bool StoreStates>
+__global__ __launch_bounds__(kThreads) void latent_chunk_finalize_persistent_kernel(
+    const scalar_t* __restrict__ drive,
+    const work_t* __restrict__ decay,
+    const work_t* __restrict__ chunk_prev,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    scalar_t* __restrict__ prior_states,
+    scalar_t* __restrict__ states) {
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const float decay_r = load_as_float(decay + r);
+            float prev = load_as_float(chunk_prev + ((b * num_chunks + chunk_id) * rank_dim + r));
+            for (int dt = 0; dt < chunk_len; ++dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                const float prior = decay_r * prev;
+                prior_states[idx] = store_from_float<scalar_t>(prior);
+                prev = prior + load_as_float(drive + idx);
+                if constexpr (StoreStates) {
+                    states[idx] = store_from_float<scalar_t>(prev);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <typename scalar_t, typename work_t, bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
     const scalar_t* __restrict__ states,
     const scalar_t* __restrict__ prior_states,
     const scalar_t* __restrict__ initial_state,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int chunk_id,
@@ -506,7 +940,7 @@ __global__ void latent_chunk_backward_kernel(
     }
     const int chunk_start = chunk_id * kLatentChunkSize;
     const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-    const float decay_r = decay[r];
+    const float decay_r = load_as_float(decay + r);
     float carry = carry_io[b * rank_dim + r];
     float decay_grad = 0.0f;
     for (int dt = chunk_len - 1; dt >= 0; --dt) {
@@ -533,16 +967,16 @@ __global__ void latent_chunk_backward_kernel(
     atomicAdd(grad_decay + r, decay_grad);
 }
 
-template <typename scalar_t, bool UseStateGrad>
-__global__ void latent_chunk_backward_summary_kernel(
+template <typename scalar_t, typename work_t, bool UseStateGrad>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
-    float* __restrict__ chunk_mul,
-    float* __restrict__ chunk_add) {
+    work_t* __restrict__ chunk_mul,
+    work_t* __restrict__ chunk_add) {
     const int b = blockIdx.x;
     const int chunk_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
@@ -551,7 +985,7 @@ __global__ void latent_chunk_backward_summary_kernel(
     }
     const int chunk_start = chunk_id * kLatentChunkSize;
     const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-    const float decay_r = decay[r];
+    const float decay_r = load_as_float(decay + r);
     float add = 0.0f;
     for (int dt = chunk_len - 1; dt >= 0; --dt) {
         const int t = chunk_start + dt;
@@ -561,19 +995,66 @@ __global__ void latent_chunk_backward_summary_kernel(
         add = decay_r * (local_grad + add);
     }
     const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
-    chunk_mul[summary_idx] = powf(decay_r, static_cast<float>(chunk_len));
-    chunk_add[summary_idx] = add;
+    chunk_mul[summary_idx] = store_from_float<work_t>(powf(decay_r, static_cast<float>(chunk_len)));
+    chunk_add[summary_idx] = store_from_float<work_t>(add);
 }
 
-template <typename scalar_t>
-__global__ void latent_chunk_reverse_prefix_scan_kernel(
-    const float* __restrict__ chunk_mul,
-    const float* __restrict__ chunk_add,
+template <typename scalar_t, typename work_t, bool UseStateGrad>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_persistent_kernel(
+    const scalar_t* __restrict__ grad_states,
+    const scalar_t* __restrict__ grad_prior_states,
+    const work_t* __restrict__ decay,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_mul,
+    work_t* __restrict__ chunk_add) {
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const float decay_r = load_as_float(decay + r);
+            float add = 0.0f;
+            for (int dt = chunk_len - 1; dt >= 0; --dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                const float local_grad = load_as_float(grad_prior_states + idx)
+                    + (UseStateGrad ? load_as_float(grad_states + idx) : 0.0f);
+                add = decay_r * (local_grad + add);
+            }
+            const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
+            chunk_mul[summary_idx] = store_from_float<work_t>(powf(decay_r, static_cast<float>(chunk_len)));
+            chunk_add[summary_idx] = store_from_float<work_t>(add);
+        }
+        __syncthreads();
+    }
+}
+
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix_scan_kernel(
+    const work_t* __restrict__ chunk_mul,
+    const work_t* __restrict__ chunk_add,
     const scalar_t* __restrict__ grad_final_state,
+    int total_batches,
     int num_chunks,
     int rank_dim,
-    float* __restrict__ chunk_carry) {
-    const int b = blockIdx.x;
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_carry) {
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
     if (r >= rank_dim || tid >= kChunkScanThreads) {
@@ -585,61 +1066,75 @@ __global__ void latent_chunk_reverse_prefix_scan_kernel(
     __shared__ float mul_tmp[kChunkScanThreads];
     __shared__ float add_tmp[kChunkScanThreads];
 
-    if (tid < num_chunks) {
-        const int rev = num_chunks - 1 - tid;
-        const int idx = (b * num_chunks + rev) * rank_dim + r;
-        mul_shared[tid] = chunk_mul[idx];
-        add_shared[tid] = chunk_add[idx];
-    } else {
-        mul_shared[tid] = 1.0f;
-        add_shared[tid] = 0.0f;
-    }
-    __syncthreads();
+    __shared__ int current_batch;
+    while (true) {
+        if (tid == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
 
-    for (int offset = 1; offset < num_chunks; offset <<= 1) {
         if (tid < num_chunks) {
-            float cur_mul = mul_shared[tid];
-            float cur_add = add_shared[tid];
-            if (tid >= offset) {
-                const float left_mul = mul_shared[tid - offset];
-                const float left_add = add_shared[tid - offset];
-                mul_tmp[tid] = cur_mul * left_mul;
-                add_tmp[tid] = cur_mul * left_add + cur_add;
-            } else {
-                mul_tmp[tid] = cur_mul;
-                add_tmp[tid] = cur_add;
+            const int rev = num_chunks - 1 - tid;
+            const int idx = (current_batch * num_chunks + rev) * rank_dim + r;
+            mul_shared[tid] = load_as_float(chunk_mul + idx);
+            add_shared[tid] = load_as_float(chunk_add + idx);
+        } else {
+            mul_shared[tid] = 1.0f;
+            add_shared[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int offset = 1; offset < num_chunks; offset <<= 1) {
+            if (tid < num_chunks) {
+                float cur_mul = mul_shared[tid];
+                float cur_add = add_shared[tid];
+                if (tid >= offset) {
+                    const float left_mul = mul_shared[tid - offset];
+                    const float left_add = add_shared[tid - offset];
+                    mul_tmp[tid] = cur_mul * left_mul;
+                    add_tmp[tid] = cur_mul * left_add + cur_add;
+                } else {
+                    mul_tmp[tid] = cur_mul;
+                    add_tmp[tid] = cur_add;
+                }
             }
+            __syncthreads();
+            if (tid < num_chunks) {
+                mul_shared[tid] = mul_tmp[tid];
+                add_shared[tid] = add_tmp[tid];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        if (tid < num_chunks) {
-            mul_shared[tid] = mul_tmp[tid];
-            add_shared[tid] = add_tmp[tid];
-        }
-        __syncthreads();
-    }
 
-    const float final_grad = load_as_float(grad_final_state + b * rank_dim + r);
-    if (tid < num_chunks) {
-        const int rev = num_chunks - 1 - tid;
-        float carry = final_grad;
-        if (tid > 0) {
-            const float excl_mul = mul_shared[tid - 1];
-            const float excl_add = add_shared[tid - 1];
-            carry = excl_mul * final_grad + excl_add;
+        const float final_grad = load_as_float(grad_final_state + current_batch * rank_dim + r);
+        if (tid < num_chunks) {
+            const int rev = num_chunks - 1 - tid;
+            float carry = final_grad;
+            if (tid > 0) {
+                const float excl_mul = mul_shared[tid - 1];
+                const float excl_add = add_shared[tid - 1];
+                carry = excl_mul * final_grad + excl_add;
+            }
+            chunk_carry[(current_batch * num_chunks + rev) * rank_dim + r] = store_from_float<work_t>(carry);
         }
-        chunk_carry[(b * num_chunks + rev) * rank_dim + r] = carry;
+        __syncthreads();
     }
 }
 
-__global__ void latent_chunk_group_reverse_prefix_scan_kernel(
-    const float* __restrict__ chunk_mul,
-    const float* __restrict__ chunk_add,
-    const float* __restrict__ group_carry,
+template <typename work_t>
+__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_reverse_prefix_scan_kernel(
+    const work_t* __restrict__ chunk_mul,
+    const work_t* __restrict__ chunk_add,
+    const work_t* __restrict__ group_carry,
+    int total_batches,
     int num_chunks,
     int rank_dim,
     int num_groups,
-    float* __restrict__ chunk_carry) {
-    const int b = blockIdx.x;
+    int32_t* __restrict__ work_queue_counter,
+    work_t* __restrict__ chunk_carry) {
     const int group_id = blockIdx.y;
     const int r = blockIdx.z;
     const int tid = threadIdx.x;
@@ -652,63 +1147,75 @@ __global__ void latent_chunk_group_reverse_prefix_scan_kernel(
     __shared__ float mul_tmp[kChunkScanThreads];
     __shared__ float add_tmp[kChunkScanThreads];
 
-    const int group_start = group_id * kChunkScanThreads;
-    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
-    if (tid < group_len) {
-        const int rev_local = group_len - 1 - tid;
-        const int idx = (b * num_chunks + (group_start + rev_local)) * rank_dim + r;
-        mul_shared[tid] = chunk_mul[idx];
-        add_shared[tid] = chunk_add[idx];
-    } else {
-        mul_shared[tid] = 1.0f;
-        add_shared[tid] = 0.0f;
-    }
-    __syncthreads();
+    __shared__ int current_batch;
+    while (true) {
+        if (tid == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
 
-    for (int offset = 1; offset < group_len; offset <<= 1) {
+        const int group_start = group_id * kChunkScanThreads;
+        const int group_len = min(kChunkScanThreads, num_chunks - group_start);
         if (tid < group_len) {
-            float cur_mul = mul_shared[tid];
-            float cur_add = add_shared[tid];
-            if (tid >= offset) {
-                const float left_mul = mul_shared[tid - offset];
-                const float left_add = add_shared[tid - offset];
-                mul_tmp[tid] = cur_mul * left_mul;
-                add_tmp[tid] = cur_mul * left_add + cur_add;
-            } else {
-                mul_tmp[tid] = cur_mul;
-                add_tmp[tid] = cur_add;
+            const int rev_local = group_len - 1 - tid;
+            const int idx = (current_batch * num_chunks + (group_start + rev_local)) * rank_dim + r;
+            mul_shared[tid] = load_as_float(chunk_mul + idx);
+            add_shared[tid] = load_as_float(chunk_add + idx);
+        } else {
+            mul_shared[tid] = 1.0f;
+            add_shared[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        for (int offset = 1; offset < group_len; offset <<= 1) {
+            if (tid < group_len) {
+                float cur_mul = mul_shared[tid];
+                float cur_add = add_shared[tid];
+                if (tid >= offset) {
+                    const float left_mul = mul_shared[tid - offset];
+                    const float left_add = add_shared[tid - offset];
+                    mul_tmp[tid] = cur_mul * left_mul;
+                    add_tmp[tid] = cur_mul * left_add + cur_add;
+                } else {
+                    mul_tmp[tid] = cur_mul;
+                    add_tmp[tid] = cur_add;
+                }
             }
+            __syncthreads();
+            if (tid < group_len) {
+                mul_shared[tid] = mul_tmp[tid];
+                add_shared[tid] = add_tmp[tid];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        if (tid < group_len) {
-            mul_shared[tid] = mul_tmp[tid];
-            add_shared[tid] = add_tmp[tid];
-        }
-        __syncthreads();
-    }
 
-    if (tid < group_len) {
-        const int rev_local = group_len - 1 - tid;
-        const int actual_chunk = group_start + rev_local;
-        float carry = group_carry[(b * num_groups + group_id) * rank_dim + r];
-        if (tid > 0) {
-            const float excl_mul = mul_shared[tid - 1];
-            const float excl_add = add_shared[tid - 1];
-            carry = excl_mul * carry + excl_add;
+        if (tid < group_len) {
+            const int rev_local = group_len - 1 - tid;
+            const int actual_chunk = group_start + rev_local;
+            float carry = load_as_float(group_carry + ((current_batch * num_groups + group_id) * rank_dim + r));
+            if (tid > 0) {
+                const float excl_mul = mul_shared[tid - 1];
+                const float excl_add = add_shared[tid - 1];
+                carry = excl_mul * carry + excl_add;
+            }
+            chunk_carry[(current_batch * num_chunks + actual_chunk) * rank_dim + r] = store_from_float<work_t>(carry);
         }
-        chunk_carry[(b * num_chunks + actual_chunk) * rank_dim + r] = carry;
+        __syncthreads();
     }
 }
 
-template <typename scalar_t, bool UseStateGrad, bool UseStatesPrev>
-__global__ void latent_chunk_backward_finalize_kernel(
+template <typename scalar_t, typename work_t, bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_finalize_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
     const scalar_t* __restrict__ states,
     const scalar_t* __restrict__ prior_states,
     const scalar_t* __restrict__ initial_state,
-    const float* __restrict__ decay,
-    const float* __restrict__ chunk_carry,
+    const work_t* __restrict__ decay,
+    const work_t* __restrict__ chunk_carry,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -723,8 +1230,8 @@ __global__ void latent_chunk_backward_finalize_kernel(
     }
     const int chunk_start = chunk_id * kLatentChunkSize;
     const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-    const float decay_r = decay[r];
-    float carry = chunk_carry[(b * num_chunks + chunk_id) * rank_dim + r];
+    const float decay_r = load_as_float(decay + r);
+    float carry = load_as_float(chunk_carry + ((b * num_chunks + chunk_id) * rank_dim + r));
     float decay_grad_local = 0.0f;
     for (int dt = chunk_len - 1; dt >= 0; --dt) {
         const int t = chunk_start + dt;
@@ -749,167 +1256,715 @@ __global__ void latent_chunk_backward_finalize_kernel(
     atomicAdd(grad_decay + r, decay_grad_local);
 }
 
-template <typename scalar_t>
-__global__ void latent_scan_forward_kernel(
+template <typename scalar_t, typename work_t, bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_finalize_persistent_kernel(
+    const scalar_t* __restrict__ grad_states,
+    const scalar_t* __restrict__ grad_prior_states,
+    const scalar_t* __restrict__ states,
+    const scalar_t* __restrict__ prior_states,
+    const scalar_t* __restrict__ initial_state,
+    const work_t* __restrict__ decay,
+    const work_t* __restrict__ chunk_carry,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    scalar_t* __restrict__ grad_drive,
+    float* __restrict__ grad_decay,
+    scalar_t* __restrict__ grad_initial_state) {
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const float decay_r = load_as_float(decay + r);
+            float carry = load_as_float(chunk_carry + ((b * num_chunks + chunk_id) * rank_dim + r));
+            float decay_grad_local = 0.0f;
+            for (int dt = chunk_len - 1; dt >= 0; --dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                const float grad_state = (UseStateGrad ? load_as_float(grad_states + idx) : 0.0f) + carry;
+                grad_drive[idx] = store_from_float<scalar_t>(grad_state);
+                const float grad_prior = load_as_float(grad_prior_states + idx) + grad_state;
+                float prev_state;
+                if (t == 0) {
+                    prev_state = load_as_float(initial_state + b * rank_dim + r);
+                } else if constexpr (UseStatesPrev) {
+                    prev_state = load_as_float(states + ((b * seq_len + (t - 1)) * rank_dim + r));
+                } else {
+                    prev_state = load_as_float(prior_states + idx) / decay_r;
+                }
+                decay_grad_local += grad_prior * prev_state;
+                carry = grad_prior * decay_r;
+            }
+            if (chunk_id == 0) {
+                grad_initial_state[b * rank_dim + r] = store_from_float<scalar_t>(carry);
+            }
+            atomicAdd(grad_decay + r, decay_grad_local);
+        }
+        __syncthreads();
+    }
+}
+
+template <bool StoreStates>
+__global__ __launch_bounds__(kThreads) void latent_scan_forward_kernel_half2(
+    const c10::Half* __restrict__ drive,
+    const c10::Half* __restrict__ decay,
+    const c10::Half* __restrict__ initial_state,
+    int seq_len,
+    int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
+    c10::Half* __restrict__ prior_states,
+    c10::Half* __restrict__ states,
+    c10::Half* __restrict__ final_state) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            __half2 prev = load_half2_pair(initial_state + current_batch * rank_dim + r);
+            const __half2 decay2 = load_half2_pair(decay + r);
+            for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                prev = latent_forward_chunk_half2<StoreStates>(
+                    drive,
+                    decay2,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    prev,
+                    prior_states,
+                    states);
+            }
+            store_half2_pair(final_state + current_batch * rank_dim + r, prev);
+        }
+        __syncthreads();
+    }
+}
+
+template <bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_scan_backward_kernel_half2(
+    const c10::Half* __restrict__ grad_states,
+    const c10::Half* __restrict__ grad_prior_states,
+    const c10::Half* __restrict__ grad_final_state,
+    const c10::Half* __restrict__ states,
+    const c10::Half* __restrict__ prior_states,
+    const c10::Half* __restrict__ decay,
+    const c10::Half* __restrict__ initial_state,
+    int seq_len,
+    int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
+    c10::Half* __restrict__ grad_drive,
+    float* __restrict__ grad_decay,
+    c10::Half* __restrict__ grad_initial_state) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            const __half2 decay2 = load_half2_pair(decay + r);
+            __half2 carry = load_half2_pair(grad_final_state + current_batch * rank_dim + r);
+            float2 decay_grad = make_float2(0.0f, 0.0f);
+            for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                latent_backward_chunk_half2<UseStateGrad, UseStatesPrev>(
+                    grad_states,
+                    grad_prior_states,
+                    states,
+                    prior_states,
+                    initial_state,
+                    decay2,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    carry,
+                    decay_grad,
+                    grad_drive);
+            }
+            store_half2_pair(grad_initial_state + current_batch * rank_dim + r, carry);
+            atomicAdd(grad_decay + r, decay_grad.x);
+            atomicAdd(grad_decay + r + 1, decay_grad.y);
+        }
+        __syncthreads();
+    }
+}
+
+template <bool StoreStates>
+__global__ __launch_bounds__(kThreads) void latent_scan_forward_kernel_bfloat162(
+    const c10::BFloat16* __restrict__ drive,
+    const c10::BFloat16* __restrict__ decay,
+    const c10::BFloat16* __restrict__ initial_state,
+    int seq_len,
+    int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
+    c10::BFloat16* __restrict__ prior_states,
+    c10::BFloat16* __restrict__ states,
+    c10::BFloat16* __restrict__ final_state) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            __nv_bfloat162 prev = load_bfloat162_pair(initial_state + current_batch * rank_dim + r);
+            const __nv_bfloat162 decay2 = load_bfloat162_pair(decay + r);
+            for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                prev = latent_forward_chunk_bfloat162<StoreStates>(
+                    drive,
+                    decay2,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    prev,
+                    prior_states,
+                    states);
+            }
+            store_bfloat162_pair(final_state + current_batch * rank_dim + r, prev);
+        }
+        __syncthreads();
+    }
+}
+
+template <bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_scan_backward_kernel_bfloat162(
+    const c10::BFloat16* __restrict__ grad_states,
+    const c10::BFloat16* __restrict__ grad_prior_states,
+    const c10::BFloat16* __restrict__ grad_final_state,
+    const c10::BFloat16* __restrict__ states,
+    const c10::BFloat16* __restrict__ prior_states,
+    const c10::BFloat16* __restrict__ decay,
+    const c10::BFloat16* __restrict__ initial_state,
+    int seq_len,
+    int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
+    c10::BFloat16* __restrict__ grad_drive,
+    float* __restrict__ grad_decay,
+    c10::BFloat16* __restrict__ grad_initial_state) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            const __nv_bfloat162 decay2 = load_bfloat162_pair(decay + r);
+            __nv_bfloat162 carry = load_bfloat162_pair(grad_final_state + current_batch * rank_dim + r);
+            float2 decay_grad = make_float2(0.0f, 0.0f);
+            for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                latent_backward_chunk_bfloat162<UseStateGrad, UseStatesPrev>(
+                    grad_states,
+                    grad_prior_states,
+                    states,
+                    prior_states,
+                    initial_state,
+                    decay2,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    carry,
+                    decay_grad,
+                    grad_drive);
+            }
+            store_bfloat162_pair(grad_initial_state + current_batch * rank_dim + r, carry);
+            atomicAdd(grad_decay + r, decay_grad.x);
+            atomicAdd(grad_decay + r + 1, decay_grad.y);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void latent_chunk_summary_persistent_kernel_half2(
+    const c10::Half* __restrict__ drive,
+    const c10::Half* __restrict__ decay,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    float* __restrict__ chunk_mul,
+    float* __restrict__ chunk_add) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const __half2 decay2 = load_half2_pair(decay + r);
+            __half2 add = __floats2half2_rn(0.0f, 0.0f);
+            __half2 mul = __floats2half2_rn(1.0f, 1.0f);
+            for (int dt = 0; dt < chunk_len; ++dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                add = __hadd2(__hmul2(decay2, add), load_half2_pair(drive + idx));
+                mul = __hmul2(mul, decay2);
+            }
+            const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
+            store_pair_from_float2(chunk_mul + summary_idx, __half22float2(mul));
+            store_pair_from_float2(chunk_add + summary_idx, __half22float2(add));
+        }
+        __syncthreads();
+    }
+}
+
+template <bool StoreStates>
+__global__ __launch_bounds__(kThreads) void latent_chunk_finalize_persistent_kernel_half2(
+    const c10::Half* __restrict__ drive,
+    const c10::Half* __restrict__ decay,
+    const float* __restrict__ chunk_prev,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    c10::Half* __restrict__ prior_states,
+    c10::Half* __restrict__ states) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const __half2 decay2 = load_half2_pair(decay + r);
+            const float2 prev_f = load_pair_as_float2(chunk_prev + ((b * num_chunks + chunk_id) * rank_dim + r));
+            __half2 prev = __floats2half2_rn(prev_f.x, prev_f.y);
+            prev = latent_forward_chunk_half2<StoreStates>(
+                drive,
+                decay2,
+                seq_len,
+                rank_dim,
+                b,
+                r,
+                chunk_start,
+                chunk_len,
+                prev,
+                prior_states,
+                states);
+        }
+        __syncthreads();
+    }
+}
+
+template <bool UseStateGrad>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_persistent_kernel_half2(
+    const c10::Half* __restrict__ grad_states,
+    const c10::Half* __restrict__ grad_prior_states,
+    const c10::Half* __restrict__ decay,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    float* __restrict__ chunk_mul,
+    float* __restrict__ chunk_add) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const __half2 decay2 = load_half2_pair(decay + r);
+            __half2 add = __floats2half2_rn(0.0f, 0.0f);
+            __half2 mul = __floats2half2_rn(1.0f, 1.0f);
+            for (int dt = chunk_len - 1; dt >= 0; --dt) {
+                const int t = chunk_start + dt;
+                const int idx = (b * seq_len + t) * rank_dim + r;
+                __half2 local_grad = load_half2_pair(grad_prior_states + idx);
+                if constexpr (UseStateGrad) {
+                    local_grad = __hadd2(local_grad, load_half2_pair(grad_states + idx));
+                }
+                add = __hmul2(decay2, __hadd2(local_grad, add));
+                mul = __hmul2(mul, decay2);
+            }
+            const int summary_idx = (b * num_chunks + chunk_id) * rank_dim + r;
+            store_pair_from_float2(chunk_mul + summary_idx, __half22float2(mul));
+            store_pair_from_float2(chunk_add + summary_idx, __half22float2(add));
+        }
+        __syncthreads();
+    }
+}
+
+template <bool UseStateGrad, bool UseStatesPrev>
+__global__ __launch_bounds__(kThreads) void latent_chunk_backward_finalize_persistent_kernel_half2(
+    const c10::Half* __restrict__ grad_states,
+    const c10::Half* __restrict__ grad_prior_states,
+    const c10::Half* __restrict__ states,
+    const c10::Half* __restrict__ prior_states,
+    const c10::Half* __restrict__ initial_state,
+    const c10::Half* __restrict__ decay,
+    const float* __restrict__ chunk_carry,
+    int seq_len,
+    int rank_dim,
+    int num_chunks,
+    int total_tasks,
+    int32_t* __restrict__ work_queue_counter,
+    c10::Half* __restrict__ grad_drive,
+    float* __restrict__ grad_decay,
+    c10::Half* __restrict__ grad_initial_state) {
+    const int rank_pair_tile = blockIdx.y;
+    const int r = (rank_pair_tile * blockDim.x + threadIdx.x) * 2;
+    const bool active = (r + 1) < rank_dim;
+    __shared__ int current_task;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_task = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_task >= total_tasks) {
+            break;
+        }
+        if (active) {
+            const int b = current_task / num_chunks;
+            const int chunk_id = current_task - (b * num_chunks);
+            const int chunk_start = chunk_id * kLatentChunkSize;
+            const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+            const __half2 decay2 = load_half2_pair(decay + r);
+            const float2 carry_f = load_pair_as_float2(chunk_carry + ((b * num_chunks + chunk_id) * rank_dim + r));
+            __half2 carry = __floats2half2_rn(carry_f.x, carry_f.y);
+            float2 decay_grad_local = make_float2(0.0f, 0.0f);
+            latent_backward_chunk_half2<UseStateGrad, UseStatesPrev>(
+                grad_states,
+                grad_prior_states,
+                states,
+                prior_states,
+                initial_state,
+                decay2,
+                seq_len,
+                rank_dim,
+                b,
+                r,
+                chunk_start,
+                chunk_len,
+                carry,
+                decay_grad_local,
+                grad_drive);
+            if (chunk_id == 0) {
+                store_half2_pair(grad_initial_state + b * rank_dim + r, carry);
+            }
+            atomicAdd(grad_decay + r, decay_grad_local.x);
+            atomicAdd(grad_decay + r + 1, decay_grad_local.y);
+        }
+        __syncthreads();
+    }
+}
+
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_scan_forward_kernel(
     const scalar_t* __restrict__ drive,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     const scalar_t* __restrict__ initial_state,
     int seq_len,
     int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
     scalar_t* __restrict__ prior_states,
     scalar_t* __restrict__ states,
     scalar_t* __restrict__ final_state) {
-    const int b = blockIdx.x;
-    const int r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rank_dim) {
-        return;
-    }
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
 
-    float prev = load_as_float(initial_state + b * rank_dim + r);
-    const float decay_r = decay[r];
-    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
-        const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-        prev = latent_forward_chunk<scalar_t, true>(
-            drive,
-            decay_r,
-            seq_len,
-            rank_dim,
-            b,
-            r,
-            chunk_start,
-            chunk_len,
-            prev,
-            prior_states,
-            states);
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            float prev = load_as_float(initial_state + current_batch * rank_dim + r);
+            const float decay_r = load_as_float(decay + r);
+            for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                prev = latent_forward_chunk<scalar_t, true>(
+                    drive,
+                    decay_r,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    prev,
+                    prior_states,
+                    states);
+            }
+            final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(prev);
+        }
+        __syncthreads();
     }
-    final_state[b * rank_dim + r] = store_from_float<scalar_t>(prev);
 }
 
-template <typename scalar_t>
-__global__ void latent_prior_scan_forward_kernel(
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_prior_scan_forward_kernel(
     const scalar_t* __restrict__ drive,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     const scalar_t* __restrict__ initial_state,
     int seq_len,
     int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
     scalar_t* __restrict__ prior_states,
     scalar_t* __restrict__ final_state) {
-    const int b = blockIdx.x;
-    const int r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rank_dim) {
-        return;
-    }
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
 
-    float prev = load_as_float(initial_state + b * rank_dim + r);
-    const float decay_r = decay[r];
-    for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
-        const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-        prev = latent_forward_chunk<scalar_t, false>(
-            drive,
-            decay_r,
-            seq_len,
-            rank_dim,
-            b,
-            r,
-            chunk_start,
-            chunk_len,
-            prev,
-            prior_states,
-            nullptr);
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            float prev = load_as_float(initial_state + current_batch * rank_dim + r);
+            const float decay_r = load_as_float(decay + r);
+            for (int chunk_start = 0; chunk_start < seq_len; chunk_start += kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                prev = latent_forward_chunk<scalar_t, false>(
+                    drive,
+                    decay_r,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    prev,
+                    prior_states,
+                    nullptr);
+            }
+            final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(prev);
+        }
+        __syncthreads();
     }
-    final_state[b * rank_dim + r] = store_from_float<scalar_t>(prev);
 }
 
-template <typename scalar_t>
-__global__ void latent_scan_backward_kernel(
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_scan_backward_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
     const scalar_t* __restrict__ grad_final_state,
     const scalar_t* __restrict__ states,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     const scalar_t* __restrict__ initial_state,
     int seq_len,
     int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
     scalar_t* __restrict__ grad_drive,
     float* __restrict__ grad_decay,
     scalar_t* __restrict__ grad_initial_state) {
-    const int b = blockIdx.x;
-    const int r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rank_dim) {
-        return;
-    }
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
 
-    const float decay_r = decay[r];
-    float carry = load_as_float(grad_final_state + b * rank_dim + r);
-    float decay_grad = 0.0f;
-    for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
-        const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-        latent_backward_chunk<scalar_t, true>(
-            grad_states,
-            grad_prior_states,
-            states,
-            nullptr,
-            initial_state,
-            decay_r,
-            seq_len,
-            rank_dim,
-            b,
-            r,
-            chunk_start,
-            chunk_len,
-            carry,
-            decay_grad,
-            grad_drive);
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            const float decay_r = load_as_float(decay + r);
+            float carry = load_as_float(grad_final_state + current_batch * rank_dim + r);
+            float decay_grad = 0.0f;
+            for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                latent_backward_chunk<scalar_t, true>(
+                    grad_states,
+                    grad_prior_states,
+                    states,
+                    nullptr,
+                    initial_state,
+                    decay_r,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    carry,
+                    decay_grad,
+                    grad_drive);
+            }
+            grad_initial_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(carry);
+            atomicAdd(grad_decay + r, decay_grad);
+        }
+        __syncthreads();
     }
-    grad_initial_state[b * rank_dim + r] = store_from_float<scalar_t>(carry);
-    atomicAdd(grad_decay + r, decay_grad);
 }
 
-template <typename scalar_t>
-__global__ void latent_prior_scan_backward_kernel(
+template <typename scalar_t, typename work_t>
+__global__ __launch_bounds__(kThreads) void latent_prior_scan_backward_kernel(
     const scalar_t* __restrict__ grad_prior_states,
     const scalar_t* __restrict__ grad_final_state,
     const scalar_t* __restrict__ prior_states,
-    const float* __restrict__ decay,
+    const work_t* __restrict__ decay,
     const scalar_t* __restrict__ initial_state,
     int seq_len,
     int rank_dim,
+    int total_batches,
+    int32_t* __restrict__ work_queue_counter,
     scalar_t* __restrict__ grad_drive,
     float* __restrict__ grad_decay,
     scalar_t* __restrict__ grad_initial_state) {
-    const int b = blockIdx.x;
-    const int r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rank_dim) {
-        return;
-    }
+    const int rank_tile = blockIdx.y;
+    const int r = rank_tile * blockDim.x + threadIdx.x;
+    const bool active = r < rank_dim;
 
-    const float decay_r = decay[r];
-    float carry = load_as_float(grad_final_state + b * rank_dim + r);
-    float decay_grad = 0.0f;
-    for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
-        const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
-        latent_backward_chunk<scalar_t, false>(
-            nullptr,
-            grad_prior_states,
-            nullptr,
-            prior_states,
-            initial_state,
-            decay_r,
-            seq_len,
-            rank_dim,
-            b,
-            r,
-            chunk_start,
-            chunk_len,
-            carry,
-            decay_grad,
-            grad_drive);
+    __shared__ int current_batch;
+    while (true) {
+        if (threadIdx.x == 0) {
+            current_batch = atomicAdd(work_queue_counter, 1);
+        }
+        __syncthreads();
+        if (current_batch >= total_batches) {
+            break;
+        }
+
+        if (active) {
+            const float decay_r = load_as_float(decay + r);
+            float carry = load_as_float(grad_final_state + current_batch * rank_dim + r);
+            float decay_grad = 0.0f;
+            for (int chunk_start = ((seq_len - 1) / kLatentChunkSize) * kLatentChunkSize; chunk_start >= 0; chunk_start -= kLatentChunkSize) {
+                const int chunk_len = min(kLatentChunkSize, seq_len - chunk_start);
+                latent_backward_chunk<scalar_t, false>(
+                    nullptr,
+                    grad_prior_states,
+                    nullptr,
+                    prior_states,
+                    initial_state,
+                    decay_r,
+                    seq_len,
+                    rank_dim,
+                    current_batch,
+                    r,
+                    chunk_start,
+                    chunk_len,
+                    carry,
+                    decay_grad,
+                    grad_drive);
+            }
+            grad_initial_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(carry);
+            atomicAdd(grad_decay + r, decay_grad);
+        }
+        __syncthreads();
     }
-    grad_initial_state[b * rank_dim + r] = store_from_float<scalar_t>(carry);
-    atomicAdd(grad_decay + r, decay_grad);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename work_t>
 void latent_prefix_scan_dispatch(
     const torch::Tensor& chunk_mul,
     const torch::Tensor& chunk_add,
@@ -921,35 +1976,57 @@ void latent_prefix_scan_dispatch(
     torch::Tensor& chunk_prev,
     torch::Tensor& final_state) {
     if (num_chunks <= kChunkScanThreads) {
-        const dim3 scan_grid(batch_size, rank_dim);
-        latent_chunk_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-            chunk_mul.data_ptr<float>(),
-            chunk_add.data_ptr<float>(),
+        const int worker_blocks = occupancy_persistent_worker_blocks(
+            latent_chunk_prefix_scan_kernel<scalar_t, work_t>,
+            chunk_mul.get_device(),
+            batch_size,
+            kChunkScanThreads);
+        auto work_queue_counter = make_device_work_queue_counter(chunk_mul);
+        const dim3 scan_grid(
+            static_cast<unsigned int>(worker_blocks),
+            static_cast<unsigned int>(rank_dim));
+        latent_chunk_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<work_t>(),
+            chunk_add.data_ptr<work_t>(),
             initial_state.data_ptr<scalar_t>(),
+            batch_size,
             num_chunks,
             rank_dim,
-            chunk_prev.data_ptr<float>(),
+            work_queue_counter.data_ptr<int32_t>(),
+            chunk_prev.data_ptr<work_t>(),
             final_state.data_ptr<scalar_t>());
         return;
     }
 
     const int num_groups = static_cast<int>((num_chunks + kChunkScanThreads - 1) / kChunkScanThreads);
-    auto summary_opts = chunk_mul.options().dtype(torch::kFloat32);
+    auto summary_opts = chunk_mul.options();
     auto group_mul = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     auto group_add = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     auto group_prev = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     auto group_final = torch::empty_like(initial_state);
     const dim3 block(kThreads);
-    const dim3 summary_grid(batch_size, num_groups, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    latent_group_summary_kernel<<<summary_grid, block, 0, stream>>>(
-        chunk_mul.data_ptr<float>(),
-        chunk_add.data_ptr<float>(),
+    const int rank_tiles = static_cast<int>((rank_dim + kThreads - 1) / kThreads);
+    const int summary_worker_blocks = occupancy_persistent_worker_blocks(
+        latent_group_summary_kernel<work_t>,
+        chunk_mul.get_device(),
+        batch_size * num_groups,
+        kThreads);
+    auto summary_queue_counter = make_device_work_queue_counter(chunk_mul);
+    const dim3 summary_grid(
+        static_cast<unsigned int>(summary_worker_blocks),
+        static_cast<unsigned int>(num_groups),
+        static_cast<unsigned int>(rank_tiles));
+    latent_group_summary_kernel<work_t><<<summary_grid, block, 0, stream>>>(
+        chunk_mul.data_ptr<work_t>(),
+        chunk_add.data_ptr<work_t>(),
+        batch_size,
         num_chunks,
         rank_dim,
         num_groups,
-        group_mul.data_ptr<float>(),
-        group_add.data_ptr<float>());
-    latent_prefix_scan_dispatch<scalar_t>(
+        summary_queue_counter.data_ptr<int32_t>(),
+        group_mul.data_ptr<work_t>(),
+        group_add.data_ptr<work_t>());
+    latent_prefix_scan_dispatch<scalar_t, work_t>(
         group_mul,
         group_add,
         initial_state,
@@ -959,19 +2036,30 @@ void latent_prefix_scan_dispatch(
         stream,
         group_prev,
         group_final);
-    const dim3 group_scan_grid(batch_size, num_groups, rank_dim);
-    latent_chunk_group_prefix_scan_kernel<<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
-        chunk_mul.data_ptr<float>(),
-        chunk_add.data_ptr<float>(),
-        group_prev.data_ptr<float>(),
+    const int group_scan_worker_blocks = occupancy_persistent_worker_blocks(
+        latent_chunk_group_prefix_scan_kernel<work_t>,
+        chunk_mul.get_device(),
+        batch_size * num_groups,
+        kChunkScanThreads);
+    auto group_scan_queue_counter = make_device_work_queue_counter(chunk_mul);
+    const dim3 group_scan_grid(
+        static_cast<unsigned int>(group_scan_worker_blocks),
+        static_cast<unsigned int>(num_groups),
+        static_cast<unsigned int>(rank_dim));
+    latent_chunk_group_prefix_scan_kernel<work_t><<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
+        chunk_mul.data_ptr<work_t>(),
+        chunk_add.data_ptr<work_t>(),
+        group_prev.data_ptr<work_t>(),
+        batch_size,
         num_chunks,
         rank_dim,
         num_groups,
-        chunk_prev.data_ptr<float>());
+        group_scan_queue_counter.data_ptr<int32_t>(),
+        chunk_prev.data_ptr<work_t>());
     final_state.copy_(group_final);
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename work_t>
 void latent_reverse_prefix_scan_dispatch(
     const torch::Tensor& chunk_mul,
     const torch::Tensor& chunk_add,
@@ -982,33 +2070,55 @@ void latent_reverse_prefix_scan_dispatch(
     cudaStream_t stream,
     torch::Tensor& chunk_carry) {
     if (num_chunks <= kChunkScanThreads) {
-        const dim3 scan_grid(batch_size, rank_dim);
-        latent_chunk_reverse_prefix_scan_kernel<scalar_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
-            chunk_mul.data_ptr<float>(),
-            chunk_add.data_ptr<float>(),
+        const int worker_blocks = occupancy_persistent_worker_blocks(
+            latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t>,
+            chunk_mul.get_device(),
+            batch_size,
+            kChunkScanThreads);
+        auto work_queue_counter = make_device_work_queue_counter(chunk_mul);
+        const dim3 scan_grid(
+            static_cast<unsigned int>(worker_blocks),
+            static_cast<unsigned int>(rank_dim));
+        latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<work_t>(),
+            chunk_add.data_ptr<work_t>(),
             grad_final_state.data_ptr<scalar_t>(),
+            batch_size,
             num_chunks,
             rank_dim,
-            chunk_carry.data_ptr<float>());
+            work_queue_counter.data_ptr<int32_t>(),
+            chunk_carry.data_ptr<work_t>());
         return;
     }
 
     const int num_groups = static_cast<int>((num_chunks + kChunkScanThreads - 1) / kChunkScanThreads);
-    auto summary_opts = chunk_mul.options().dtype(torch::kFloat32);
+    auto summary_opts = chunk_mul.options();
     auto group_mul = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     auto group_add = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     auto group_carry = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     const dim3 block(kThreads);
-    const dim3 summary_grid(batch_size, num_groups, static_cast<unsigned int>((rank_dim + kThreads - 1) / kThreads));
-    latent_group_summary_reverse_kernel<<<summary_grid, block, 0, stream>>>(
-        chunk_mul.data_ptr<float>(),
-        chunk_add.data_ptr<float>(),
+    const int rank_tiles = static_cast<int>((rank_dim + kThreads - 1) / kThreads);
+    const int summary_worker_blocks = occupancy_persistent_worker_blocks(
+        latent_group_summary_reverse_kernel<work_t>,
+        chunk_mul.get_device(),
+        batch_size * num_groups,
+        kThreads);
+    auto summary_queue_counter = make_device_work_queue_counter(chunk_mul);
+    const dim3 summary_grid(
+        static_cast<unsigned int>(summary_worker_blocks),
+        static_cast<unsigned int>(num_groups),
+        static_cast<unsigned int>(rank_tiles));
+    latent_group_summary_reverse_kernel<work_t><<<summary_grid, block, 0, stream>>>(
+        chunk_mul.data_ptr<work_t>(),
+        chunk_add.data_ptr<work_t>(),
+        batch_size,
         num_chunks,
         rank_dim,
         num_groups,
-        group_mul.data_ptr<float>(),
-        group_add.data_ptr<float>());
-    latent_reverse_prefix_scan_dispatch<scalar_t>(
+        summary_queue_counter.data_ptr<int32_t>(),
+        group_mul.data_ptr<work_t>(),
+        group_add.data_ptr<work_t>());
+    latent_reverse_prefix_scan_dispatch<scalar_t, work_t>(
         group_mul,
         group_add,
         grad_final_state,
@@ -1017,15 +2127,26 @@ void latent_reverse_prefix_scan_dispatch(
         rank_dim,
         stream,
         group_carry);
-    const dim3 group_scan_grid(batch_size, num_groups, rank_dim);
-    latent_chunk_group_reverse_prefix_scan_kernel<<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
-        chunk_mul.data_ptr<float>(),
-        chunk_add.data_ptr<float>(),
-        group_carry.data_ptr<float>(),
+    const int group_scan_worker_blocks = occupancy_persistent_worker_blocks(
+        latent_chunk_group_reverse_prefix_scan_kernel<work_t>,
+        chunk_mul.get_device(),
+        batch_size * num_groups,
+        kChunkScanThreads);
+    auto group_scan_queue_counter = make_device_work_queue_counter(chunk_mul);
+    const dim3 group_scan_grid(
+        static_cast<unsigned int>(group_scan_worker_blocks),
+        static_cast<unsigned int>(num_groups),
+        static_cast<unsigned int>(rank_dim));
+    latent_chunk_group_reverse_prefix_scan_kernel<work_t><<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
+        chunk_mul.data_ptr<work_t>(),
+        chunk_add.data_ptr<work_t>(),
+        group_carry.data_ptr<work_t>(),
+        batch_size,
         num_chunks,
         rank_dim,
         num_groups,
-        chunk_carry.data_ptr<float>());
+        group_scan_queue_counter.data_ptr<int32_t>(),
+        chunk_carry.data_ptr<work_t>());
 }
 
 }  // namespace
@@ -1046,54 +2167,170 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
         final_state.copy_(initial_state);
         return {states, prior_states, final_state};
     }
-    const int launch_threads = latent_launch_threads(rank_dim);
-    const dim3 block(static_cast<unsigned int>(launch_threads));
-    const dim3 rank_grid(batch_size, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int single_kernel_max_seq_len = latent_single_kernel_max_seq_len();
+    const bool allow_half2 = drive.scalar_type() == torch::kHalf && ((rank_dim & 1) == 0);
+    const bool allow_bfloat162 = drive.scalar_type() == torch::kBFloat16 && ((rank_dim & 1) == 0);
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_scan_forward_cuda", [&] {
-        if (seq_len <= single_kernel_max_seq_len) {
-            latent_scan_forward_kernel<scalar_t><<<rank_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                seq_len,
-                rank_dim,
-                prior_states.data_ptr<scalar_t>(),
-                states.data_ptr<scalar_t>(),
-                final_state.data_ptr<scalar_t>());
+        const bool use_half2 = allow_half2;
+        const bool use_bfloat162 = allow_bfloat162;
+        const bool use_vec2 = use_half2 || use_bfloat162;
+        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        const int launch_threads = latent_launch_threads(rank_items);
+        const dim3 block(static_cast<unsigned int>(launch_threads));
+        const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
+        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_forward_kernel_half2<true>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads)
+                : use_bfloat162
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_forward_kernel_bfloat162<true>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_scan_forward_kernel<scalar_t, scalar_t>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads);
+            const dim3 rank_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            auto work_queue_counter = make_device_work_queue_counter(drive);
+            if (use_half2) {
+                latent_scan_forward_kernel_half2<true><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<c10::Half*>(states.data_ptr<scalar_t>()),
+                    reinterpret_cast<c10::Half*>(final_state.data_ptr<scalar_t>()));
+            } else if (use_bfloat162) {
+                latent_scan_forward_kernel_bfloat162<true><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::BFloat16*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::BFloat16*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<c10::BFloat16*>(states.data_ptr<scalar_t>()),
+                    reinterpret_cast<c10::BFloat16*>(final_state.data_ptr<scalar_t>()));
+            } else {
+                latent_scan_forward_kernel<scalar_t, scalar_t><<<rank_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>(),
+                    final_state.data_ptr<scalar_t>());
+            }
         } else {
+            const auto workspace_dtype = use_half2 ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
-                LatentWorkspaceTag::Forward, drive, batch_size, num_chunks, rank_dim);
-            latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>());
-            latent_prefix_scan_dispatch<scalar_t>(
-                chunk_mul,
-                chunk_add,
-                initial_state,
-                batch_size,
-                num_chunks,
-                rank_dim,
-                stream,
-                chunk_prev,
-                final_state);
-            latent_chunk_finalize_kernel<scalar_t, true><<<finalize_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_prev.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                prior_states.data_ptr<scalar_t>(),
-                states.data_ptr<scalar_t>());
+                LatentWorkspaceTag::Forward, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const int total_chunk_tasks = batch_size * num_chunks;
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel_half2,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads);
+            auto work_queue_counter = make_device_work_queue_counter(drive);
+            const dim3 persistent_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            if (use_half2) {
+                latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else {
+                latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<scalar_t>(),
+                    chunk_add.data_ptr<scalar_t>());
+            }
+            if (use_half2) {
+                latent_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
+            } else {
+                latent_prefix_scan_dispatch<scalar_t, scalar_t>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
+            }
+            if (!use_half2) {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_prev.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>());
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel_half2<true><<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    chunk_prev.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<c10::Half*>(states.data_ptr<scalar_t>()));
+            }
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1115,53 +2352,169 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
         final_state.copy_(initial_state);
         return {prior_states, final_state};
     }
-    const int launch_threads = latent_launch_threads(rank_dim);
-    const dim3 block(static_cast<unsigned int>(launch_threads));
-    const dim3 rank_grid(batch_size, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int single_kernel_max_seq_len = latent_single_kernel_max_seq_len();
+    const bool allow_half2 = drive.scalar_type() == torch::kHalf && ((rank_dim & 1) == 0);
+    const bool allow_bfloat162 = drive.scalar_type() == torch::kBFloat16 && ((rank_dim & 1) == 0);
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_prior_scan_forward_cuda", [&] {
-        if (seq_len <= single_kernel_max_seq_len) {
-            latent_prior_scan_forward_kernel<scalar_t><<<rank_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                seq_len,
-                rank_dim,
-                prior_states.data_ptr<scalar_t>(),
-                final_state.data_ptr<scalar_t>());
+        const bool use_half2 = allow_half2;
+        const bool use_bfloat162 = allow_bfloat162;
+        const bool use_vec2 = use_half2 || use_bfloat162;
+        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        const int launch_threads = latent_launch_threads(rank_items);
+        const dim3 block(static_cast<unsigned int>(launch_threads));
+        const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
+        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_forward_kernel_half2<false>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads)
+                : use_bfloat162
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_forward_kernel_bfloat162<false>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_prior_scan_forward_kernel<scalar_t, scalar_t>,
+                    drive.get_device(),
+                    batch_size,
+                    launch_threads);
+            const dim3 rank_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            auto work_queue_counter = make_device_work_queue_counter(drive);
+            if (use_half2) {
+                latent_scan_forward_kernel_half2<false><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<c10::Half*>(final_state.data_ptr<scalar_t>()));
+            } else if (use_bfloat162) {
+                latent_scan_forward_kernel_bfloat162<false><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::BFloat16*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::BFloat16*>(prior_states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<c10::BFloat16*>(final_state.data_ptr<scalar_t>()));
+            } else {
+                latent_prior_scan_forward_kernel<scalar_t, scalar_t><<<rank_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    final_state.data_ptr<scalar_t>());
+            }
         } else {
+            const auto workspace_dtype = use_half2 ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
-                LatentWorkspaceTag::ForwardPrior, drive, batch_size, num_chunks, rank_dim);
-            latent_chunk_summary_kernel<scalar_t><<<summary_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>());
-            latent_prefix_scan_dispatch<scalar_t>(
-                chunk_mul,
-                chunk_add,
-                initial_state,
-                batch_size,
-                num_chunks,
-                rank_dim,
-                stream,
-                chunk_prev,
-                final_state);
-            latent_chunk_finalize_kernel<scalar_t, false><<<finalize_grid, block, 0, stream>>>(
-                drive.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_prev.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                prior_states.data_ptr<scalar_t>(),
-                nullptr);
+                LatentWorkspaceTag::ForwardPrior, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const int total_chunk_tasks = batch_size * num_chunks;
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel_half2,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads);
+            auto work_queue_counter = make_device_work_queue_counter(drive);
+            const dim3 persistent_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            if (use_half2) {
+                latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else {
+                latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<scalar_t>(),
+                    chunk_add.data_ptr<scalar_t>());
+            }
+            if (use_half2) {
+                latent_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
+            } else {
+                latent_prefix_scan_dispatch<scalar_t, scalar_t>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
+            }
+            if (!use_half2) {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_prev.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    nullptr);
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel_half2<false><<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    chunk_prev.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    nullptr);
+            }
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1180,69 +2533,198 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
     const auto seq_len = static_cast<int>(states.size(1));
     const auto rank_dim = static_cast<int>(states.size(2));
     auto grad_drive = torch::empty_like(states);
-    auto grad_decay = torch::zeros_like(decay);
+    auto grad_decay = torch::zeros(decay.sizes(), decay.options().dtype(torch::kFloat32));
     auto grad_initial_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
-    const int launch_threads = latent_launch_threads(rank_dim);
-    const dim3 block(static_cast<unsigned int>(launch_threads));
     const int num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
-    const dim3 rank_grid(batch_size, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int single_kernel_max_seq_len = latent_single_kernel_max_seq_len();
+    const bool allow_half2 = states.scalar_type() == torch::kHalf && ((rank_dim & 1) == 0);
+    const bool allow_bfloat162 = states.scalar_type() == torch::kBFloat16 && ((rank_dim & 1) == 0);
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, states.scalar_type(), "latent_scan_backward_cuda", [&] {
-        if (seq_len <= single_kernel_max_seq_len) {
-            latent_scan_backward_kernel<scalar_t><<<rank_grid, block, 0, stream>>>(
-                grad_states.data_ptr<scalar_t>(),
-                grad_prior_states.data_ptr<scalar_t>(),
-                grad_final_state.data_ptr<scalar_t>(),
-                states.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                seq_len,
-                rank_dim,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
+        const bool use_half2 = allow_half2;
+        const bool use_bfloat162 = allow_bfloat162;
+        const bool use_vec2 = use_half2 || use_bfloat162;
+        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        const int launch_threads = latent_launch_threads(rank_items);
+        const dim3 block(static_cast<unsigned int>(launch_threads));
+        const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
+        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_backward_kernel_half2<true, true>,
+                    states.get_device(),
+                    batch_size,
+                    launch_threads)
+                : use_bfloat162
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_backward_kernel_bfloat162<true, true>,
+                    states.get_device(),
+                    batch_size,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_scan_backward_kernel<scalar_t, scalar_t>,
+                    states.get_device(),
+                    batch_size,
+                    launch_threads);
+            const dim3 rank_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            auto work_queue_counter = make_device_work_queue_counter(states);
+            if (use_half2) {
+                latent_scan_backward_kernel_half2<true, true><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(grad_final_state.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else if (use_bfloat162) {
+                latent_scan_backward_kernel_bfloat162<true, true><<<rank_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::BFloat16*>(grad_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(grad_final_state.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::BFloat16*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::BFloat16*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::BFloat16*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else {
+                latent_scan_backward_kernel<scalar_t, scalar_t><<<rank_grid, block, 0, stream>>>(
+                    grad_states.data_ptr<scalar_t>(),
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    grad_final_state.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
+            }
         } else {
+            const auto workspace_dtype = use_half2 ? torch::kFloat32 : states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
-                LatentWorkspaceTag::Backward, states, batch_size, num_chunks, rank_dim);
-            latent_chunk_backward_summary_kernel<scalar_t, true><<<summary_grid, block, 0, stream>>>(
-                grad_states.data_ptr<scalar_t>(),
-                grad_prior_states.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>());
-            latent_reverse_prefix_scan_dispatch<scalar_t>(
-                chunk_mul,
-                chunk_add,
-                grad_final_state,
-                batch_size,
-                num_chunks,
-                rank_dim,
-                stream,
-                chunk_carry);
-            latent_chunk_backward_finalize_kernel<scalar_t, true, true><<<finalize_grid, block, 0, stream>>>(
-                grad_states.data_ptr<scalar_t>(),
-                grad_prior_states.data_ptr<scalar_t>(),
-                states.data_ptr<scalar_t>(),
-                nullptr,
-                initial_state.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_carry.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
+                LatentWorkspaceTag::Backward, states, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const int total_chunk_tasks = batch_size * num_chunks;
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel_half2<true>,
+                    states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true>,
+                    states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads);
+            auto work_queue_counter = make_device_work_queue_counter(states);
+            const dim3 persistent_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            if (use_half2) {
+                latent_chunk_backward_summary_persistent_kernel_half2<true><<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else {
+                latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
+                    grad_states.data_ptr<scalar_t>(),
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<scalar_t>(),
+                    chunk_add.data_ptr<scalar_t>());
+            }
+            if (use_half2) {
+                latent_reverse_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
+            } else {
+                latent_reverse_prefix_scan_dispatch<scalar_t, scalar_t>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
+            }
+            if (!use_half2) {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, true, true><<<persistent_grid, block, 0, stream>>>(
+                    grad_states.data_ptr<scalar_t>(),
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>(),
+                    nullptr,
+                    initial_state.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_carry.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel_half2<true, true><<<persistent_grid, block, 0, stream>>>(
+                    reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    chunk_carry.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            }
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1260,70 +2742,474 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
     const auto seq_len = static_cast<int>(prior_states.size(1));
     const auto rank_dim = static_cast<int>(prior_states.size(2));
     auto grad_drive = torch::empty_like(prior_states);
-    auto grad_decay = torch::zeros_like(decay);
+    auto grad_decay = torch::zeros(decay.sizes(), decay.options().dtype(torch::kFloat32));
     auto grad_initial_state = torch::empty_like(initial_state);
     if (batch_size == 0 || rank_dim == 0 || seq_len == 0) {
         grad_initial_state.copy_(grad_final_state);
         return {grad_drive, grad_decay, grad_initial_state};
     }
-    const int launch_threads = latent_launch_threads(rank_dim);
-    const dim3 block(static_cast<unsigned int>(launch_threads));
     const int num_chunks = static_cast<int>((seq_len + kLatentChunkSize - 1) / kLatentChunkSize);
-    const dim3 rank_grid(batch_size, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 summary_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
-    const dim3 finalize_grid(batch_size, num_chunks, static_cast<unsigned int>((rank_dim + launch_threads - 1) / launch_threads));
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int single_kernel_max_seq_len = latent_single_kernel_max_seq_len();
+    const bool allow_half2 = prior_states.scalar_type() == torch::kHalf && ((rank_dim & 1) == 0);
+    const bool allow_bfloat162 = prior_states.scalar_type() == torch::kBFloat16 && ((rank_dim & 1) == 0);
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, prior_states.scalar_type(), "latent_prior_scan_backward_cuda", [&] {
-        if (seq_len <= single_kernel_max_seq_len) {
-            latent_prior_scan_backward_kernel<scalar_t><<<rank_grid, block, 0, stream>>>(
-                grad_prior_states.data_ptr<scalar_t>(),
-                grad_final_state.data_ptr<scalar_t>(),
-                prior_states.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                initial_state.data_ptr<scalar_t>(),
-                seq_len,
-                rank_dim,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
+        const bool use_half2 = allow_half2;
+        const bool use_bfloat162 = allow_bfloat162;
+        const bool use_vec2 = use_half2 || use_bfloat162;
+        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        const int launch_threads = latent_launch_threads(rank_items);
+        const dim3 block(static_cast<unsigned int>(launch_threads));
+        const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
+        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_backward_kernel_half2<false, false>,
+                    prior_states.get_device(),
+                    batch_size,
+                    launch_threads)
+                : use_bfloat162
+                ? occupancy_persistent_worker_blocks(
+                    latent_scan_backward_kernel_bfloat162<false, false>,
+                    prior_states.get_device(),
+                    batch_size,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_prior_scan_backward_kernel<scalar_t, scalar_t>,
+                    prior_states.get_device(),
+                    batch_size,
+                    launch_threads);
+            const dim3 rank_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            auto work_queue_counter = make_device_work_queue_counter(prior_states);
+            if (use_half2) {
+                latent_scan_backward_kernel_half2<false, false><<<rank_grid, block, 0, stream>>>(
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(grad_final_state.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else if (use_bfloat162) {
+                latent_scan_backward_kernel_bfloat162<false, false><<<rank_grid, block, 0, stream>>>(
+                    nullptr,
+                    reinterpret_cast<const c10::BFloat16*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(grad_final_state.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::BFloat16*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(decay.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::BFloat16*>(initial_state.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::BFloat16*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::BFloat16*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else {
+                latent_prior_scan_backward_kernel<scalar_t, scalar_t><<<rank_grid, block, 0, stream>>>(
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    grad_final_state.data_ptr<scalar_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    batch_size,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
+            }
         } else {
+            const auto workspace_dtype = use_half2 ? torch::kFloat32 : prior_states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
-                LatentWorkspaceTag::BackwardPrior, prior_states, batch_size, num_chunks, rank_dim);
-            latent_chunk_backward_summary_kernel<scalar_t, false><<<summary_grid, block, 0, stream>>>(
-                nullptr,
-                grad_prior_states.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                chunk_mul.data_ptr<float>(),
-                chunk_add.data_ptr<float>());
-            latent_reverse_prefix_scan_dispatch<scalar_t>(
-                chunk_mul,
-                chunk_add,
-                grad_final_state,
-                batch_size,
-                num_chunks,
-                rank_dim,
-                stream,
-                chunk_carry);
-            latent_chunk_backward_finalize_kernel<scalar_t, false, false><<<finalize_grid, block, 0, stream>>>(
-                nullptr,
-                grad_prior_states.data_ptr<scalar_t>(),
-                nullptr,
-                prior_states.data_ptr<scalar_t>(),
-                initial_state.data_ptr<scalar_t>(),
-                decay.data_ptr<float>(),
-                chunk_carry.data_ptr<float>(),
-                seq_len,
-                rank_dim,
-                num_chunks,
-                grad_drive.data_ptr<scalar_t>(),
-                grad_decay.data_ptr<float>(),
-                grad_initial_state.data_ptr<scalar_t>());
+                LatentWorkspaceTag::BackwardPrior, prior_states, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const int total_chunk_tasks = batch_size * num_chunks;
+            const int worker_blocks = use_half2
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel_half2<false>,
+                    prior_states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false>,
+                    prior_states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads);
+            auto work_queue_counter = make_device_work_queue_counter(prior_states);
+            const dim3 persistent_grid(
+                static_cast<unsigned int>(worker_blocks),
+                static_cast<unsigned int>(rank_tiles));
+            if (use_half2) {
+                latent_chunk_backward_summary_persistent_kernel_half2<false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else {
+                latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<scalar_t>(),
+                    chunk_add.data_ptr<scalar_t>());
+            }
+            if (use_half2) {
+                latent_reverse_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
+            } else {
+                latent_reverse_prefix_scan_dispatch<scalar_t, scalar_t>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
+            }
+            if (!use_half2) {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, false, false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    nullptr,
+                    prior_states.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_carry.data_ptr<scalar_t>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel_half2<false, false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                    nullptr,
+                    reinterpret_cast<const c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(initial_state.data_ptr<scalar_t>()),
+                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    chunk_carry.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
+                    grad_decay.data_ptr<float>(),
+                    reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            }
         }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {grad_drive, grad_decay, grad_initial_state};
+}
+
+template <typename scalar_t>
+__global__ __launch_bounds__(kThreads) void latent_replace_forward_kernel(
+    const scalar_t* __restrict__ local_logits,
+    const scalar_t* __restrict__ prior_logits,
+    const scalar_t* __restrict__ transition_context,
+    const scalar_t* __restrict__ token_gate,
+    const scalar_t* __restrict__ pred_scale,
+    int64_t rows,
+    int64_t num_states,
+    scalar_t* __restrict__ beliefs,
+    scalar_t* __restrict__ prior_log_beliefs) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t base = row * num_states;
+    __shared__ float shared[kThreads];
+    const float gate = load_as_float(token_gate + row);
+    const float scale = fmaxf(load_as_float(pred_scale + row), 1.0e-4f);
+
+    float thread_max_filtered = -CUDART_INF_F;
+    float thread_max_prior = -CUDART_INF_F;
+    for (int64_t state = tid; state < num_states; state += blockDim.x) {
+        const float raw_unscaled = load_as_float(prior_logits + base + state) + load_as_float(transition_context + base + state);
+        const float raw = raw_unscaled / scale;
+        const float filtered = load_as_float(local_logits + base + state) + gate * raw;
+        thread_max_filtered = fmaxf(thread_max_filtered, filtered);
+        thread_max_prior = fmaxf(thread_max_prior, raw);
+    }
+    shared[tid] = thread_max_filtered;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + offset]);
+        }
+        __syncthreads();
+    }
+    const float row_max_filtered = shared[0];
+    shared[tid] = thread_max_prior;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + offset]);
+        }
+        __syncthreads();
+    }
+    const float row_max_prior = shared[0];
+
+    float thread_sum_filtered = 0.0f;
+    float thread_sum_prior = 0.0f;
+    for (int64_t state = tid; state < num_states; state += blockDim.x) {
+        const float raw_unscaled = load_as_float(prior_logits + base + state) + load_as_float(transition_context + base + state);
+        const float raw = raw_unscaled / scale;
+        const float filtered = load_as_float(local_logits + base + state) + gate * raw;
+        thread_sum_filtered += expf(filtered - row_max_filtered);
+        thread_sum_prior += expf(raw - row_max_prior);
+    }
+    shared[tid] = thread_sum_filtered;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    const float row_logsum_filtered = row_max_filtered + logf(fmaxf(shared[0], 1.0e-20f));
+    shared[tid] = thread_sum_prior;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    const float row_logsum_prior = row_max_prior + logf(fmaxf(shared[0], 1.0e-20f));
+
+    for (int64_t state = tid; state < num_states; state += blockDim.x) {
+        const float raw_unscaled = load_as_float(prior_logits + base + state) + load_as_float(transition_context + base + state);
+        const float raw = raw_unscaled / scale;
+        const float filtered = load_as_float(local_logits + base + state) + gate * raw;
+        beliefs[base + state] = store_from_float<scalar_t>(filtered - row_logsum_filtered);
+        prior_log_beliefs[base + state] = store_from_float<scalar_t>(raw - row_logsum_prior);
+    }
+}
+
+template <typename scalar_t>
+__global__ __launch_bounds__(kThreads) void latent_replace_backward_kernel(
+    const scalar_t* __restrict__ grad_beliefs,
+    const scalar_t* __restrict__ grad_prior_log_beliefs,
+    const scalar_t* __restrict__ prior_logits,
+    const scalar_t* __restrict__ transition_context,
+    const scalar_t* __restrict__ token_gate,
+    const scalar_t* __restrict__ pred_scale,
+    const scalar_t* __restrict__ beliefs,
+    const scalar_t* __restrict__ prior_log_beliefs,
+    int64_t rows,
+    int64_t num_states,
+    scalar_t* __restrict__ grad_local_logits,
+    scalar_t* __restrict__ grad_prior_logits,
+    scalar_t* __restrict__ grad_transition_context,
+    scalar_t* __restrict__ grad_token_gate,
+    scalar_t* __restrict__ grad_pred_scale) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t base = row * num_states;
+    __shared__ float shared[kThreads];
+    const float gate = load_as_float(token_gate + row);
+    const float scale = fmaxf(load_as_float(pred_scale + row), 1.0e-4f);
+    const float inv_scale = 1.0f / scale;
+    const float inv_scale_sq = inv_scale * inv_scale;
+
+    float thread_sum_grad_beliefs = 0.0f;
+    float thread_sum_grad_prior = 0.0f;
+    for (int64_t state = tid; state < num_states; state += blockDim.x) {
+        thread_sum_grad_beliefs += load_as_float(grad_beliefs + base + state);
+        thread_sum_grad_prior += load_as_float(grad_prior_log_beliefs + base + state);
+    }
+    shared[tid] = thread_sum_grad_beliefs;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    const float row_sum_grad_beliefs = shared[0];
+    shared[tid] = thread_sum_grad_prior;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    const float row_sum_grad_prior = shared[0];
+
+    float thread_grad_gate = 0.0f;
+    float thread_grad_scale = 0.0f;
+    for (int64_t state = tid; state < num_states; state += blockDim.x) {
+        const float belief_log = load_as_float(beliefs + base + state);
+        const float prior_log = load_as_float(prior_log_beliefs + base + state);
+        const float grad_belief = load_as_float(grad_beliefs + base + state);
+        const float grad_prior_log = load_as_float(grad_prior_log_beliefs + base + state);
+        const float raw_unscaled = load_as_float(prior_logits + base + state) + load_as_float(transition_context + base + state);
+        const float raw = raw_unscaled * inv_scale;
+        const float grad_filtered = grad_belief - expf(belief_log) * row_sum_grad_beliefs;
+        const float grad_prior_row = grad_prior_log - expf(prior_log) * row_sum_grad_prior;
+        const float grad_raw = gate * grad_filtered + grad_prior_row;
+        const float grad_unscaled = grad_raw * inv_scale;
+        grad_local_logits[base + state] = store_from_float<scalar_t>(grad_filtered);
+        grad_prior_logits[base + state] = store_from_float<scalar_t>(grad_unscaled);
+        grad_transition_context[base + state] = store_from_float<scalar_t>(grad_unscaled);
+        thread_grad_gate += grad_filtered * raw;
+        thread_grad_scale += -grad_raw * raw_unscaled * inv_scale_sq;
+    }
+    shared[tid] = thread_grad_gate;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        grad_token_gate[row] = store_from_float<scalar_t>(shared[0]);
+    }
+    shared[tid] = thread_grad_scale;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        grad_pred_scale[row] = store_from_float<scalar_t>(shared[0]);
+    }
+}
+
+std::vector<torch::Tensor> causal_machine_latent_replace_forward_cuda(
+    torch::Tensor local_logits,
+    torch::Tensor prior_logits,
+    torch::Tensor transition_context,
+    torch::Tensor token_gate,
+    torch::Tensor pred_scale) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(local_logits));
+    const int64_t batch_size = local_logits.size(0);
+    const int64_t seq_len = local_logits.size(1);
+    const int64_t num_states = local_logits.size(2);
+    auto beliefs = torch::empty_like(local_logits);
+    auto prior_log_beliefs = torch::empty_like(local_logits);
+    if (batch_size == 0 || seq_len == 0 || num_states == 0) {
+        return {beliefs, prior_log_beliefs};
+    }
+    const int64_t rows = batch_size * seq_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const dim3 grid(static_cast<unsigned int>(rows));
+    const dim3 block(static_cast<unsigned int>(kThreads));
+    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, local_logits.scalar_type(), "latent_replace_forward_cuda", [&] {
+        latent_replace_forward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            local_logits.data_ptr<scalar_t>(),
+            prior_logits.data_ptr<scalar_t>(),
+            transition_context.data_ptr<scalar_t>(),
+            token_gate.data_ptr<scalar_t>(),
+            pred_scale.data_ptr<scalar_t>(),
+            rows,
+            num_states,
+            beliefs.data_ptr<scalar_t>(),
+            prior_log_beliefs.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {beliefs, prior_log_beliefs};
+}
+
+std::vector<torch::Tensor> causal_machine_latent_replace_backward_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_prior_log_beliefs,
+    torch::Tensor prior_logits,
+    torch::Tensor transition_context,
+    torch::Tensor token_gate,
+    torch::Tensor pred_scale,
+    torch::Tensor beliefs,
+    torch::Tensor prior_log_beliefs) {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(beliefs));
+    const int64_t batch_size = beliefs.size(0);
+    const int64_t seq_len = beliefs.size(1);
+    const int64_t num_states = beliefs.size(2);
+    auto grad_local_logits = torch::empty_like(beliefs);
+    auto grad_prior_logits = torch::empty_like(beliefs);
+    auto grad_transition_context = torch::empty_like(beliefs);
+    auto grad_token_gate = torch::empty_like(token_gate);
+    auto grad_pred_scale = torch::empty_like(pred_scale);
+    if (batch_size == 0 || seq_len == 0 || num_states == 0) {
+        return {
+            grad_local_logits,
+            grad_prior_logits,
+            grad_transition_context,
+            grad_token_gate,
+            grad_pred_scale};
+    }
+    const int64_t rows = batch_size * seq_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const dim3 grid(static_cast<unsigned int>(rows));
+    const dim3 block(static_cast<unsigned int>(kThreads));
+    AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, beliefs.scalar_type(), "latent_replace_backward_cuda", [&] {
+        latent_replace_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            grad_beliefs.data_ptr<scalar_t>(),
+            grad_prior_log_beliefs.data_ptr<scalar_t>(),
+            prior_logits.data_ptr<scalar_t>(),
+            transition_context.data_ptr<scalar_t>(),
+            token_gate.data_ptr<scalar_t>(),
+            pred_scale.data_ptr<scalar_t>(),
+            beliefs.data_ptr<scalar_t>(),
+            prior_log_beliefs.data_ptr<scalar_t>(),
+            rows,
+            num_states,
+            grad_local_logits.data_ptr<scalar_t>(),
+            grad_prior_logits.data_ptr<scalar_t>(),
+            grad_transition_context.data_ptr<scalar_t>(),
+            grad_token_gate.data_ptr<scalar_t>(),
+            grad_pred_scale.data_ptr<scalar_t>());
+    });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {
+        grad_local_logits,
+        grad_prior_logits,
+        grad_transition_context,
+        grad_token_gate,
+        grad_pred_scale};
 }

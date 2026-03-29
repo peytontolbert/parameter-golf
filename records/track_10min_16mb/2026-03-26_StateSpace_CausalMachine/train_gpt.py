@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import functools
 import glob
+import importlib.util
 import io
 import json
 import math
@@ -16,13 +17,15 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zlib
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import sentencepiece as spm
@@ -77,7 +80,17 @@ DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA = 0.95
 DEFAULT_VOCAB_SIZE = 1024
 USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_SCAN", "1")))
 USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN", "1")))
+USE_MUON_CUDA = bool(int(os.environ.get("USE_MUON_CUDA", "1")))
+PROFILE_MUON_STEP = bool(int(os.environ.get("PROFILE_MUON_STEP", "0")))
+MUON_CUDA_BUCKET_POLICY = os.environ.get("MUON_CUDA_BUCKET_POLICY", "auto").strip().lower()
+# Historical env name retained for compatibility. This gates the prepacked
+# transition-table fast path, which now runs dedicated int8 / FP8 CUDA kernels
+# instead of dequantizing back to the float path.
 USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT = bool(int(os.environ.get("USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT", "1")))
+
+_PACKED_TRANSITION_INT8 = 0
+_PACKED_TRANSITION_FP8_E4M3 = 1
+_PACKED_TRANSITION_FP8_E5M2 = 2
 
 BOS_ID = -1
 
@@ -85,6 +98,65 @@ _CAUSAL_MACHINE_SCAN_CUDA = None
 _CAUSAL_MACHINE_SCAN_CUDA_ERROR: Exception | None = None
 _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
 _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR: Exception | None = None
+_MUON_CUDA = None
+_MUON_CUDA_ERROR: Exception | None = None
+
+
+def _parse_cuda_arch_list(raw: str) -> list[str]:
+    archs: list[str] = []
+    for item in raw.replace(";", ",").split(","):
+        token = item.strip().lower().replace("sm_", "").replace(".", "")
+        if not token:
+            continue
+        if token.endswith("a"):
+            if not token[:-1].isdigit():
+                continue
+        elif not token.isdigit():
+            continue
+        archs.append(token)
+    return archs
+
+
+@functools.lru_cache(maxsize=1)
+def _causal_machine_cuda_arch_flags() -> tuple[str, ...]:
+    raw = os.environ.get("CAUSAL_MACHINE_CUDA_ARCHS", "").strip()
+    archs = _parse_cuda_arch_list(raw)
+    if not archs and torch.cuda.is_available():
+        try:
+            major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+            archs = [f"{major}{minor}"]
+        except Exception:
+            archs = []
+    if not raw:
+        cuda_version = str(getattr(torch.version, "cuda", "") or "")
+        version_tokens = cuda_version.split(".")
+        try:
+            cuda_major = int(version_tokens[0]) if version_tokens else 0
+            cuda_minor = int(version_tokens[1]) if len(version_tokens) > 1 else 0
+        except ValueError:
+            cuda_major = 0
+            cuda_minor = 0
+        if (cuda_major, cuda_minor) >= (12, 0):
+            if "90" not in archs:
+                archs.append("90")
+        if (cuda_major, cuda_minor) >= (12, 3):
+            if "90a" not in archs:
+                archs.append("90a")
+    flags: list[str] = []
+    for arch in archs:
+        if arch.endswith("a"):
+            base_arch = arch[:-1]
+            if base_arch.isdigit():
+                flags.extend([
+                    f"-gencode=arch=compute_{base_arch},code=compute_{base_arch}",
+                    f"-gencode=arch=compute_{arch},code=sm_{arch}",
+                ])
+            continue
+        flags.extend([
+            f"-gencode=arch=compute_{arch},code=compute_{arch}",
+            f"-gencode=arch=compute_{arch},code=sm_{arch}",
+        ])
+    return tuple(flags)
 
 
 def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
@@ -95,9 +167,81 @@ def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
             str(source_dir / "causal_machine_scan_kernel.cu"),
         ],
         extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17", *_causal_machine_cuda_arch_flags()],
         build_directory=str(build_dir),
         verbose=False,
+    )
+
+
+def _load_existing_cuda_extension_module(
+    module_name: str,
+    build_dir: Path,
+    source_paths: Sequence[Path],
+):
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+    module_path = build_dir / f"{module_name}.so"
+    if not module_path.exists():
+        return None
+    try:
+        module_mtime = module_path.stat().st_mtime
+        if any(path.exists() and path.stat().st_mtime > module_mtime for path in source_paths):
+            return None
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        sys.modules.pop(module_name, None)
+        return None
+
+
+def _stale_prebuilt_cuda_extension_sources(module_path: Path, source_paths: Sequence[Path]) -> tuple[Path, ...]:
+    if not module_path.exists():
+        return ()
+    try:
+        module_mtime = module_path.stat().st_mtime
+    except Exception:
+        return ()
+    stale = [
+        path
+        for path in source_paths
+        if path.exists() and path.stat().st_mtime > module_mtime
+    ]
+    return tuple(stale)
+
+
+def _load_prebuilt_cuda_extension_or_none(
+    module_name: str,
+    display_name: str,
+    build_dir: Path,
+    source_paths: Sequence[Path],
+):
+    existing = _load_existing_cuda_extension_module(module_name, build_dir, source_paths)
+    if existing is not None:
+        return existing
+    if not _require_prebuilt_cuda_extensions():
+        return None
+    module_path = build_dir / f"{module_name}.so"
+    stale_sources = _stale_prebuilt_cuda_extension_sources(module_path, source_paths)
+    if not module_path.exists():
+        raise RuntimeError(
+            f"{display_name} requires a prebuilt CUDA extension in competition mode; "
+            f"missing {module_path}. Prebuild it before starting the timed run."
+        )
+    if stale_sources:
+        stale_names = ", ".join(path.name for path in stale_sources)
+        raise RuntimeError(
+            f"{display_name} requires an up-to-date prebuilt CUDA extension in competition mode; "
+            f"{module_path} is older than: {stale_names}. Rebuild it before starting the timed run."
+        )
+    raise RuntimeError(
+        f"{display_name} requires a loadable prebuilt CUDA extension in competition mode; "
+        f"failed to import {module_path}. Rebuild it before starting the timed run."
     )
 
 
@@ -109,7 +253,22 @@ def _load_causal_machine_latent_scan_cuda_extension(source_dir: Path, build_dir:
             str(source_dir / "causal_machine_latent_scan_kernel.cu"),
         ],
         extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17", *_causal_machine_cuda_arch_flags()],
+        build_directory=str(build_dir),
+        verbose=False,
+    )
+
+
+def _load_muon_cuda_extension(source_dir: Path, build_dir: Path):
+    return load_cpp_extension(
+        name="muon_cuda_ext",
+        sources=[
+            str(source_dir / "muon.cpp"),
+            str(source_dir / "muon_kernel.cu"),
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17", *_causal_machine_cuda_arch_flags()],
+        extra_ldflags=["-lcublasLt"],
         build_directory=str(build_dir),
         verbose=False,
     )
@@ -125,6 +284,18 @@ def load_causal_machine_scan_cuda():
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
     build_dir = source_dir / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
+    existing = _load_prebuilt_cuda_extension_or_none(
+        "causal_machine_scan_cuda_ext",
+        "causal_machine_scan_cuda",
+        build_dir,
+        (
+            source_dir / "causal_machine_scan.cpp",
+            source_dir / "causal_machine_scan_kernel.cu",
+        ),
+    )
+    if existing is not None:
+        _CAUSAL_MACHINE_SCAN_CUDA = existing
+        return _CAUSAL_MACHINE_SCAN_CUDA
     last_exc: Exception | None = None
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
@@ -191,6 +362,18 @@ def load_causal_machine_latent_scan_cuda():
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
     build_dir = source_dir / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
+    existing = _load_prebuilt_cuda_extension_or_none(
+        "causal_machine_latent_scan_cuda_ext",
+        "causal_machine_latent_scan_cuda",
+        build_dir,
+        (
+            source_dir / "causal_machine_latent_scan.cpp",
+            source_dir / "causal_machine_latent_scan_kernel.cu",
+        ),
+    )
+    if existing is not None:
+        _CAUSAL_MACHINE_LATENT_SCAN_CUDA = existing
+        return _CAUSAL_MACHINE_LATENT_SCAN_CUDA
     last_exc: Exception | None = None
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
@@ -247,6 +430,84 @@ def load_causal_machine_latent_scan_cuda():
     raise RuntimeError("causal_machine_latent_scan_cuda is unavailable after retries") from last_exc
 
 
+def load_muon_cuda():
+    global _MUON_CUDA
+    global _MUON_CUDA_ERROR
+    if _MUON_CUDA is not None:
+        return _MUON_CUDA
+    if _MUON_CUDA_ERROR is not None:
+        raise RuntimeError("muon_cuda is unavailable") from _MUON_CUDA_ERROR
+    source_dir = Path(__file__).resolve().parent / "cuda_ext"
+    build_dir = source_dir / "build" / "muon_cuda"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    existing = _load_prebuilt_cuda_extension_or_none(
+        "muon_cuda_ext",
+        "muon_cuda",
+        build_dir,
+        (
+            source_dir / "muon.cpp",
+            source_dir / "muon_kernel.cu",
+        ),
+    )
+    if existing is not None:
+        _MUON_CUDA = existing
+        return _MUON_CUDA
+    last_exc: Exception | None = None
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    attempts = 4 if distributed else 2
+    if not distributed:
+        try:
+            _MUON_CUDA = _load_muon_cuda_extension(source_dir, build_dir)
+            return _MUON_CUDA
+        except Exception as exc:
+            _MUON_CUDA_ERROR = exc
+            raise RuntimeError("muon_cuda is unavailable") from exc
+
+    sync_device = torch.device("cuda", torch.cuda.current_device())
+    for attempt in range(attempts):
+        local_exc: Exception | None = None
+        leader_success = torch.zeros(1, device=sync_device, dtype=torch.int32)
+        try:
+            if rank == 0:
+                if _MUON_CUDA is None:
+                    _MUON_CUDA = _load_muon_cuda_extension(source_dir, build_dir)
+                leader_success.fill_(1)
+        except Exception as exc:
+            local_exc = exc
+            if rank == 0:
+                _MUON_CUDA = None
+            leader_success.zero_()
+
+        dist.broadcast(leader_success, src=0)
+
+        if int(leader_success.item()) == 1:
+            try:
+                if rank != 0 and _MUON_CUDA is None:
+                    _MUON_CUDA = _load_muon_cuda_extension(source_dir, build_dir)
+            except Exception as exc:
+                local_exc = exc
+                _MUON_CUDA = None
+
+            load_ok = torch.tensor([0 if local_exc is not None else 1], device=sync_device, dtype=torch.int32)
+            dist.all_reduce(load_ok, op=dist.ReduceOp.MIN)
+            if int(load_ok.item()) == 1:
+                return _MUON_CUDA
+
+        if local_exc is None:
+            local_exc = RuntimeError(
+                f"muon_cuda leader build failed on rank 0 during attempt {attempt + 1}/{attempts}"
+            )
+        last_exc = local_exc
+        _MUON_CUDA = None
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+
+    _MUON_CUDA_ERROR = last_exc
+    raise RuntimeError("muon_cuda is unavailable after retries") from last_exc
+
+
 class _CausalMachineScanCudaFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -262,8 +523,12 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
         packed_source_scales: Tensor,
         packed_dest_q: Tensor,
         packed_dest_scales: Tensor,
+        packed_kind: int,
         use_packed: bool,
         chunk_size: int,
+        score_clamp_min: float,
+        score_clamp_max: float,
+        composable: bool,
     ) -> tuple[Tensor, Tensor]:
         ext = load_causal_machine_scan_cuda()
         local_logits_in = local_logits.contiguous()
@@ -272,32 +537,92 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
         transition_stay_probs_f32 = transition_stay_probs.contiguous().float()
         transition_source_logits_f32 = transition_source_logits.contiguous().float()
         transition_dest_logits_f32 = transition_dest_logits.contiguous().float()
+        transition_source_probs_f32 = F.softmax(transition_source_logits_f32, dim=-1).contiguous()
+        transition_dest_probs_f32 = F.softmax(transition_dest_logits_f32, dim=-1).contiguous()
         gate_value = float(transition_gate.detach().float().item())
-        approx_packed_training = _env_enabled("CAUSAL_MACHINE_SCAN_APPROX_PACKED_TRAINING", default=False)
-        # The packed structured-scan path executes on quantized transition tables.
-        # Keep it for inference/eval, but do not use it for training-time autograd:
-        # the packed CUDA op is not the exact gradient of its own forward pass.
-        packed_grad_safe = not (ctx.needs_input_grad[1] or ctx.needs_input_grad[2])
-        ctx.use_packed = bool(use_packed) and (packed_grad_safe or approx_packed_training)
-        ctx.approx_packed_training = bool(ctx.use_packed and approx_packed_training and not packed_grad_safe)
+        ctx.composable = bool(composable)
+        ctx.use_packed = bool(use_packed)
+        ctx.packed_kind = int(packed_kind)
         if ctx.use_packed:
-            beliefs, final_belief = ext.forward_quantized(
-                local_logits_in,
-                packed_source_q.contiguous(),
-                packed_source_scales.contiguous(),
-                packed_dest_q.contiguous(),
-                packed_dest_scales.contiguous(),
+            packed_source_q = packed_source_q.contiguous()
+            packed_source_scales = packed_source_scales.contiguous()
+            packed_dest_q = packed_dest_q.contiguous()
+            packed_dest_scales = packed_dest_scales.contiguous()
+            if ctx.packed_kind == _PACKED_TRANSITION_INT8:
+                beliefs, final_belief = ext.forward_quantized(
+                    local_logits_in,
+                    packed_source_q,
+                    packed_source_scales,
+                    packed_dest_q,
+                    packed_dest_scales,
+                    transition_context_in,
+                    initial_log_belief_in,
+                    gate_value,
+                    transition_stay_probs_f32,
+                    int(chunk_size),
+                )
+            elif ctx.packed_kind == _PACKED_TRANSITION_FP8_E4M3:
+                beliefs, final_belief = ext.forward_fp8(
+                    local_logits_in,
+                    packed_source_q,
+                    packed_source_scales,
+                    packed_dest_q,
+                    packed_dest_scales,
+                    transition_context_in,
+                    initial_log_belief_in,
+                    gate_value,
+                    transition_stay_probs_f32,
+                    0,
+                    int(chunk_size),
+                )
+            elif ctx.packed_kind == _PACKED_TRANSITION_FP8_E5M2:
+                beliefs, final_belief = ext.forward_fp8(
+                    local_logits_in,
+                    packed_source_q,
+                    packed_source_scales,
+                    packed_dest_q,
+                    packed_dest_scales,
+                    transition_context_in,
+                    initial_log_belief_in,
+                    gate_value,
+                    transition_stay_probs_f32,
+                    1,
+                    int(chunk_size),
+                )
+            else:
+                raise ValueError(f"unsupported packed transition kind: {ctx.packed_kind}")
+            packed_source_probs_f32, packed_dest_probs_f32 = _unpack_scan_transition_tables(
+                ext,
+                int(ctx.packed_kind),
+                packed_source_q,
+                packed_source_scales,
+                packed_dest_q,
+                packed_dest_scales,
+            )
+            ctx.save_for_backward(
+                packed_source_q,
+                packed_source_scales,
+                packed_dest_q,
+                packed_dest_scales,
                 transition_context_in,
                 initial_log_belief_in,
-                gate_value,
+                beliefs.contiguous(),
+                packed_source_probs_f32,
+                packed_dest_probs_f32,
+                transition_gate.float(),
+                transition_stay_probs_f32,
+            )
+        elif ctx.composable:
+            beliefs, final_belief = ext.forward_composable_logits(
+                local_logits_in,
+                transition_source_logits_f32,
+                transition_dest_logits_f32,
+                transition_context_in,
+                initial_log_belief_in,
                 transition_stay_probs_f32,
                 int(chunk_size),
             )
             ctx.save_for_backward(
-                packed_source_q.contiguous(),
-                packed_source_scales.contiguous(),
-                packed_dest_q.contiguous(),
-                packed_dest_scales.contiguous(),
                 transition_context_in,
                 initial_log_belief_in,
                 beliefs.contiguous(),
@@ -316,6 +641,8 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 gate_value,
                 transition_stay_probs_f32,
                 int(chunk_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
             )
             ctx.save_for_backward(
                 transition_context_in,
@@ -327,6 +654,8 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_stay_probs_f32,
             )
         ctx.chunk_size = int(chunk_size)
+        ctx.score_clamp_min = float(score_clamp_min)
+        ctx.score_clamp_max = float(score_clamp_max)
         return beliefs, final_belief
 
     @staticmethod
@@ -341,12 +670,72 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_context_saved,
                 initial_log_belief_saved,
                 beliefs_saved,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+            ) = ctx.saved_tensors
+            packed_source_q = packed_source_q.contiguous()
+            packed_source_scales = packed_source_scales.contiguous()
+            packed_dest_q = packed_dest_q.contiguous()
+            packed_dest_scales = packed_dest_scales.contiguous()
+            common_args = (
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q,
+                packed_source_scales,
+                packed_dest_q,
+                packed_dest_scales,
+                transition_context_saved.contiguous(),
+                initial_log_belief_saved.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+            )
+            if int(getattr(ctx, "packed_kind", _PACKED_TRANSITION_INT8)) == _PACKED_TRANSITION_INT8:
+                grads = ext.backward_quantized(*common_args, int(ctx.chunk_size))
+            elif int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E4M3:
+                grads = ext.backward_fp8(*common_args, 0, int(ctx.chunk_size))
+            elif int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E5M2:
+                grads = ext.backward_fp8(*common_args, 1, int(ctx.chunk_size))
+            else:
+                raise ValueError(f"unsupported packed transition kind: {ctx.packed_kind}")
+            grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
+            grad_source = (
+                _softmax_backward_rows(grad_source_probs, transition_source_probs_f32)
+                if ctx.needs_input_grad[1]
+                else None
+            )
+            grad_dest = (
+                _softmax_backward_rows(grad_dest_probs, transition_dest_probs_f32)
+                if ctx.needs_input_grad[2]
+                else None
+            )
+            if bool(getattr(ctx, "composable", False)):
+                grad_gate = torch.zeros_like(grad_gate)
+        else:
+            (
+                transition_context_saved,
+                initial_log_belief_saved,
+                beliefs_saved,
                 transition_source_logits_f32,
                 transition_dest_logits_f32,
                 transition_gate_f32,
                 transition_stay_probs_f32,
             ) = ctx.saved_tensors
-            if bool(getattr(ctx, "approx_packed_training", False)):
+            if bool(getattr(ctx, "composable", False)):
+                grads = ext.backward_composable_logits(
+                    grad_beliefs.contiguous(),
+                    grad_final_belief.contiguous(),
+                    transition_source_logits_f32,
+                    transition_dest_logits_f32,
+                    transition_context_saved.contiguous(),
+                    initial_log_belief_saved.contiguous(),
+                    beliefs_saved.contiguous(),
+                    transition_stay_probs_f32,
+                    int(ctx.chunk_size),
+                )
+            else:
                 grads = ext.backward_logits(
                     grad_beliefs.contiguous(),
                     grad_final_belief.contiguous(),
@@ -358,48 +747,9 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                     float(transition_gate_f32.detach().float().item()),
                     transition_stay_probs_f32,
                     int(ctx.chunk_size),
+                    float(ctx.score_clamp_min),
+                    float(ctx.score_clamp_max),
                 )
-                grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = grads
-            else:
-                grads = ext.backward_quantized(
-                    grad_beliefs.contiguous(),
-                    grad_final_belief.contiguous(),
-                    packed_source_q.contiguous(),
-                    packed_source_scales.contiguous(),
-                    packed_dest_q.contiguous(),
-                    packed_dest_scales.contiguous(),
-                    transition_context_saved.contiguous(),
-                    initial_log_belief_saved.contiguous(),
-                    beliefs_saved.contiguous(),
-                    float(transition_gate_f32.detach().float().item()),
-                    transition_stay_probs_f32,
-                    int(ctx.chunk_size),
-                )
-                grad_local, _grad_source_probs, _grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
-                grad_source = None
-                grad_dest = None
-        else:
-            (
-                transition_context_saved,
-                initial_log_belief_saved,
-                beliefs_saved,
-                transition_source_logits_f32,
-                transition_dest_logits_f32,
-                transition_gate_f32,
-                transition_stay_probs_f32,
-            ) = ctx.saved_tensors
-            grads = ext.backward_logits(
-                grad_beliefs.contiguous(),
-                grad_final_belief.contiguous(),
-                transition_source_logits_f32,
-                transition_dest_logits_f32,
-                transition_context_saved.contiguous(),
-                initial_log_belief_saved.contiguous(),
-                beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
-                transition_stay_probs_f32,
-                int(ctx.chunk_size),
-            )
             grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = grads
         return (
             grad_local,
@@ -415,26 +765,946 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
-def _causal_machine_scan_shared_bytes(transition_rank: int) -> int:
+class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits: Tensor,
+        transition_source_probs: Tensor,
+        transition_dest_probs: Tensor,
+        transition_context: Tensor,
+        initial_log_belief: Tensor,
+        transition_gate: Tensor,
+        transition_stay_probs: Tensor,
+        packed_source_q: Tensor,
+        packed_source_scales: Tensor,
+        packed_dest_q: Tensor,
+        packed_dest_scales: Tensor,
+        packed_kind: int,
+        use_packed: bool,
+        seq_lens: Tensor,
+        chunk_size: int,
+        tile_size: int,
+        split_size: int,
+        score_clamp_min: float,
+        score_clamp_max: float,
+        score_threshold: float,
+        score_topk: int,
+        use_custom_forward_kernel: bool,
+        use_custom_backward_kernel: bool,
+        workspace: dict[str, Any] | None,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_scan_cuda()
+        local_logits_in = local_logits.contiguous()
+        transition_source_probs_f32 = transition_source_probs.contiguous().float()
+        transition_dest_probs_f32 = transition_dest_probs.contiguous().float()
+        transition_context_in = transition_context.contiguous()
+        initial_log_belief_f32 = initial_log_belief.contiguous().float()
+        transition_gate_f32 = transition_gate.contiguous().float().reshape(())
+        transition_stay_probs_f32 = transition_stay_probs.contiguous().float()
+        packed_source_q_in = packed_source_q.contiguous()
+        packed_source_scales_in = packed_source_scales.contiguous()
+        packed_dest_q_in = packed_dest_q.contiguous()
+        packed_dest_scales_in = packed_dest_scales.contiguous()
+        seq_lens_in = seq_lens.contiguous()
+        workspace_dict = workspace if isinstance(workspace, dict) else None
+        ctx.use_packed = bool(use_packed)
+        ctx.packed_kind = int(packed_kind)
+        if ctx.use_packed and ctx.packed_kind == _PACKED_TRANSITION_INT8:
+            beliefs, final_belief = ext.forward_tiled_quantized_kernel(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif ctx.use_packed and ctx.packed_kind in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}:
+            beliefs, final_belief = ext.forward_tiled_fp8_kernel(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                0 if ctx.packed_kind == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif (
+            bool(use_custom_forward_kernel)
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_logits_kernel_bound_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_logits_kernel_bound_workspace(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif (
+            bool(use_custom_forward_kernel)
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_logits_kernel_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_logits_kernel_workspace(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["filtered_value_cache"],
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif bool(use_custom_forward_kernel) and hasattr(ext, "forward_tiled_logits_kernel"):
+            beliefs, final_belief = ext.forward_tiled_logits_kernel(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif hasattr(ext, "forward_tiled_logits"):
+            beliefs, final_belief = ext.forward_tiled_logits(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+            )
+        else:
+            raise RuntimeError("cuda_tiled requires forward_tiled_logits in the CUDA extension")
+        if ctx.use_packed:
+            ctx.save_for_backward(
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                beliefs.contiguous(),
+                transition_gate.float(),
+                transition_stay_probs_f32,
+                seq_lens_in,
+            )
+        else:
+            ctx.save_for_backward(
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_f32,
+                beliefs.contiguous(),
+                transition_gate.float(),
+                transition_stay_probs_f32,
+                seq_lens_in,
+            )
+        ctx.chunk_size = int(chunk_size)
+        ctx.tile_size = int(tile_size)
+        ctx.split_size = int(split_size)
+        ctx.score_clamp_min = float(score_clamp_min)
+        ctx.score_clamp_max = float(score_clamp_max)
+        ctx.score_threshold = float(score_threshold)
+        ctx.score_topk = int(score_topk)
+        ctx.use_custom_backward_kernel = bool(use_custom_backward_kernel) and hasattr(ext, "backward_tiled_probs_kernel")
+        ctx.workspace = workspace_dict
+        return beliefs, final_belief
+
+    @staticmethod
+    def backward(ctx, grad_beliefs: Tensor, grad_final_belief: Tensor):
+        ext = load_causal_machine_scan_cuda()
+        if bool(getattr(ctx, "use_packed", False)):
+            (
+                packed_source_q,
+                packed_source_scales,
+                packed_dest_q,
+                packed_dest_scales,
+                transition_context_saved,
+                initial_log_belief_f32,
+                beliefs_saved,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_saved,
+            ) = ctx.saved_tensors
+        else:
+            (
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved,
+                initial_log_belief_f32,
+                beliefs_saved,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_saved,
+            ) = ctx.saved_tensors
+        workspace_dict = getattr(ctx, "workspace", None)
+        if bool(getattr(ctx, "use_packed", False)) and int(getattr(ctx, "packed_kind", -1)) == _PACKED_TRANSITION_INT8:
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_quantized_kernel(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif bool(getattr(ctx, "use_packed", False)) and int(getattr(ctx, "packed_kind", -1)) in {
+            _PACKED_TRANSITION_FP8_E4M3,
+            _PACKED_TRANSITION_FP8_E5M2,
+        }:
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_fp8_kernel(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                0 if int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif (
+            bool(getattr(ctx, "use_custom_backward_kernel", False))
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_probs_kernel_bound_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_probs_kernel_bound_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict,
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif (
+            bool(getattr(ctx, "use_custom_backward_kernel", False))
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_probs_kernel_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_probs_kernel_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["latent_cache_staging"],
+                workspace_dict["grad_latent_accum_staging"],
+                workspace_dict["grad_transition_source_probs_staging"],
+                workspace_dict["grad_transition_dest_probs_staging"],
+                workspace_dict["grad_transition_gate_staging"],
+                workspace_dict["grad_transition_stay_staging"],
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif bool(getattr(ctx, "use_custom_backward_kernel", False)) and hasattr(ext, "backward_tiled_probs_kernel"):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_probs_kernel(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif hasattr(ext, "backward_tiled_probs"):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_probs(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+            )
+        else:
+            raise RuntimeError("cuda_tiled requires backward_tiled_probs in the CUDA extension when gradients are enabled")
+        return (
+            grad_local,
+            grad_source,
+            grad_dest,
+            grad_context,
+            grad_initial,
+            grad_gate.reshape_as(transition_gate_f32),
+            grad_stay.reshape_as(transition_stay_probs_f32),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def _materialize_structured_sparse_transition_values(
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    sparse_transition_tables: StructuredSparseTransitionTables,
+) -> tuple[Tensor, Tensor]:
+    num_states = int(transition_source_probs.size(0))
+    padded_states = int(sparse_transition_tables.row_sums.numel())
+    block_size = int(sparse_transition_tables.block_size)
+    if transition_source_probs.is_cuda and transition_dest_probs.is_cuda:
+        ext = load_causal_machine_scan_cuda()
+        return ext.materialize_sparse_blocks(
+            transition_source_probs.contiguous().float(),
+            transition_dest_probs.contiguous().float(),
+            sparse_transition_tables.col_idx.contiguous(),
+            sparse_transition_tables.dst_idx.contiguous(),
+            sparse_transition_tables.block_mask.contiguous().float(),
+            int(padded_states),
+            int(block_size),
+        )
+    transition_rank = int(transition_source_probs.size(1))
+    source_probs = transition_source_probs.float()
+    dest_probs = transition_dest_probs.float()
+    if padded_states != num_states:
+        source_pad = torch.zeros((padded_states, transition_rank), device=source_probs.device, dtype=torch.float32)
+        source_pad[:num_states, :] = source_probs
+        source_probs = source_pad
+        dest_pad = torch.zeros((transition_rank, padded_states), device=dest_probs.device, dtype=torch.float32)
+        dest_pad[:, :num_states] = dest_probs
+        dest_probs = dest_pad
+    raw_blocks: list[Tensor] = []
+    row_sums = torch.zeros((padded_states,), device=source_probs.device, dtype=torch.float32)
+    for nz in range(int(sparse_transition_tables.col_idx.numel())):
+        src_block = int(sparse_transition_tables.col_idx[nz].item())
+        dst_block = int(sparse_transition_tables.dst_idx[nz].item())
+        src_base = src_block * block_size
+        dst_base = dst_block * block_size
+        raw_block = torch.matmul(
+            source_probs[src_base : src_base + block_size, :],
+            dest_probs[:, dst_base : dst_base + block_size],
+        )
+        raw_block = raw_block * sparse_transition_tables.block_mask[nz]
+        row_sums[src_base : src_base + block_size] += raw_block.sum(dim=1)
+        raw_blocks.append(raw_block)
+    if raw_blocks:
+        normalized_blocks = [
+            raw_block
+            / row_sums[
+                int(sparse_transition_tables.col_idx[nz].item()) * block_size
+                : (int(sparse_transition_tables.col_idx[nz].item()) + 1) * block_size
+            ].clamp_min(1.0e-20).unsqueeze(1)
+            for nz, raw_block in enumerate(raw_blocks)
+        ]
+        transition_blocks = torch.stack(normalized_blocks, dim=0).contiguous()
+    else:
+        transition_blocks = torch.empty((0, block_size, block_size), device=source_probs.device, dtype=torch.float32)
+    return transition_blocks, row_sums.contiguous()
+
+
+class _CausalMachineSparseScanCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits: Tensor,
+        transition_source_logits: Tensor,
+        transition_dest_logits: Tensor,
+        transition_context: Tensor,
+        initial_log_belief: Tensor,
+        transition_gate: Tensor,
+        transition_stay_probs: Tensor,
+        block_row_ptr: Tensor,
+        block_col_idx: Tensor,
+        block_dst_idx: Tensor,
+        src_row_ptr: Tensor,
+        src_nz_idx: Tensor,
+        grouped_src_row_ptr: Tensor,
+        grouped_src_block_idx: Tensor,
+        block_mask: Tensor,
+        seq_lens: Tensor,
+        block_size: int,
+        chunk_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_scan_cuda()
+        beliefs, final_belief = ext.forward_sparse_logits_fused(
+            local_logits.contiguous(),
+            transition_source_logits.contiguous().float(),
+            transition_dest_logits.contiguous().float(),
+            block_row_ptr.contiguous(),
+            block_col_idx.contiguous(),
+            block_dst_idx.contiguous(),
+            src_row_ptr.contiguous(),
+            src_nz_idx.contiguous(),
+            block_mask.contiguous().float(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous(),
+            transition_gate.reshape(()).contiguous().float(),
+            transition_stay_probs.contiguous().float(),
+            seq_lens.contiguous(),
+            int(block_size),
+            int(chunk_size),
+        )
+        ctx.block_size = int(block_size)
+        ctx.chunk_size = int(chunk_size)
+        ctx.save_for_backward(
+            transition_source_logits.contiguous().float(),
+            transition_dest_logits.contiguous().float(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous(),
+            beliefs.contiguous(),
+            transition_gate.contiguous().float(),
+            transition_stay_probs.contiguous().float(),
+            block_row_ptr.contiguous(),
+            block_col_idx.contiguous(),
+            block_dst_idx.contiguous(),
+            src_row_ptr.contiguous(),
+            src_nz_idx.contiguous(),
+            grouped_src_row_ptr.contiguous(),
+            grouped_src_block_idx.contiguous(),
+            block_mask.contiguous().float(),
+            seq_lens.contiguous(),
+        )
+        return beliefs, final_belief
+
+    @staticmethod
+    def backward(ctx, grad_beliefs: Tensor, grad_final_belief: Tensor):
+        ext = load_causal_machine_scan_cuda()
+        (
+            transition_source_logits_f32,
+            transition_dest_logits_f32,
+            transition_context_saved,
+            initial_log_belief_saved,
+            beliefs_saved,
+            transition_gate_f32,
+            transition_stay_probs_f32,
+            block_row_ptr,
+            block_col_idx,
+            block_dst_idx,
+            src_row_ptr,
+            src_nz_idx,
+            grouped_src_row_ptr,
+            grouped_src_block_idx,
+            block_mask,
+            seq_lens,
+        ) = ctx.saved_tensors
+        grads = ext.backward_sparse_logits_fused(
+            grad_beliefs.contiguous(),
+            grad_final_belief.contiguous(),
+            transition_source_logits_f32.contiguous(),
+            transition_dest_logits_f32.contiguous(),
+            block_row_ptr.contiguous(),
+            block_col_idx.contiguous(),
+            block_dst_idx.contiguous(),
+            src_row_ptr.contiguous(),
+            src_nz_idx.contiguous(),
+            grouped_src_row_ptr.contiguous(),
+            grouped_src_block_idx.contiguous(),
+            block_mask.contiguous(),
+            transition_context_saved.contiguous(),
+            initial_log_belief_saved.contiguous(),
+            beliefs_saved.contiguous(),
+            transition_gate_f32.reshape(()),
+            transition_stay_probs_f32,
+            seq_lens,
+            int(ctx.block_size),
+            int(ctx.chunk_size),
+        )
+        grad_local, grad_source_logits, grad_dest_logits, grad_context, grad_initial, grad_gate, grad_stay = grads
+        return (
+            grad_local,
+            grad_source_logits,
+            grad_dest_logits,
+            grad_context,
+            grad_initial,
+            grad_gate.reshape_as(transition_gate_f32),
+            grad_stay.reshape_as(transition_stay_probs_f32),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+_PREFERRED_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES = (64, 96, 128)
+_MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES = max(_PREFERRED_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES)
+
+
+def _causal_machine_scan_shared_bytes(
+    transition_rank: int,
+    num_states: int = _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES,
+) -> int:
     transition_rank = max(int(transition_rank), 1)
-    num_states = 128
-    num_warps = num_states // 32
-    forward_bytes = ((2 * num_states * transition_rank) + num_states + transition_rank + num_warps) * 4
+    num_states = max(int(num_states), 1)
+    num_warps = (num_states + 31) // 32
+    forward_bytes = ((2 * num_states * transition_rank) + num_states + transition_rank + (num_warps * transition_rank)) * 4
     backward_base = ((2 * num_states * transition_rank) + (2 * num_states) + (2 * transition_rank) + num_warps) * 4
     backward_direct = ((2 * num_states * transition_rank) + num_states) * 4
     backward_bytes = backward_base + backward_direct
     return max(forward_bytes, backward_bytes)
 
 
-def _can_use_causal_machine_scan_cuda(device: torch.device, transition_rank: int) -> bool:
-    if int(transition_rank) not in (8, 16, 32, 64, 128):
+def _causal_machine_sparse_scan_shared_bytes(num_states: int) -> int:
+    states = max(int(num_states), 1)
+    block_threads = max(32, min(256, 1 << (min(states, 256) - 1).bit_length()))
+    num_warps = (block_threads + 31) // 32
+    forward_bytes = ((2 * states) + num_warps + 4) * 4
+    backward_bytes = ((4 * states) + num_warps) * 4
+    return max(forward_bytes, backward_bytes)
+
+
+def _supports_structured_scan_num_states(num_states: int) -> bool:
+    states = int(num_states)
+    return 1 <= states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+
+
+def _supports_structured_scan_transition_rank(transition_rank: int) -> bool:
+    rank = int(transition_rank)
+    return 1 <= rank <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+
+
+def _default_structured_scan_tile_size(num_states: int) -> int:
+    states = max(int(num_states), 1)
+    if states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+    return _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES if states >= 256 else 96
+
+
+def _default_structured_scan_split_size(num_states: int, transition_rank: int) -> int:
+    states = max(int(num_states), 1)
+    rank = max(int(transition_rank), 1)
+    if states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES or rank <= 64:
+        return rank
+    if states >= 512:
+        return min(rank, 64)
+    if states >= 384:
+        return min(rank, 96)
+    return min(rank, _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES)
+
+
+def _structured_scan_tiled_candidate_sizes(limit: int, preferred: int) -> tuple[int, ...]:
+    capped_limit = max(min(int(limit), 256), 1)
+    values: list[int] = []
+    for candidate in (
+        preferred,
+        capped_limit,
+        256,
+        192,
+        160,
+        128,
+        96,
+        64,
+        48,
+        32,
+        24,
+        16,
+        8,
+        4,
+        2,
+        1,
+    ):
+        value = min(max(int(candidate), 1), capped_limit)
+        if value not in values:
+            values.append(value)
+    return tuple(values)
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_structured_scan_tiled_kernel_config_cached(
+    device_index: int,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    preferred_tile_size: int,
+    preferred_split_size: int,
+    needs_grad: bool,
+    ) -> tuple[int, int] | None:
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        ext = None
+    if ext is not None and hasattr(ext, "select_tiled_runtime_policy"):
+        try:
+            info = ext.select_tiled_runtime_policy(
+                int(num_states),
+                int(transition_rank),
+                int(seq_len),
+                int(chunk_size),
+                bool(needs_grad),
+                int(device_index),
+            )
+            if not bool(info.get("selected", False)):
+                return None
+            if not bool(info.get("custom_kernel_supported", False)):
+                return None
+            if bool(needs_grad) and not bool(info.get("custom_backward_kernel_supported", False)):
+                return None
+            tile_size = int(info.get("tile_size", 0))
+            split_size = int(info.get("split_size", 0))
+            if tile_size > 0 and split_size > 0:
+                return tile_size, split_size
+        except Exception:
+            pass
+    device = torch.device("cuda", int(device_index))
+    tile_candidates = _structured_scan_tiled_candidate_sizes(num_states, preferred_tile_size)
+    split_candidates = _structured_scan_tiled_candidate_sizes(transition_rank, preferred_split_size)
+    for tile_size in tile_candidates:
+        for split_size in split_candidates:
+            if not _can_use_causal_machine_tiled_forward_kernel(
+                device,
+                num_states=int(num_states),
+                transition_rank=int(transition_rank),
+                seq_len=int(seq_len),
+                chunk_size=int(chunk_size),
+                tile_size=int(tile_size),
+                split_size=int(split_size),
+            ):
+                continue
+            if bool(needs_grad) and not _can_use_causal_machine_tiled_backward_kernel(
+                device,
+                num_states=int(num_states),
+                transition_rank=int(transition_rank),
+                seq_len=int(seq_len),
+                chunk_size=int(chunk_size),
+                tile_size=int(tile_size),
+                split_size=int(split_size),
+            ):
+                continue
+            return int(tile_size), int(split_size)
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def _select_structured_scan_tiled_policy_cached(
+    device_index: int,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    needs_grad: bool,
+) -> dict[str, Any] | None:
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return None
+    if not hasattr(ext, "select_tiled_runtime_policy"):
+        return None
+    try:
+        info = ext.select_tiled_runtime_policy(
+            int(num_states),
+            int(transition_rank),
+            int(seq_len),
+            int(chunk_size),
+            bool(needs_grad),
+            int(device_index),
+        )
+    except Exception:
+        return None
+    if not isinstance(info, dict):
+        return None
+    if not bool(info.get("selected", False)):
+        return None
+    if not bool(info.get("custom_kernel_supported", False)):
+        return None
+    if bool(needs_grad) and not bool(info.get("custom_backward_kernel_supported", False)):
+        return None
+    return dict(info)
+
+
+def _resolve_structured_scan_tiled_kernel_config(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    preferred_tile_size: int,
+    preferred_split_size: int,
+    needs_grad: bool,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> tuple[int, int] | None:
+    if device.type != "cuda":
+        return None
+    if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return None
+    if int(transition_rank) <= 0 or int(transition_rank) > int(num_states):
+        return None
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    if _has_native_structured_score_filtering(runtime_config, num_states=int(num_states)):
+        topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(num_states))
+        if topk > 32:
+            return None
+        tile_candidates = _structured_scan_tiled_candidate_sizes(num_states, preferred_tile_size)
+        split_candidates = _structured_scan_tiled_candidate_sizes(transition_rank, preferred_split_size)
+        for tile_size in tile_candidates:
+            for split_size in split_candidates:
+                if not _can_use_causal_machine_tiled_forward_kernel(
+                    device,
+                    num_states=int(num_states),
+                    transition_rank=int(transition_rank),
+                    seq_len=int(seq_len),
+                    chunk_size=int(chunk_size),
+                    tile_size=int(tile_size),
+                    split_size=int(split_size),
+                    runtime_config=runtime_config,
+                ):
+                    continue
+                if bool(needs_grad) and not _can_use_causal_machine_tiled_backward_kernel(
+                    device,
+                    num_states=int(num_states),
+                    transition_rank=int(transition_rank),
+                    seq_len=int(seq_len),
+                    chunk_size=int(chunk_size),
+                    tile_size=int(tile_size),
+                    split_size=int(split_size),
+                    runtime_config=runtime_config,
+                ):
+                    continue
+                return int(tile_size), int(split_size)
+        return None
+    return _resolve_structured_scan_tiled_kernel_config_cached(
+        int(device_index),
+        int(num_states),
+        int(transition_rank),
+        int(seq_len),
+        int(chunk_size),
+        int(preferred_tile_size),
+        int(preferred_split_size),
+        bool(needs_grad),
+    )
+
+
+def _select_structured_scan_tiled_policy(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    needs_grad: bool,
+) -> dict[str, Any] | None:
+    if device.type != "cuda":
+        return None
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    return _select_structured_scan_tiled_policy_cached(
+        int(device_index),
+        int(num_states),
+        int(transition_rank),
+        int(seq_len),
+        int(chunk_size),
+        bool(needs_grad),
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _select_structured_scan_dense_policy_cached(
+    device_index: int,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    needs_grad: bool,
+) -> dict[str, Any] | None:
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return None
+    if not hasattr(ext, "select_dense_runtime_policy"):
+        return None
+    try:
+        info = ext.select_dense_runtime_policy(
+            int(num_states),
+            int(transition_rank),
+            int(seq_len),
+            int(chunk_size),
+            bool(needs_grad),
+            int(device_index),
+        )
+    except Exception:
+        return None
+    return dict(info) if isinstance(info, dict) else None
+
+
+def _select_structured_scan_dense_policy(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    needs_grad: bool,
+) -> dict[str, Any] | None:
+    if device.type != "cuda":
+        return None
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    return _select_structured_scan_dense_policy_cached(
+        int(device_index),
+        int(num_states),
+        int(transition_rank),
+        int(seq_len),
+        int(chunk_size),
+        bool(needs_grad),
+    )
+
+
+def _is_optimized_structured_scan_transition_rank(transition_rank: int) -> bool:
+    return int(transition_rank) in (8, 16, 32, 64, _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES)
+
+
+def _can_use_causal_machine_scan_cuda(
+    device: torch.device,
+    transition_rank: int,
+    num_states: int = _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES,
+) -> bool:
+    if not _supports_structured_scan_transition_rank(transition_rank):
         return False
     if device.type != "cuda":
         return False
-    required_bytes = _causal_machine_scan_shared_bytes(transition_rank)
+    effective_num_states = (
+        _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+        if int(num_states) < _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES and int(transition_rank) > int(num_states)
+        else int(num_states)
+    )
+    required_bytes = _causal_machine_scan_shared_bytes(transition_rank, num_states=effective_num_states)
     try:
         props = torch.cuda.get_device_properties(device)
     except Exception:
@@ -445,7 +1715,318 @@ def _can_use_causal_machine_scan_cuda(device: torch.device, transition_rank: int
     return required_bytes <= int(max_optin)
 
 
-def _estimate_structured_scan_cost(seq_len: int, transition_rank: int, num_states: int = 128) -> float:
+def _can_use_causal_machine_masked_scan_cuda(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    needs_grad: bool = False,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> bool:
+    if device.type != "cuda":
+        return False
+    states = int(num_states)
+    rank = int(transition_rank)
+    if states <= 0 or rank <= 0 or rank > states:
+        return False
+    if _has_native_structured_score_filtering(runtime_config, num_states=states):
+        if states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+            return False
+        topk = _resolve_native_structured_score_topk(runtime_config, num_states=states)
+        if topk > 32:
+            return False
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return False
+    if supports_structured_scan_cuda_config(states, rank):
+        if not hasattr(ext, "forward_masked_logits"):
+            return False
+        if bool(needs_grad) and not hasattr(ext, "backward_masked_logits"):
+            return False
+        return _can_use_causal_machine_scan_cuda(device, rank, num_states=states)
+    if not hasattr(ext, "forward_masked_logits"):
+        return False
+    if bool(needs_grad) and not hasattr(ext, "backward_masked_logits"):
+        return False
+    if not hasattr(ext, "describe_masked_tiled_runtime_config"):
+        try:
+            props = torch.cuda.get_device_properties(device)
+        except Exception:
+            return False
+        max_optin = int(getattr(props, "shared_memory_per_block_optin", 0) or getattr(props, "shared_memory_per_block", 0))
+        if max_optin <= 0:
+            return False
+        required_threads = min(max(states, 1), 256)
+        block_threads = max(32, min(256, 1 << (required_threads - 1).bit_length()))
+        num_warps = (block_threads + 31) // 32
+        forward_bytes = ((3 * states) + num_warps + 4) * 4
+        backward_bytes = ((6 * states) + num_warps + 4) * 4
+        return max(forward_bytes, backward_bytes) <= max_optin
+    try:
+        device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+        info = ext.describe_masked_tiled_runtime_config(
+            int(states),
+            1,
+            device_index,
+            bool(needs_grad),
+        )
+    except Exception:
+        return False
+    return bool(
+        info.get(
+            "runtime_supported",
+            bool(info.get("custom_kernel_supported", False))
+            or bool(info.get("extension_fallback_supported", False)),
+        )
+    )
+
+
+def _can_use_causal_machine_sparse_scan_cuda(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+) -> bool:
+    if device.type != "cuda":
+        return False
+    states = int(num_states)
+    rank = int(transition_rank)
+    if states <= 0 or rank <= 0 or rank > states:
+        return False
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception:
+        return False
+    max_optin = getattr(props, "shared_memory_per_block_optin", 0)
+    if max_optin <= 0:
+        max_optin = getattr(props, "shared_memory_per_block", 0)
+    return _causal_machine_sparse_scan_shared_bytes(states) <= int(max_optin)
+
+
+def _can_use_causal_machine_tiled_scan_cuda(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    needs_grad: bool = False,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> bool:
+    if device.type != "cuda":
+        return False
+    if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return False
+    if int(transition_rank) <= 0 or int(transition_rank) > int(num_states):
+        return False
+    if _has_native_structured_score_filtering(runtime_config, num_states=int(num_states)):
+        topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(num_states))
+        if topk > 32:
+            return False
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return False
+    if not hasattr(ext, "forward_tiled_logits"):
+        return False
+    if bool(needs_grad) and not hasattr(ext, "backward_tiled_probs"):
+        return False
+    return True
+
+
+def _can_use_causal_machine_tiled_forward_kernel(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    tile_size: int,
+    split_size: int,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> bool:
+    if device.type != "cuda":
+        return False
+    if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return False
+    if int(transition_rank) <= 0 or int(transition_rank) > int(num_states):
+        return False
+    if int(seq_len) < 0 or int(chunk_size) <= 0:
+        return False
+    if int(tile_size) <= 0 or int(split_size) <= 0:
+        return False
+    if _has_native_structured_score_filtering(runtime_config, num_states=int(num_states)):
+        topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(num_states))
+        if topk > 32:
+            return False
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return False
+    if not hasattr(ext, "describe_tiled_runtime_config"):
+        return int(max(tile_size, split_size)) <= 256
+    try:
+        device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+        info = ext.describe_tiled_runtime_config(
+            int(num_states),
+            int(transition_rank),
+            int(seq_len),
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            1,
+            device_index,
+        )
+    except Exception:
+        return False
+    return bool(info.get("custom_kernel_supported", False))
+
+
+def _can_use_causal_machine_tiled_backward_kernel(
+    device: torch.device,
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    chunk_size: int,
+    tile_size: int,
+    split_size: int,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> bool:
+    if device.type != "cuda":
+        return False
+    if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return False
+    if int(transition_rank) <= 0 or int(transition_rank) > int(num_states):
+        return False
+    if int(seq_len) < 0 or int(chunk_size) <= 0:
+        return False
+    if int(tile_size) <= 0 or int(split_size) <= 0:
+        return False
+    if _has_native_structured_score_filtering(runtime_config, num_states=int(num_states)):
+        topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(num_states))
+        if topk > 32:
+            return False
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return False
+    if not hasattr(ext, "describe_tiled_runtime_config"):
+        return int(max(tile_size, split_size)) <= 256
+    try:
+        device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+        info = ext.describe_tiled_runtime_config(
+            int(num_states),
+            int(transition_rank),
+            int(seq_len),
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            1,
+            device_index,
+        )
+    except Exception:
+        return False
+    return bool(info.get("custom_backward_kernel_supported", False))
+
+
+def create_structured_scan_workspace(
+    *,
+    mode: str,
+    device: torch.device,
+    num_states: int,
+    transition_rank: int,
+    batch_size: int,
+    seq_len: int,
+    chunk_size: int,
+    tile_size: int,
+    split_size: int,
+) -> dict[str, Any] | None:
+    if device.type != "cuda":
+        return None
+    try:
+        ext = load_causal_machine_scan_cuda()
+    except Exception:
+        return None
+    if not hasattr(ext, "create_scan_workspace"):
+        return None
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    return ext.create_scan_workspace(
+        str(mode),
+        int(num_states),
+        int(transition_rank),
+        int(batch_size),
+        int(tile_size),
+        int(split_size),
+        int(seq_len),
+        int(chunk_size),
+        int(device_index),
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _describe_structured_scan_device_runtime_cached(device_index: int) -> dict[str, int]:
+    device = torch.device("cuda", int(device_index))
+    info: dict[str, int] = {
+        "device_index": int(device_index),
+        "capability_major": 0,
+        "capability_minor": 0,
+        "sm_count": 0,
+        "max_dynamic_smem_bytes": 0,
+        "total_global_mem_bytes": 0,
+        "supports_tma": 0,
+        "supports_wgmma": 0,
+    }
+    try:
+        # Do not trigger a build/load just to answer autotune heuristics.
+        # If the extension is already resident, use its richer metadata.
+        ext = _CAUSAL_MACHINE_SCAN_CUDA
+        if hasattr(ext, "describe_device_runtime_config"):
+            raw = ext.describe_device_runtime_config(int(device_index))
+            info.update({str(k): int(v) for k, v in raw.items()})
+            return info
+    except Exception:
+        pass
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+        props = torch.cuda.get_device_properties(device)
+        info.update(
+            {
+                "capability_major": int(major),
+                "capability_minor": int(minor),
+                "sm_count": int(getattr(props, "multi_processor_count", 0)),
+                "max_dynamic_smem_bytes": int(
+                    getattr(props, "shared_memory_per_block_optin", 0)
+                    or getattr(props, "shared_memory_per_block", 0)
+                ),
+                "total_global_mem_bytes": int(getattr(props, "total_memory", 0)),
+                "supports_tma": 0,
+                "supports_wgmma": 0,
+            }
+        )
+    except Exception:
+        pass
+    return info
+
+
+def _describe_structured_scan_device_runtime(device: torch.device) -> dict[str, int]:
+    if device.type != "cuda":
+        return {
+            "device_index": -1,
+            "capability_major": 0,
+            "capability_minor": 0,
+            "sm_count": 0,
+            "max_dynamic_smem_bytes": 0,
+            "total_global_mem_bytes": 0,
+        }
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    return _describe_structured_scan_device_runtime_cached(device_index)
+
+
+def _estimate_structured_scan_cost(
+    seq_len: int,
+    transition_rank: int,
+    num_states: int = _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES,
+) -> float:
     seq_len = max(int(seq_len), 1)
     transition_rank = max(int(transition_rank), 1)
     num_states = max(int(num_states), 1)
@@ -471,13 +2052,22 @@ def _cached_env_float(name: str, default: float) -> float:
 
 
 @functools.lru_cache(maxsize=None)
+def _cached_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(int(default))).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+@functools.lru_cache(maxsize=None)
 def _cached_env_str(name: str, default: str) -> str:
     return str(os.environ.get(name, default)).strip().lower()
 
 
 def _bounded_latent_decay(logits: Tensor) -> Tensor:
-    min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.995)
-    max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9999)
+    min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.99)
+    max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9995)
     min_decay = min(max(min_decay, 0.0), 0.999999)
     max_decay = min(max(max_decay, min_decay + 1e-6), 0.999999)
     return torch.sigmoid(logits.float()).clamp(min_decay, max_decay)
@@ -497,8 +2087,64 @@ def _env_enabled(name: str, default: bool = False) -> bool:
     return raw not in {"", "0", "false", "no", "off"}
 
 
+def _competition_mode_enabled() -> bool:
+    return _env_enabled("COMPETITION_MODE", True)
+
+
+def _require_prebuilt_cuda_extensions() -> bool:
+    return _env_enabled("CAUSAL_MACHINE_REQUIRE_PREBUILT_EXTENSIONS", _competition_mode_enabled())
+
+
+def _require_fused_cuda_path_contract() -> bool:
+    return _env_enabled("CAUSAL_MACHINE_REQUIRE_FUSED_CUDA_PATH", _competition_mode_enabled())
+
+
 def _structured_filter_mode() -> str:
     return _cached_env_str("CAUSAL_MACHINE_STRUCTURED_FILTER_MODE", "coupled")
+
+
+def _structured_scan_packed_kind() -> int:
+    packed_dtype = _cached_env_str("CAUSAL_MACHINE_SCAN_PACKED_DTYPE", "int8")
+    mapping = {
+        "int8": _PACKED_TRANSITION_INT8,
+        "fp8_e4m3": _PACKED_TRANSITION_FP8_E4M3,
+        "e4m3": _PACKED_TRANSITION_FP8_E4M3,
+        "fp8_e5m2": _PACKED_TRANSITION_FP8_E5M2,
+        "e5m2": _PACKED_TRANSITION_FP8_E5M2,
+    }
+    if packed_dtype not in mapping:
+        raise ValueError(
+            "CAUSAL_MACHINE_SCAN_PACKED_DTYPE must be one of "
+            "'int8', 'fp8_e4m3', or 'fp8_e5m2'"
+        )
+    return mapping[packed_dtype]
+
+
+def _softmax_backward_rows(grad_probs: Tensor, probs: Tensor) -> Tensor:
+    grad_probs_f32 = grad_probs.float()
+    probs_f32 = probs.float()
+    proj = (grad_probs_f32 * probs_f32).sum(dim=-1, keepdim=True)
+    return (probs_f32 * (grad_probs_f32 - proj)).contiguous()
+
+
+def _resolve_structured_scan_chunk_size(
+    train_seq_len: int,
+    transition_rank: int,
+    *,
+    env_name: str = "CAUSAL_MACHINE_FILTER_CHUNK_SIZE",
+) -> int:
+    env_value = _cached_env_int(env_name, -1)
+    if env_value > 0:
+        return max(8, env_value)
+    seq_len = max(int(train_seq_len), 16)
+    rank = max(int(transition_rank), 1)
+    if rank <= 16:
+        target = min(64, seq_len // 8 if seq_len >= 512 else seq_len // 4)
+    elif rank <= 32:
+        target = min(96, seq_len // 8 if seq_len >= 512 else seq_len // 4)
+    else:
+        target = min(128, seq_len // 8 if seq_len >= 512 else seq_len // 4)
+    return max(16, target)
 
 
 def _prepare_structured_filter_inputs(
@@ -523,18 +2169,33 @@ def causal_machine_scan_cuda(
     initial_log_belief: Tensor,
     transition_gate: Tensor,
     transition_stay_probs: Tensor,
-    packed_transition_tables: tuple[Tensor, Tensor, Tensor, Tensor] | None = None,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
     chunk_size: int = 64,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
 ) -> tuple[Tensor, Tensor]:
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family="cuda",
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        num_states=int(local_logits.size(2)),
+    )
+    score_clamp_min, score_clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    clamp_active = math.isfinite(score_clamp_min) or math.isfinite(score_clamp_max)
     use_packed_tables = packed_transition_tables is not None
+    if clamp_active:
+        use_packed_tables = False
     if not use_packed_tables:
         empty_q = torch.empty((0, 0), device=transition_source_logits.device, dtype=torch.int8)
         empty_s = torch.empty((0,), device=transition_source_logits.device, dtype=torch.float32)
+        packed_kind = _PACKED_TRANSITION_INT8
         packed_source_q, packed_source_scales, packed_dest_q, packed_dest_scales = empty_q, empty_s, empty_q, empty_s
         use_packed = False
     else:
         assert packed_transition_tables is not None
-        packed_source_q, packed_source_scales, packed_dest_q, packed_dest_scales = packed_transition_tables
+        packed_kind, packed_source_q, packed_source_scales, packed_dest_q, packed_dest_scales = packed_transition_tables
         use_packed = True
     return _CausalMachineScanCudaFn.apply(
         local_logits,
@@ -548,13 +2209,1439 @@ def causal_machine_scan_cuda(
         packed_source_scales,
         packed_dest_q,
         packed_dest_scales,
+        packed_kind,
         use_packed,
+        int(chunk_size),
+        float(score_clamp_min),
+        float(score_clamp_max),
+        False if clamp_active else (_structured_filter_mode() == "composable"),
+        )
+
+
+class _CausalMachineMaskedScanCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits: Tensor,
+        transition_source_logits: Tensor,
+        transition_dest_logits: Tensor,
+        transition_context: Tensor,
+        initial_log_belief: Tensor,
+        transition_gate: Tensor,
+        transition_stay_probs: Tensor,
+        transition_mask: Tensor,
+        seq_lens: Tensor,
+        chunk_size: int,
+        score_clamp_min: float,
+        score_clamp_max: float,
+        score_threshold: float,
+        score_topk: int,
+        workspace: dict[str, Any] | None,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_scan_cuda()
+        local_logits_in = local_logits.contiguous()
+        transition_source_logits_f32 = transition_source_logits.contiguous().float()
+        transition_dest_logits_f32 = transition_dest_logits.contiguous().float()
+        transition_source_probs_f32 = F.softmax(transition_source_logits_f32, dim=-1).contiguous()
+        transition_dest_probs_f32 = F.softmax(transition_dest_logits_f32, dim=-1).contiguous()
+        transition_context_in = transition_context.contiguous()
+        initial_log_belief_in = initial_log_belief.contiguous()
+        transition_stay_probs_f32 = transition_stay_probs.contiguous().float()
+        transition_mask_in = transition_mask.contiguous()
+        seq_lens_in = seq_lens.contiguous()
+        workspace_dict = workspace if isinstance(workspace, dict) else None
+        if workspace_dict is not None and hasattr(ext, "forward_masked_logits_bound_workspace"):
+            beliefs, final_belief = ext.forward_masked_logits_bound_workspace(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_in,
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs_f32,
+                transition_mask_in,
+                seq_lens_in,
+                int(chunk_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        else:
+            beliefs, final_belief = ext.forward_masked_logits(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_in,
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs_f32,
+                transition_mask_in,
+                seq_lens_in,
+                int(chunk_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        ctx.save_for_backward(
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_in,
+            initial_log_belief_in,
+            beliefs.contiguous(),
+            transition_gate.float(),
+            transition_stay_probs_f32,
+            transition_mask_in,
+            seq_lens_in,
+        )
+        ctx.chunk_size = int(chunk_size)
+        ctx.score_clamp_min = float(score_clamp_min)
+        ctx.score_clamp_max = float(score_clamp_max)
+        ctx.score_threshold = float(score_threshold)
+        ctx.score_topk = int(score_topk)
+        ctx.workspace = workspace_dict
+        return beliefs, final_belief
+
+    @staticmethod
+    def backward(ctx, grad_beliefs: Tensor, grad_final_belief: Tensor):
+        ext = load_causal_machine_scan_cuda()
+        (
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_saved,
+            initial_log_belief_saved,
+            beliefs_saved,
+            transition_gate_f32,
+            transition_stay_probs_f32,
+            transition_mask_saved,
+            seq_lens_saved,
+        ) = ctx.saved_tensors
+        workspace_dict = getattr(ctx, "workspace", None)
+        if workspace_dict is not None and hasattr(ext, "backward_masked_logits_bound_workspace"):
+            grads = ext.backward_masked_logits_bound_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_saved.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                transition_mask_saved.contiguous(),
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                workspace_dict,
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        else:
+            grads = ext.backward_masked_logits(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_saved.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                transition_mask_saved.contiguous(),
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
+        return (
+            grad_local,
+            _softmax_backward_rows(grad_source_probs, transition_source_probs_f32),
+            _softmax_backward_rows(grad_dest_probs, transition_dest_probs_f32),
+            grad_context,
+            grad_initial,
+            grad_gate.reshape_as(transition_gate_f32),
+            grad_stay.reshape_as(transition_stay_probs_f32),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _CausalMachineMaskedScanCudaProbFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits: Tensor,
+        transition_source_probs: Tensor,
+        transition_dest_probs: Tensor,
+        transition_context: Tensor,
+        initial_log_belief: Tensor,
+        transition_gate: Tensor,
+        transition_stay_probs: Tensor,
+        transition_mask: Tensor,
+        seq_lens: Tensor,
+        chunk_size: int,
+        score_clamp_min: float,
+        score_clamp_max: float,
+        score_threshold: float,
+        score_topk: int,
+        workspace: dict[str, Any] | None,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_scan_cuda()
+        local_logits_in = local_logits.contiguous()
+        transition_source_probs_f32 = transition_source_probs.contiguous().float()
+        transition_dest_probs_f32 = transition_dest_probs.contiguous().float()
+        transition_context_in = transition_context.contiguous()
+        initial_log_belief_in = initial_log_belief.contiguous()
+        transition_stay_probs_f32 = transition_stay_probs.contiguous().float()
+        transition_mask_in = transition_mask.contiguous()
+        seq_lens_in = seq_lens.contiguous()
+        workspace_dict = workspace if isinstance(workspace, dict) else None
+        if workspace_dict is not None and hasattr(ext, "forward_masked_logits_bound_workspace"):
+            beliefs, final_belief = ext.forward_masked_logits_bound_workspace(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_in,
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs_f32,
+                transition_mask_in,
+                seq_lens_in,
+                int(chunk_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        else:
+            beliefs, final_belief = ext.forward_masked_logits(
+                local_logits_in,
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_in,
+                initial_log_belief_in,
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs_f32,
+                transition_mask_in,
+                seq_lens_in,
+                int(chunk_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        ctx.save_for_backward(
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_in,
+            initial_log_belief_in,
+            beliefs.contiguous(),
+            transition_gate.float(),
+            transition_stay_probs_f32,
+            transition_mask_in,
+            seq_lens_in,
+        )
+        ctx.chunk_size = int(chunk_size)
+        ctx.score_clamp_min = float(score_clamp_min)
+        ctx.score_clamp_max = float(score_clamp_max)
+        ctx.score_threshold = float(score_threshold)
+        ctx.score_topk = int(score_topk)
+        ctx.workspace = workspace_dict
+        return beliefs, final_belief
+
+    @staticmethod
+    def backward(ctx, grad_beliefs: Tensor, grad_final_belief: Tensor):
+        ext = load_causal_machine_scan_cuda()
+        (
+            transition_source_probs_f32,
+            transition_dest_probs_f32,
+            transition_context_saved,
+            initial_log_belief_saved,
+            beliefs_saved,
+            transition_gate_f32,
+            transition_stay_probs_f32,
+            transition_mask_saved,
+            seq_lens_saved,
+        ) = ctx.saved_tensors
+        workspace_dict = getattr(ctx, "workspace", None)
+        if workspace_dict is not None and hasattr(ext, "backward_masked_logits_bound_workspace"):
+            grads = ext.backward_masked_logits_bound_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_saved.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                transition_mask_saved.contiguous(),
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                workspace_dict,
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        else:
+            grads = ext.backward_masked_logits(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                transition_source_probs_f32,
+                transition_dest_probs_f32,
+                transition_context_saved.contiguous(),
+                initial_log_belief_saved.contiguous(),
+                beliefs_saved.contiguous(),
+                float(transition_gate_f32.detach().float().item()),
+                transition_stay_probs_f32,
+                transition_mask_saved.contiguous(),
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        grad_local, grad_source_probs, grad_dest_probs, grad_context, grad_initial, grad_gate, grad_stay = grads
+        return (
+            grad_local,
+            grad_source_probs,
+            grad_dest_probs,
+            grad_context,
+            grad_initial,
+            grad_gate.reshape_as(transition_gate_f32),
+            grad_stay.reshape_as(transition_stay_probs_f32),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def causal_machine_scan_masked_cuda(
+    local_logits: Tensor,
+    transition_source_logits: Tensor,
+    transition_dest_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int = 64,
+) -> tuple[Tensor, Tensor]:
+    if runtime_config is None:
+        raise ValueError("runtime_config is required for masked CUDA structured scan")
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family="masked_cuda",
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        num_states=int(local_logits.size(2)),
+    )
+    score_clamp_min, score_clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    score_threshold = _resolve_native_structured_score_threshold(runtime_config)
+    score_topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(local_logits.size(-1)))
+    transition_mask = _build_structured_transition_mask(
+        int(local_logits.size(-1)),
+        device=local_logits.device,
+        runtime_config=runtime_config,
+    )
+    if transition_mask is None:
+        raise ValueError("masked CUDA structured scan requires a transition mask")
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens,
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        device=local_logits.device,
+    )
+    ext = load_causal_machine_scan_cuda()
+    empty_seq_lens = torch.empty((0,), device=local_logits.device, dtype=torch.int64)
+    seq_lens_in = seq_lens.contiguous() if seq_lens is not None else empty_seq_lens
+    transition_rank = int(transition_source_logits.size(1))
+    num_states = int(local_logits.size(-1))
+    if _has_native_structured_score_filtering(runtime_config, num_states=num_states) and num_states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        raise RuntimeError("masked CUDA native threshold/topk requires the large-state masked tiled custom kernel path")
+    needs_grad = (
+        torch.is_grad_enabled()
+        and (
+            local_logits.requires_grad
+            or transition_source_logits.requires_grad
+            or transition_dest_logits.requires_grad
+            or transition_context.requires_grad
+            or initial_log_belief.requires_grad
+            or transition_gate.requires_grad
+            or transition_stay_probs.requires_grad
+        )
+    )
+    masked_cuda_autograd = hasattr(ext, "backward_masked_logits")
+    workspace_dict: dict[str, Any] | None = None
+    if runtime_config is not None and hasattr(ext, "create_scan_workspace"):
+        workspace_mode = "masked_tiled_backward" if needs_grad else "masked_tiled_forward"
+        if runtime_config.backend_policy is not None:
+            workspace_mode = (
+                str(runtime_config.backend_policy.workspace_mode_backward)
+                if needs_grad
+                else str(runtime_config.backend_policy.workspace_mode)
+            )
+        workspace_dict = create_structured_scan_workspace(
+            mode=workspace_mode,
+            device=local_logits.device,
+            num_states=int(local_logits.size(-1)),
+            transition_rank=int(transition_source_logits.size(-1)),
+            batch_size=int(local_logits.size(0)),
+            seq_len=int(local_logits.size(1)),
+            chunk_size=int(chunk_size),
+            tile_size=int(local_logits.size(-1)),
+            split_size=1,
+        )
+    if not hasattr(ext, "forward_masked_logits"):
+        raise RuntimeError(
+            "masked CUDA structured scan requires forward_masked_logits and backward_masked_logits in the CUDA extension"
+        )
+    if needs_grad and masked_cuda_autograd:
+        beliefs, final_belief = _CausalMachineMaskedScanCudaFn.apply(
+            local_logits,
+            transition_source_logits,
+            transition_dest_logits,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            transition_mask,
+            seq_lens_in,
+            int(chunk_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+            workspace_dict,
+        )
+    elif not needs_grad:
+        transition_source_probs = F.softmax(
+            transition_source_logits.contiguous().float(),
+            dim=-1,
+        ).contiguous()
+        transition_dest_probs = F.softmax(
+            transition_dest_logits.contiguous().float(),
+            dim=-1,
+        ).contiguous()
+        if workspace_dict is not None and hasattr(ext, "forward_masked_logits_bound_workspace"):
+            beliefs, final_belief = ext.forward_masked_logits_bound_workspace(
+                local_logits.contiguous(),
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context.contiguous(),
+                initial_log_belief.contiguous(),
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs.contiguous().float(),
+                transition_mask.contiguous(),
+                seq_lens_in,
+                int(chunk_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        else:
+            beliefs, final_belief = ext.forward_masked_logits(
+                local_logits.contiguous(),
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context.contiguous(),
+                initial_log_belief.contiguous(),
+                transition_gate.reshape(()).contiguous().float(),
+                transition_stay_probs.contiguous().float(),
+                transition_mask.contiguous(),
+                seq_lens_in,
+                int(chunk_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+    else:
+        raise RuntimeError(
+            "masked CUDA structured scan requires forward_masked_logits and backward_masked_logits in the CUDA extension"
+        )
+    return beliefs, final_belief
+
+
+def causal_machine_scan_masked_probs_cuda(
+    local_logits: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int = 64,
+) -> tuple[Tensor, Tensor]:
+    if runtime_config is None:
+        raise ValueError("runtime_config is required for masked CUDA structured scan")
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family="masked_cuda",
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        num_states=int(local_logits.size(2)),
+    )
+    score_clamp_min, score_clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    score_threshold = _resolve_native_structured_score_threshold(runtime_config)
+    score_topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(local_logits.size(-1)))
+    transition_mask = _build_structured_transition_mask(
+        int(local_logits.size(-1)),
+        device=local_logits.device,
+        runtime_config=runtime_config,
+    )
+    if transition_mask is None:
+        raise ValueError("masked CUDA structured scan requires a transition mask")
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens,
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        device=local_logits.device,
+    )
+    ext = load_causal_machine_scan_cuda()
+    empty_seq_lens = torch.empty((0,), device=local_logits.device, dtype=torch.int64)
+    seq_lens_in = seq_lens.contiguous() if seq_lens is not None else empty_seq_lens
+    if _has_native_structured_score_filtering(runtime_config, num_states=int(local_logits.size(-1))) and int(local_logits.size(-1)) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        raise RuntimeError("masked CUDA native threshold/topk requires the large-state masked tiled custom kernel path")
+    needs_grad = (
+        torch.is_grad_enabled()
+        and (
+            local_logits.requires_grad
+            or transition_source_probs.requires_grad
+            or transition_dest_probs.requires_grad
+            or transition_context.requires_grad
+            or initial_log_belief.requires_grad
+            or transition_gate.requires_grad
+            or transition_stay_probs.requires_grad
+        )
+    )
+    if not hasattr(ext, "forward_masked_logits"):
+        raise RuntimeError(
+            "masked CUDA structured scan requires forward_masked_logits and backward_masked_logits in the CUDA extension"
+        )
+    workspace_dict: dict[str, Any] | None = None
+    if runtime_config is not None and hasattr(ext, "create_scan_workspace"):
+        workspace_mode = "masked_tiled_backward" if needs_grad else "masked_tiled_forward"
+        if runtime_config.backend_policy is not None:
+            workspace_mode = (
+                str(runtime_config.backend_policy.workspace_mode_backward)
+                if needs_grad
+                else str(runtime_config.backend_policy.workspace_mode)
+            )
+        workspace_dict = create_structured_scan_workspace(
+            mode=workspace_mode,
+            device=local_logits.device,
+            num_states=int(local_logits.size(-1)),
+            transition_rank=int(transition_source_probs.size(-1)),
+            batch_size=int(local_logits.size(0)),
+            seq_len=int(local_logits.size(1)),
+            chunk_size=int(chunk_size),
+            tile_size=int(local_logits.size(-1)),
+            split_size=1,
+        )
+    if needs_grad and hasattr(ext, "backward_masked_logits"):
+        return _CausalMachineMaskedScanCudaProbFn.apply(
+            local_logits,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            transition_mask,
+            seq_lens_in,
+            int(chunk_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+            workspace_dict,
+        )
+    if needs_grad:
+        raise RuntimeError(
+            "masked CUDA structured scan requires forward_masked_logits and backward_masked_logits in the CUDA extension"
+        )
+    if workspace_dict is not None and hasattr(ext, "forward_masked_logits_bound_workspace"):
+        return ext.forward_masked_logits_bound_workspace(
+            local_logits.contiguous(),
+            transition_source_probs.contiguous().float(),
+            transition_dest_probs.contiguous().float(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous(),
+            transition_gate.reshape(()).contiguous().float(),
+            transition_stay_probs.contiguous().float(),
+            transition_mask.contiguous(),
+            seq_lens_in,
+            int(chunk_size),
+            workspace_dict,
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    return ext.forward_masked_logits(
+        local_logits.contiguous(),
+        transition_source_probs.contiguous().float(),
+        transition_dest_probs.contiguous().float(),
+        transition_context.contiguous(),
+        initial_log_belief.contiguous(),
+        transition_gate.reshape(()).contiguous().float(),
+        transition_stay_probs.contiguous().float(),
+        transition_mask.contiguous(),
+        seq_lens_in,
+        int(chunk_size),
+        float(score_clamp_min),
+        float(score_clamp_max),
+        float(score_threshold),
+        int(score_topk),
+    )
+
+
+def _execute_structured_sparse_runtime_cuda(
+    local_logits: Tensor,
+    transition_source_logits: Tensor,
+    transition_dest_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    sparse_transition_tables: StructuredSparseTransitionTables | None,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int,
+    needs_grad: bool,
+) -> tuple[Tensor, Tensor] | None:
+    if sparse_transition_tables is None:
+        return None
+    grouped_block_count = max(int(sparse_transition_tables.grouped_src_group_count), 0)
+    grouped_sparse_gain = (
+        grouped_block_count > 0
+        and grouped_block_count < int(sparse_transition_tables.col_idx.numel())
+    )
+    if not (
+        float(sparse_transition_tables.density) < 1.0
+        or _structured_runtime_prefers_sparse_cuda(
+            runtime_config,
+            num_states=int(local_logits.size(-1)),
+        )
+        or grouped_sparse_gain
+    ):
+        return None
+    if _can_use_causal_machine_sparse_scan_cuda(
+        local_logits.device,
+        num_states=int(local_logits.size(-1)),
+        transition_rank=int(transition_source_logits.size(-1)),
+    ):
+        if needs_grad:
+            return causal_machine_scan_sparse_cuda_autograd(
+                local_logits,
+                transition_source_logits,
+                transition_dest_logits,
+                transition_context,
+                initial_log_belief,
+                transition_gate,
+                transition_stay_probs,
+                sparse_transition_tables,
+                runtime_config=runtime_config,
+                chunk_size=int(chunk_size),
+            )
+        return causal_machine_scan_sparse_cuda(
+            local_logits,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            sparse_transition_tables,
+            runtime_config=runtime_config,
+            chunk_size=int(chunk_size),
+        )
+    if not _structured_runtime_supports_masked_cuda(runtime_config):
+        return None
+    if not _can_use_causal_machine_masked_scan_cuda(
+        local_logits.device,
+        num_states=int(local_logits.size(-1)),
+        transition_rank=int(transition_source_logits.size(-1)),
+        needs_grad=bool(needs_grad),
+        runtime_config=runtime_config,
+    ):
+        return None
+    return causal_machine_scan_masked_cuda(
+        local_logits,
+        transition_source_logits,
+        transition_dest_logits,
+        transition_context,
+        initial_log_belief,
+        transition_gate,
+        transition_stay_probs,
+        runtime_config=runtime_config,
+        chunk_size=int(chunk_size),
+    )
+
+
+def causal_machine_scan_tiled_cuda(
+    local_logits: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int,
+    tile_size: int,
+    split_size: int,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+    workspace: dict[str, Any] | None = None,
+) -> tuple[Tensor, Tensor]:
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family="cuda_tiled",
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        num_states=int(local_logits.size(2)),
+    )
+    if runtime_config is not None:
+        if _structured_runtime_score_mod_callback(runtime_config) is not None:
+            raise ValueError("tiled CUDA structured scan does not support callback-based score_mod")
+        if _structured_runtime_uses_transition_masking(runtime_config):
+            return causal_machine_scan_masked_probs_cuda(
+                local_logits,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context,
+                initial_log_belief,
+                transition_gate,
+                transition_stay_probs,
+                runtime_config=runtime_config,
+                chunk_size=int(chunk_size),
+            )
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens if runtime_config is not None else None,
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        device=local_logits.device,
+    )
+    ext = load_causal_machine_scan_cuda()
+    empty_seq_lens = torch.empty((0,), device=local_logits.device, dtype=torch.int64)
+    score_clamp_min, score_clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    score_threshold = _resolve_native_structured_score_threshold(runtime_config)
+    score_topk = _resolve_native_structured_score_topk(runtime_config, num_states=int(local_logits.size(-1)))
+    use_packed_tables = packed_transition_tables is not None
+    if use_packed_tables:
+        packed_kind, packed_source_q, packed_source_scales, packed_dest_q, packed_dest_scales = packed_transition_tables
+        if packed_kind == _PACKED_TRANSITION_INT8:
+            use_packed_tables = hasattr(ext, "forward_tiled_quantized_kernel") and (
+                not torch.is_grad_enabled() or hasattr(ext, "backward_tiled_quantized_kernel")
+            )
+        elif packed_kind in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}:
+            use_packed_tables = hasattr(ext, "forward_tiled_fp8_kernel") and (
+                not torch.is_grad_enabled() or hasattr(ext, "backward_tiled_fp8_kernel")
+            )
+        else:
+            use_packed_tables = False
+    if not use_packed_tables:
+        packed_kind = _PACKED_TRANSITION_INT8
+        packed_source_q = torch.empty((0, 0), device=local_logits.device, dtype=torch.int8)
+        packed_source_scales = torch.empty((0,), device=local_logits.device, dtype=torch.float32)
+        packed_dest_q = torch.empty((0, 0), device=local_logits.device, dtype=torch.int8)
+        packed_dest_scales = torch.empty((0,), device=local_logits.device, dtype=torch.float32)
+    needs_grad = (
+        torch.is_grad_enabled()
+        and (
+            local_logits.requires_grad
+            or transition_source_probs.requires_grad
+            or transition_dest_probs.requires_grad
+            or transition_context.requires_grad
+            or initial_log_belief.requires_grad
+            or transition_gate.requires_grad
+            or transition_stay_probs.requires_grad
+        )
+    )
+    can_use_custom_tiled_forward_kernel = (
+        hasattr(ext, "forward_tiled_logits_kernel")
+        and _can_use_causal_machine_tiled_forward_kernel(
+            local_logits.device,
+            num_states=int(local_logits.size(-1)),
+            transition_rank=int(transition_source_probs.size(-1)),
+            seq_len=int(local_logits.size(1)),
+            chunk_size=int(chunk_size),
+            tile_size=int(tile_size),
+            split_size=int(split_size),
+            runtime_config=runtime_config,
+        )
+    )
+    can_use_custom_tiled_backward_kernel = (
+        needs_grad
+        and hasattr(ext, "backward_tiled_probs_kernel")
+        and _can_use_causal_machine_tiled_backward_kernel(
+            local_logits.device,
+            num_states=int(local_logits.size(-1)),
+            transition_rank=int(transition_source_probs.size(-1)),
+            seq_len=int(local_logits.size(1)),
+            chunk_size=int(chunk_size),
+            tile_size=int(tile_size),
+            split_size=int(split_size),
+            runtime_config=runtime_config,
+        )
+    )
+    if use_packed_tables and (
+        not can_use_custom_tiled_forward_kernel
+        or (needs_grad and not can_use_custom_tiled_backward_kernel)
+    ):
+        use_packed_tables = False
+        packed_kind = _PACKED_TRANSITION_INT8
+        packed_source_q = torch.empty((0, 0), device=local_logits.device, dtype=torch.int8)
+        packed_source_scales = torch.empty((0,), device=local_logits.device, dtype=torch.float32)
+        packed_dest_q = torch.empty((0, 0), device=local_logits.device, dtype=torch.int8)
+        packed_dest_scales = torch.empty((0,), device=local_logits.device, dtype=torch.float32)
+    native_filtering_active = _has_native_structured_score_filtering(runtime_config, num_states=int(local_logits.size(-1)))
+    if native_filtering_active and not can_use_custom_tiled_forward_kernel:
+        raise RuntimeError("cuda_tiled native threshold/topk requires the custom tiled forward kernel")
+    if native_filtering_active and needs_grad and not can_use_custom_tiled_backward_kernel:
+        raise RuntimeError("cuda_tiled native threshold/topk requires the custom tiled backward kernel when gradients are enabled")
+    if not can_use_custom_tiled_forward_kernel and not hasattr(ext, "forward_tiled_logits"):
+        raise RuntimeError("cuda_tiled requires forward_tiled_logits in the CUDA extension")
+    if needs_grad and not can_use_custom_tiled_backward_kernel and not hasattr(ext, "backward_tiled_probs"):
+        raise RuntimeError("cuda_tiled requires backward_tiled_probs in the CUDA extension when gradients are enabled")
+    workspace_dict = workspace
+    if (
+        workspace_dict is None
+        and (can_use_custom_tiled_forward_kernel or can_use_custom_tiled_backward_kernel)
+    ):
+        workspace_mode = "tiled_backward" if needs_grad and can_use_custom_tiled_backward_kernel else "tiled_forward"
+        if runtime_config is not None and runtime_config.backend_policy is not None:
+            if needs_grad and can_use_custom_tiled_backward_kernel:
+                workspace_mode = str(runtime_config.backend_policy.workspace_mode_backward)
+            else:
+                workspace_mode = str(runtime_config.backend_policy.workspace_mode)
+        workspace_dict = create_structured_scan_workspace(
+            mode=workspace_mode,
+            device=local_logits.device,
+            num_states=int(local_logits.size(-1)),
+            transition_rank=int(transition_source_probs.size(-1)),
+            batch_size=int(local_logits.size(0)),
+            seq_len=int(local_logits.size(1)),
+            chunk_size=int(chunk_size),
+            tile_size=int(tile_size),
+            split_size=int(split_size),
+        )
+    if needs_grad:
+        beliefs, final_belief = _CausalMachineTiledScanCudaFn.apply(
+            local_logits,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            transition_gate.reshape(()),
+            transition_stay_probs,
+            packed_source_q,
+            packed_source_scales,
+            packed_dest_q,
+            packed_dest_scales,
+            int(packed_kind),
+            bool(use_packed_tables),
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+            bool(can_use_custom_tiled_forward_kernel),
+            bool(can_use_custom_tiled_backward_kernel),
+            workspace_dict,
+        )
+    elif use_packed_tables and int(packed_kind) == _PACKED_TRANSITION_INT8:
+        beliefs, final_belief = ext.forward_tiled_quantized_kernel(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    elif use_packed_tables and int(packed_kind) in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}:
+        beliefs, final_belief = ext.forward_tiled_fp8_kernel(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            0 if int(packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    elif can_use_custom_tiled_forward_kernel:
+        if workspace_dict is not None and hasattr(ext, "forward_tiled_logits_kernel_bound_workspace"):
+            beliefs, final_belief = ext.forward_tiled_logits_kernel_bound_workspace(
+                local_logits.contiguous(),
+                transition_source_probs.contiguous().float(),
+                transition_dest_probs.contiguous().float(),
+                transition_context.contiguous(),
+                initial_log_belief.contiguous().float(),
+                transition_gate.reshape(()).float(),
+                transition_stay_probs.contiguous().float(),
+                seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif workspace_dict is not None and hasattr(ext, "forward_tiled_logits_kernel_workspace"):
+            beliefs, final_belief = ext.forward_tiled_logits_kernel_workspace(
+                local_logits.contiguous(),
+                transition_source_probs.contiguous().float(),
+                transition_dest_probs.contiguous().float(),
+                transition_context.contiguous(),
+                initial_log_belief.contiguous().float(),
+                transition_gate.reshape(()).float(),
+                transition_stay_probs.contiguous().float(),
+                seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["filtered_value_cache"],
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        else:
+            beliefs, final_belief = ext.forward_tiled_logits_kernel(
+                local_logits.contiguous(),
+                transition_source_probs.contiguous().float(),
+                transition_dest_probs.contiguous().float(),
+                transition_context.contiguous(),
+                initial_log_belief.contiguous().float(),
+                transition_gate.reshape(()).float(),
+                transition_stay_probs.contiguous().float(),
+                seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+    else:
+        beliefs, final_belief = ext.forward_tiled_logits(
+            local_logits.contiguous(),
+            transition_source_probs.contiguous().float(),
+            transition_dest_probs.contiguous().float(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+        )
+    return beliefs, final_belief
+
+
+@dataclass(frozen=True)
+class StructuredSparseTransitionTables:
+    blocks: Tensor
+    row_ptr: Tensor
+    col_idx: Tensor
+    dst_idx: Tensor
+    src_row_ptr: Tensor
+    src_nz_idx: Tensor
+    row_sums: Tensor
+    block_mask: Tensor
+    block_size: int
+    density: float
+    grouped_src_row_ptr: Tensor | None = None
+    grouped_src_block_idx: Tensor | None = None
+    grouped_src_group_ids: Tensor | None = None
+    grouped_src_group_count: int = 0
+
+
+def describe_structured_sparse_transition_tables(
+    sparse_transition_tables: StructuredSparseTransitionTables,
+) -> dict[str, int | float | bool]:
+    nnz_blocks = int(sparse_transition_tables.col_idx.numel())
+    grouped_src_group_count = int(sparse_transition_tables.grouped_src_group_count)
+    avg_blocks_per_group = (
+        float(nnz_blocks) / float(max(grouped_src_group_count, 1))
+        if grouped_src_group_count > 0
+        else 0.0
+    )
+    return {
+        "nnz_blocks": nnz_blocks,
+        "block_size": int(sparse_transition_tables.block_size),
+        "density": float(sparse_transition_tables.density),
+        "has_grouped_backward_metadata": sparse_transition_tables.grouped_src_row_ptr is not None,
+        "grouped_src_group_count": grouped_src_group_count,
+        "avg_blocks_per_group": avg_blocks_per_group,
+    }
+
+
+def _default_structured_sparse_block_size(num_states: int) -> int:
+    states = max(int(num_states), 1)
+    if states <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        return 32
+    if states <= 256:
+        return 64
+    return _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+
+
+def _structured_sparse_cache_tensor_key(tensor: Tensor | None) -> tuple[int, int, tuple[int, ...]] | None:
+    if tensor is None:
+        return None
+    return (
+        int(tensor.data_ptr()),
+        int(getattr(tensor, "_version", -1)),
+        tuple(int(dim) for dim in tensor.shape),
+    )
+
+
+def _build_grouped_sparse_backward_metadata_cpu(
+    col_idx: Tensor,
+    src_nz_idx: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if int(src_nz_idx.numel()) == 0:
+        empty = torch.empty((0,), device=col_idx.device, dtype=torch.int32)
+        return torch.zeros((1,), device=col_idx.device, dtype=torch.int32), empty, empty
+    ordered_src_blocks = col_idx.index_select(0, src_nz_idx.to(torch.int64)).to(torch.int32).contiguous()
+    starts = torch.ones_like(ordered_src_blocks, dtype=torch.int32)
+    if int(ordered_src_blocks.numel()) > 1:
+        starts[1:] = ordered_src_blocks[1:].ne(ordered_src_blocks[:-1]).to(torch.int32)
+    group_ids = starts.cumsum(0).sub_(1).to(torch.int32).contiguous()
+    num_groups = int(group_ids[-1].item()) + 1
+    counts = torch.bincount(group_ids.to(torch.int64), minlength=num_groups).to(torch.int32)
+    row_ptr = torch.zeros((num_groups + 1,), device=col_idx.device, dtype=torch.int32)
+    if num_groups > 0:
+        row_ptr[1:] = counts.cumsum(0).to(torch.int32)
+    group_start_idx = torch.nonzero(starts, as_tuple=False).flatten().to(torch.int64)
+    grouped_src_block_idx = ordered_src_blocks.index_select(0, group_start_idx).to(torch.int32).contiguous()
+    return row_ptr.contiguous(), grouped_src_block_idx, group_ids
+
+
+def _build_grouped_sparse_backward_metadata_python(
+    col_idx: Tensor,
+    src_nz_idx: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    return _build_grouped_sparse_backward_metadata_cpu(col_idx, src_nz_idx)
+
+
+def get_or_update_scan_transition_sparse_blocks(
+    cache: dict[str, object],
+    source_logits: Tensor,
+    dest_logits: Tensor,
+    device: torch.device,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+) -> StructuredSparseTransitionTables | None:
+    if runtime_config is None or not _structured_runtime_supports_sparse_cuda(runtime_config):
+        return None
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=device,
+        dtype=torch.float32,
+        backend_family="sparse_metadata",
+        batch_size=1,
+        seq_len=1,
+        num_states=max(int(source_logits.size(0)), 1),
+    )
+    num_states = int(source_logits.size(0))
+    transition_rank = int(source_logits.size(1))
+    if num_states <= 0 or transition_rank <= 0:
+        return None
+    block_size = max(1, min(
+        int(runtime_config.block_size or _default_structured_sparse_block_size(num_states)),
+        num_states,
+    ))
+    device_index = int(device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else -1))
+    cache_key = (
+        device_index,
+        int(num_states),
+        int(transition_rank),
+        int(getattr(source_logits, "_version", -1)),
+        int(getattr(dest_logits, "_version", -1)),
+        int(block_size),
+        int(packed_transition_tables[0]) if packed_transition_tables is not None else -1,
+        int(runtime_config.local_transition_window) if runtime_config.local_transition_window is not None else -1,
+        _structured_sparse_cache_tensor_key(runtime_config.transition_mask),
+        _structured_sparse_cache_tensor_key(runtime_config.block_mask),
+        id(runtime_config.transition_mask_mod) if runtime_config.transition_mask_mod is not None else 0,
+    )
+    cached_key = cache.get("key")
+    cached_tables = cache.get("tables")
+    if (
+        runtime_config.transition_mask_mod is None
+        and cached_key == cache_key
+        and isinstance(cached_tables, StructuredSparseTransitionTables)
+    ):
+        return cached_tables
+
+    with torch.no_grad():
+        if runtime_config.grouped_launch_pack is not None:
+            runtime_config.grouped_launch_pack.record_row_sum_prep()
+        num_state_blocks = math.ceil(num_states / block_size)
+        padded_states = num_state_blocks * block_size
+        source_probs = F.softmax(source_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
+        dest_probs = F.softmax(dest_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
+        if device.type == "cuda":
+            ext = load_causal_machine_scan_cuda()
+            transition_mask: Tensor | None = (
+                runtime_config.transition_mask.to(device=device, dtype=torch.bool).contiguous()
+                if runtime_config is not None and runtime_config.transition_mask is not None
+                else None
+            )
+            mod_transition_mask = _evaluate_structured_transition_mask_mod(
+                num_states,
+                device=device,
+                runtime_config=runtime_config,
+            )
+            if mod_transition_mask is not None:
+                transition_mask = (
+                    mod_transition_mask
+                    if transition_mask is None
+                    else (transition_mask & mod_transition_mask).contiguous()
+                )
+            transition_mask_tensor = (
+                transition_mask
+                if transition_mask is not None
+                else torch.empty((0, 0), device=device, dtype=torch.bool)
+            )
+            runtime_block_mask = (
+                runtime_config.block_mask.to(device=device, dtype=torch.bool).contiguous()
+                if runtime_config is not None and runtime_config.block_mask is not None
+                else torch.empty((0, 0), device=device, dtype=torch.bool)
+            )
+            row_ptr, col_idx, dst_idx, src_row_ptr, src_nz_idx, block_mask = ext.build_sparse_metadata_from_runtime(
+                int(num_states),
+                int(padded_states),
+                int(block_size),
+                int(runtime_config.local_transition_window) if runtime_config is not None and runtime_config.local_transition_window is not None else -1,
+                transition_mask_tensor,
+                runtime_block_mask,
+            )
+            if int(col_idx.numel()) > 0:
+                if packed_transition_tables is not None:
+                    packed_kind, packed_source_q, packed_source_scales, packed_dest_q, packed_dest_scales = packed_transition_tables
+                    if packed_kind == _PACKED_TRANSITION_INT8:
+                        transition_blocks, row_sums = ext.materialize_sparse_blocks_int8(
+                            packed_source_q.contiguous(),
+                            packed_source_scales.contiguous(),
+                            packed_dest_q.contiguous(),
+                            packed_dest_scales.contiguous(),
+                            col_idx,
+                            dst_idx,
+                            block_mask,
+                            int(padded_states),
+                            int(block_size),
+                        )
+                    elif packed_kind in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}:
+                        transition_blocks, row_sums = ext.materialize_sparse_blocks_fp8(
+                            packed_source_q.contiguous(),
+                            packed_source_scales.contiguous(),
+                            packed_dest_q.contiguous(),
+                            packed_dest_scales.contiguous(),
+                            col_idx,
+                            dst_idx,
+                            block_mask,
+                            0 if packed_kind == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                            int(padded_states),
+                            int(block_size),
+                        )
+                    else:
+                        raise ValueError(f"unsupported packed transition kind: {packed_kind}")
+                else:
+                    transition_blocks, row_sums = ext.materialize_sparse_blocks(
+                        source_probs.contiguous(),
+                        dest_probs.contiguous(),
+                        col_idx,
+                        dst_idx,
+                        block_mask,
+                        int(padded_states),
+                        int(block_size),
+                    )
+            else:
+                transition_blocks = torch.empty((0, block_size, block_size), device=device, dtype=torch.float32)
+                row_sums = torch.zeros((padded_states,), device=device, dtype=torch.float32)
+        else:
+            mask = _build_structured_transition_mask(
+                num_states,
+                device=device,
+                runtime_config=runtime_config,
+            )
+            if mask is None:
+                return None
+            if padded_states != num_states:
+                source_pad = torch.zeros((padded_states, transition_rank), device=device, dtype=torch.float32)
+                source_pad[:num_states, :] = source_probs
+                source_probs = source_pad
+                dest_pad = torch.zeros((transition_rank, padded_states), device=device, dtype=torch.float32)
+                dest_pad[:, :num_states] = dest_probs
+                dest_probs = dest_pad
+                mask_pad = torch.zeros((padded_states, padded_states), device=device, dtype=torch.bool)
+                mask_pad[:num_states, :num_states] = mask
+                mask = mask_pad
+            block_active = (
+                mask.view(num_state_blocks, block_size, num_state_blocks, block_size)
+                .permute(0, 2, 1, 3)
+                .any(dim=3)
+                .any(dim=2)
+            )
+            row_ptr_list: list[int] = [0]
+            col_idx_list: list[int] = []
+            dst_idx_list: list[int] = []
+            for dst_block in range(num_state_blocks):
+                active_src = torch.nonzero(block_active[:, dst_block], as_tuple=False).flatten()
+                row_ptr_list.append(row_ptr_list[-1] + int(active_src.numel()))
+                for src_block in active_src.tolist():
+                    col_idx_list.append(int(src_block))
+                    dst_idx_list.append(int(dst_block))
+            row_ptr = torch.tensor(row_ptr_list, device=device, dtype=torch.int32).contiguous()
+            col_idx = torch.tensor(col_idx_list, device=device, dtype=torch.int32).contiguous()
+            dst_idx = torch.tensor(dst_idx_list, device=device, dtype=torch.int32).contiguous()
+            if col_idx_list:
+                block_mask = torch.stack(
+                    [
+                        mask[
+                            src_block * block_size : (src_block + 1) * block_size,
+                            dst_block * block_size : (dst_block + 1) * block_size,
+                        ]
+                        for src_block, dst_block in zip(col_idx_list, dst_idx_list)
+                    ],
+                    dim=0,
+                ).to(dtype=torch.float32).contiguous()
+                raw_blocks: list[Tensor] = []
+                row_sums = torch.zeros((padded_states,), device=device, dtype=torch.float32)
+                for src_block, dst_block in zip(col_idx_list, dst_idx_list):
+                    src_base = src_block * block_size
+                    dst_base = dst_block * block_size
+                    raw_block = torch.matmul(
+                        source_probs[src_base : src_base + block_size, :],
+                        dest_probs[:, dst_base : dst_base + block_size],
+                    )
+                    raw_block = raw_block * mask[
+                        src_base : src_base + block_size,
+                        dst_base : dst_base + block_size,
+                    ].to(torch.float32)
+                    row_sums[src_base : src_base + block_size] += raw_block.sum(dim=1)
+                    raw_blocks.append(raw_block)
+                transition_blocks = torch.stack(
+                    [
+                        raw_block / row_sums[src_block * block_size : (src_block + 1) * block_size].clamp_min(1.0e-20).unsqueeze(1)
+                        for raw_block, src_block in zip(raw_blocks, col_idx_list)
+                    ],
+                    dim=0,
+                ).contiguous()
+            else:
+                transition_blocks = torch.empty((0, block_size, block_size), device=device, dtype=torch.float32)
+                row_sums = torch.zeros((padded_states,), device=device, dtype=torch.float32)
+                block_mask = torch.empty((0, block_size, block_size), device=device, dtype=torch.float32)
+            src_row_ptr_list: list[int] = [0]
+            src_nz_idx_list: list[int] = []
+            for src_block in range(num_state_blocks):
+                nz_indices = [idx for idx, block_idx in enumerate(col_idx_list) if block_idx == src_block]
+                src_nz_idx_list.extend(nz_indices)
+                src_row_ptr_list.append(len(src_nz_idx_list))
+            src_row_ptr = torch.tensor(src_row_ptr_list, device=device, dtype=torch.int32).contiguous()
+            src_nz_idx = torch.tensor(src_nz_idx_list, device=device, dtype=torch.int32).contiguous()
+        density = float(int(col_idx.numel())) / float(max(num_state_blocks * num_state_blocks, 1))
+        if device.type == "cuda":
+            ext = load_causal_machine_scan_cuda()
+            if hasattr(ext, "build_grouped_sparse_backward_metadata"):
+                grouped_src_row_ptr, grouped_src_block_idx, grouped_src_group_ids = ext.build_grouped_sparse_backward_metadata(
+                    col_idx.contiguous(),
+                    src_nz_idx.contiguous(),
+                )
+            else:
+                grouped_src_row_ptr, grouped_src_block_idx, grouped_src_group_ids = _build_grouped_sparse_backward_metadata_python(
+                    col_idx.contiguous(),
+                    src_nz_idx.contiguous(),
+                )
+        else:
+            grouped_src_row_ptr, grouped_src_block_idx, grouped_src_group_ids = _build_grouped_sparse_backward_metadata_python(
+                col_idx.contiguous(),
+                src_nz_idx.contiguous(),
+            )
+        grouped_src_group_count = int(grouped_src_block_idx.numel())
+
+    tables = StructuredSparseTransitionTables(
+        blocks=transition_blocks,
+        row_ptr=row_ptr,
+        col_idx=col_idx,
+        dst_idx=dst_idx,
+        src_row_ptr=src_row_ptr,
+        src_nz_idx=src_nz_idx,
+        row_sums=row_sums.contiguous(),
+        block_mask=block_mask,
+        block_size=int(block_size),
+        density=float(density),
+        grouped_src_row_ptr=grouped_src_row_ptr.contiguous(),
+        grouped_src_block_idx=grouped_src_block_idx.contiguous(),
+        grouped_src_group_ids=grouped_src_group_ids.contiguous(),
+        grouped_src_group_count=int(grouped_src_group_count),
+    )
+    if runtime_config.transition_mask_mod is None:
+        cache.clear()
+        cache["key"] = cache_key
+        cache["tables"] = tables
+    return tables
+
+
+def causal_machine_scan_sparse_cuda(
+    local_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    sparse_transition_tables: StructuredSparseTransitionTables,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int = 64,
+) -> tuple[Tensor, Tensor]:
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family="sparse_cuda",
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        num_states=int(local_logits.size(2)),
+    )
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens if runtime_config is not None else None,
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        device=local_logits.device,
+    )
+    ext = load_causal_machine_scan_cuda()
+    empty_seq_lens = torch.empty((0,), device=local_logits.device, dtype=torch.int64)
+    beliefs, final_belief = ext.forward_sparse_logits(
+        local_logits.contiguous(),
+        sparse_transition_tables.blocks.contiguous(),
+        sparse_transition_tables.row_ptr.contiguous(),
+        sparse_transition_tables.col_idx.contiguous(),
+        transition_context.contiguous(),
+        initial_log_belief.contiguous(),
+        transition_gate.reshape(()).contiguous().float(),
+        transition_stay_probs.contiguous().float(),
+        seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+        int(sparse_transition_tables.block_size),
+        int(chunk_size),
+    )
+    return beliefs, final_belief
+
+
+def causal_machine_scan_sparse_cuda_autograd(
+    local_logits: Tensor,
+    transition_source_logits: Tensor,
+    transition_dest_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    sparse_transition_tables: StructuredSparseTransitionTables,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    chunk_size: int = 64,
+) -> tuple[Tensor, Tensor]:
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens if runtime_config is not None else None,
+        batch_size=int(local_logits.size(0)),
+        seq_len=int(local_logits.size(1)),
+        device=local_logits.device,
+    )
+    empty_seq_lens = torch.empty((0,), device=local_logits.device, dtype=torch.int64)
+    return _CausalMachineSparseScanCudaFn.apply(
+        local_logits,
+        transition_source_logits,
+        transition_dest_logits,
+        transition_context,
+        initial_log_belief,
+        transition_gate,
+        transition_stay_probs,
+        sparse_transition_tables.row_ptr,
+        sparse_transition_tables.col_idx,
+        sparse_transition_tables.dst_idx,
+        sparse_transition_tables.src_row_ptr,
+        sparse_transition_tables.src_nz_idx,
+        (
+            sparse_transition_tables.grouped_src_row_ptr
+            if sparse_transition_tables.grouped_src_row_ptr is not None
+            else torch.empty((0,), device=local_logits.device, dtype=torch.int32)
+        ),
+        (
+            sparse_transition_tables.grouped_src_block_idx
+            if sparse_transition_tables.grouped_src_block_idx is not None
+            else torch.empty((0,), device=local_logits.device, dtype=torch.int32)
+        ),
+        sparse_transition_tables.block_mask,
+        seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+        int(sparse_transition_tables.block_size),
         int(chunk_size),
     )
 
 
 def supports_structured_scan_cuda_rank(transition_rank: int) -> bool:
-    return int(transition_rank) in (8, 16, 32, 64, 128)
+    return supports_structured_scan_cuda_config(_MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES, transition_rank)
 
 
 def quantize_scan_transition_table_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
@@ -567,47 +3654,188 @@ def quantize_scan_transition_table_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, scales
 
 
+def get_or_update_structured_reduced_transition_cache(
+    cache: dict[str, object],
+    source_logits: Tensor,
+    dest_logits: Tensor,
+    device: torch.device,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    num_states: int,
+    tile_size: int,
+    split_size: int,
+) -> StructuredReducedTransitionCache | None:
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=device,
+        dtype=torch.float32,
+        backend_family="reduced_transition",
+        batch_size=1,
+        seq_len=1,
+        num_states=max(int(num_states), 1),
+    )
+    source_version = int(getattr(source_logits, "_version", -1))
+    dest_version = int(getattr(dest_logits, "_version", -1))
+    cache_key = (
+        int(device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else -1)),
+        source_version,
+        dest_version,
+        int(num_states),
+        int(tile_size),
+        int(split_size),
+        _structured_sparse_cache_tensor_key(runtime_config.transition_mask),
+        _structured_sparse_cache_tensor_key(runtime_config.block_mask),
+        int(runtime_config.local_transition_window) if runtime_config.local_transition_window is not None else -1,
+        id(runtime_config.transition_mask_mod) if runtime_config.transition_mask_mod is not None else 0,
+    )
+    cached_key = cache.get("key")
+    cached_value = cache.get("reduced")
+    if cached_key == cache_key and isinstance(cached_value, StructuredReducedTransitionCache):
+        runtime_config.reduced_transition_cache = cached_value
+        return cached_value
+    with torch.no_grad():
+        source_probs = F.softmax(source_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
+        dest_probs = F.softmax(dest_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
+        dense_transition_matrix = None
+        row_sums = None
+        if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES or _structured_runtime_uses_transition_masking(runtime_config):
+            dense_transition_matrix = _build_structured_transition_matrix(
+                source_probs,
+                dest_probs,
+                runtime_config=runtime_config,
+            )
+            if dense_transition_matrix is not None:
+                row_sums = dense_transition_matrix.sum(dim=-1).contiguous()
+        split_size = max(int(split_size), 1)
+        source_splits = tuple(
+            source_probs[:, start : min(start + split_size, int(source_probs.size(1)))].contiguous()
+            for start in range(0, int(source_probs.size(1)), split_size)
+        )
+        dest_splits = tuple(
+            dest_probs[start : min(start + split_size, int(dest_probs.size(0))), :].contiguous()
+            for start in range(0, int(dest_probs.size(0)), split_size)
+        )
+        reduced = StructuredReducedTransitionCache(
+            dense_transition_matrix=dense_transition_matrix,
+            source_prob_splits=source_splits,
+            dest_prob_splits=dest_splits,
+            row_sums=row_sums,
+            split_size=int(split_size),
+            tile_size=int(tile_size),
+        )
+    cache.clear()
+    cache["key"] = cache_key
+    cache["reduced"] = reduced
+    runtime_config.reduced_transition_cache = reduced
+    return reduced
+
+
 def get_or_update_scan_transition_prepack(
     cache: dict[str, object],
     source_logits: Tensor,
     dest_logits: Tensor,
     device: torch.device,
-) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+) -> tuple[int, Tensor, Tensor, Tensor, Tensor] | None:
+    num_states = int(source_logits.size(0))
     transition_rank = int(source_logits.size(1))
     if (
         not USE_CAUSAL_MACHINE_SCAN_FUSED_DEQUANT
         or device.type != "cuda"
-        or not supports_structured_scan_cuda_rank(transition_rank)
+        or num_states <= 0
+        or transition_rank <= 0
     ):
         return None
-    # Training needs the exact float-table path; the packed CUDA op is kept as
-    # an eval/inference optimization only.
-    if torch.is_grad_enabled() and (source_logits.requires_grad or dest_logits.requires_grad):
+    device_runtime = _describe_structured_scan_device_runtime(device)
+    if int(device_runtime.get("capability_major", 0)) < 8:
         return None
     device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    packed_kind = _structured_scan_packed_kind()
+    low_precision_recipe = _default_structured_scan_low_precision_recipe()
+    gradients_enabled = torch.is_grad_enabled()
     source_version = int(getattr(source_logits, "_version", -1))
     dest_version = int(getattr(dest_logits, "_version", -1))
     if (
         cache.get("device_index") == device_index
+        and cache.get("packed_kind") == packed_kind
         and cache.get("source_version") == source_version
         and cache.get("dest_version") == dest_version
     ):
         packed = cache.get("packed")
-        if isinstance(packed, tuple) and len(packed) == 4:
+        if isinstance(packed, tuple) and len(packed) == 5:
             return packed  # type: ignore[return-value]
     with torch.no_grad():
+        ext = load_causal_machine_scan_cuda()
+        if gradients_enabled:
+            if packed_kind == _PACKED_TRANSITION_INT8 and not hasattr(ext, "unpack_int8"):
+                return None
+            if packed_kind == _PACKED_TRANSITION_FP8_E4M3 and not hasattr(ext, "unpack_fp8_e4m3"):
+                return None
+            if packed_kind == _PACKED_TRANSITION_FP8_E5M2 and not hasattr(ext, "unpack_fp8_e5m2"):
+                return None
         source_probs = F.softmax(source_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
         dest_probs = F.softmax(dest_logits.detach().to(device=device, dtype=torch.float32), dim=-1).contiguous()
+        low_precision_metadata = _materialize_structured_scan_low_precision_metadata(
+            cache=cache,
+            recipe=low_precision_recipe,
+            source_probs=source_probs,
+            dest_probs=dest_probs,
+        )
+        if packed_kind == _PACKED_TRANSITION_INT8:
+            packed_source_q, packed_source_scales = ext.pack_int8(source_probs)
+            packed_dest_q, packed_dest_scales = ext.pack_int8(dest_probs)
+        elif packed_kind == _PACKED_TRANSITION_FP8_E4M3:
+            packed_source_q, packed_source_scales = ext.pack_fp8_e4m3(source_probs)
+            packed_dest_q, packed_dest_scales = ext.pack_fp8_e4m3(dest_probs)
+        elif packed_kind == _PACKED_TRANSITION_FP8_E5M2:
+            packed_source_q, packed_source_scales = ext.pack_fp8_e5m2(source_probs)
+            packed_dest_q, packed_dest_scales = ext.pack_fp8_e5m2(dest_probs)
+        else:
+            raise ValueError(f"unsupported packed transition kind: {packed_kind}")
         packed = (
-            *quantize_scan_transition_table_per_row(source_probs),
-            *quantize_scan_transition_table_per_row(dest_probs),
+            packed_kind,
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
         )
     cache.clear()
     cache["device_index"] = device_index
+    cache["packed_kind"] = packed_kind
     cache["source_version"] = source_version
     cache["dest_version"] = dest_version
     cache["packed"] = packed
+    cache["low_precision_recipe"] = low_precision_recipe
+    cache["low_precision_source_scale_estimate"] = float(low_precision_metadata.source_scale)
+    cache["low_precision_dest_scale_estimate"] = float(low_precision_metadata.dest_scale)
+    cache["low_precision_source_scale_inv"] = float(low_precision_metadata.source_scale_inv)
+    cache["low_precision_dest_scale_inv"] = float(low_precision_metadata.dest_scale_inv)
     return packed
+
+
+def _unpack_scan_transition_tables(
+    ext,
+    packed_kind: int,
+    packed_source_q: Tensor,
+    packed_source_scales: Tensor,
+    packed_dest_q: Tensor,
+    packed_dest_scales: Tensor,
+) -> tuple[Tensor, Tensor]:
+    if packed_kind == _PACKED_TRANSITION_INT8:
+        return (
+            ext.unpack_int8(packed_source_q, packed_source_scales).contiguous(),
+            ext.unpack_int8(packed_dest_q, packed_dest_scales).contiguous(),
+        )
+    if packed_kind == _PACKED_TRANSITION_FP8_E4M3:
+        return (
+            ext.unpack_fp8_e4m3(packed_source_q, packed_source_scales).contiguous(),
+            ext.unpack_fp8_e4m3(packed_dest_q, packed_dest_scales).contiguous(),
+        )
+    if packed_kind == _PACKED_TRANSITION_FP8_E5M2:
+        return (
+            ext.unpack_fp8_e5m2(packed_source_q, packed_source_scales).contiguous(),
+            ext.unpack_fp8_e5m2(packed_dest_q, packed_dest_scales).contiguous(),
+        )
+    raise ValueError(f"unsupported packed transition kind: {packed_kind}")
 
 
 class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
@@ -620,25 +3848,25 @@ class _CausalMachineLatentScanCudaFn(torch.autograd.Function):
     ) -> tuple[Tensor, Tensor, Tensor]:
         ext = load_causal_machine_latent_scan_cuda()
         drive_in = drive.contiguous()
-        decay_f32 = decay.contiguous().float()
+        decay_in = decay.contiguous().to(dtype=drive_in.dtype)
         initial_state_in = initial_state.contiguous()
-        states, prior_states, final_state = ext.forward(drive_in, decay_f32, initial_state_in)
-        ctx.save_for_backward(states.contiguous(), decay_f32, initial_state_in)
+        states, prior_states, final_state = ext.forward(drive_in, decay_in, initial_state_in)
+        ctx.save_for_backward(states.contiguous(), decay_in, initial_state_in)
         return states, prior_states, final_state
 
     @staticmethod
     def backward(ctx, grad_states: Tensor, grad_prior_states: Tensor, grad_final_state: Tensor):
         ext = load_causal_machine_latent_scan_cuda()
-        states, decay_f32, initial_state_in = ctx.saved_tensors
+        states, decay_in, initial_state_in = ctx.saved_tensors
         grad_drive, grad_decay, grad_initial = ext.backward(
             grad_states.contiguous(),
             grad_prior_states.contiguous(),
             grad_final_state.contiguous(),
             states,
-            decay_f32,
+            decay_in,
             initial_state_in,
         )
-        return grad_drive, grad_decay.reshape_as(decay_f32), grad_initial
+        return grad_drive, grad_decay.reshape_as(decay_in).to(decay_in.dtype), grad_initial
 
 
 def causal_machine_latent_scan_cuda(
@@ -659,24 +3887,24 @@ class _CausalMachineLatentPriorScanCudaFn(torch.autograd.Function):
     ) -> tuple[Tensor, Tensor]:
         ext = load_causal_machine_latent_scan_cuda()
         drive_in = drive.contiguous()
-        decay_f32 = decay.contiguous().float()
+        decay_in = decay.contiguous().to(dtype=drive_in.dtype)
         initial_state_in = initial_state.contiguous()
-        prior_states, final_state = ext.forward_prior_only(drive_in, decay_f32, initial_state_in)
-        ctx.save_for_backward(prior_states.contiguous(), decay_f32, initial_state_in)
+        prior_states, final_state = ext.forward_prior_only(drive_in, decay_in, initial_state_in)
+        ctx.save_for_backward(prior_states.contiguous(), decay_in, initial_state_in)
         return prior_states, final_state
 
     @staticmethod
     def backward(ctx, grad_prior_states: Tensor, grad_final_state: Tensor):
         ext = load_causal_machine_latent_scan_cuda()
-        prior_states, decay_f32, initial_state_in = ctx.saved_tensors
+        prior_states, decay_in, initial_state_in = ctx.saved_tensors
         grad_drive, grad_decay, grad_initial = ext.backward_prior_only(
             grad_prior_states.contiguous(),
             grad_final_state.contiguous(),
             prior_states,
-            decay_f32,
+            decay_in,
             initial_state_in,
         )
-        return grad_drive, grad_decay.reshape_as(decay_f32), grad_initial
+        return grad_drive, grad_decay.reshape_as(decay_in).to(decay_in.dtype), grad_initial
 
 
 def causal_machine_latent_prior_scan_cuda(
@@ -685,6 +3913,93 @@ def causal_machine_latent_prior_scan_cuda(
     initial_state: Tensor,
 ) -> tuple[Tensor, Tensor]:
     return _CausalMachineLatentPriorScanCudaFn.apply(drive, decay, initial_state)
+
+
+class _CausalMachineLatentReplaceCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        local_logits: Tensor,
+        prior_logits: Tensor,
+        transition_context: Tensor,
+        token_gate: Tensor,
+        pred_scale: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_latent_scan_cuda()
+        local_logits_in = local_logits.contiguous()
+        prior_logits_in = prior_logits.contiguous()
+        transition_context_in = transition_context.contiguous()
+        token_gate_in = token_gate.contiguous()
+        pred_scale_in = pred_scale.contiguous()
+        beliefs, prior_log_beliefs = ext.forward_replace(
+            local_logits_in,
+            prior_logits_in,
+            transition_context_in,
+            token_gate_in,
+            pred_scale_in,
+        )
+        ctx.save_for_backward(
+            prior_logits_in,
+            transition_context_in,
+            token_gate_in,
+            pred_scale_in,
+            beliefs.contiguous(),
+            prior_log_beliefs.contiguous(),
+        )
+        return beliefs, prior_log_beliefs
+
+    @staticmethod
+    def backward(ctx, grad_beliefs: Tensor, grad_prior_log_beliefs: Tensor | None):
+        ext = load_causal_machine_latent_scan_cuda()
+        (
+            prior_logits_in,
+            transition_context_in,
+            token_gate_in,
+            pred_scale_in,
+            beliefs,
+            prior_log_beliefs,
+        ) = ctx.saved_tensors
+        if grad_prior_log_beliefs is None:
+            grad_prior_log_beliefs = torch.zeros_like(prior_log_beliefs)
+        (
+            grad_local_logits,
+            grad_prior_logits,
+            grad_transition_context,
+            grad_token_gate,
+            grad_pred_scale,
+        ) = ext.backward_replace(
+            grad_beliefs.contiguous(),
+            grad_prior_log_beliefs.contiguous(),
+            prior_logits_in,
+            transition_context_in,
+            token_gate_in,
+            pred_scale_in,
+            beliefs,
+            prior_log_beliefs,
+        )
+        return (
+            grad_local_logits,
+            grad_prior_logits,
+            grad_transition_context,
+            grad_token_gate,
+            grad_pred_scale,
+        )
+
+
+def causal_machine_latent_replace_cuda(
+    local_logits: Tensor,
+    prior_logits: Tensor,
+    transition_context: Tensor,
+    token_gate: Tensor,
+    pred_scale: Tensor,
+) -> tuple[Tensor, Tensor]:
+    return _CausalMachineLatentReplaceCudaFn.apply(
+        local_logits,
+        prior_logits,
+        transition_context,
+        token_gate,
+        pred_scale,
+    )
 
 
 def structured_transition_predict_log_belief(
@@ -701,6 +4016,326 @@ def structured_transition_predict_log_belief(
     return pred_probs.clamp_min(1.0e-20).log()
 
 
+def _structured_running_logsumexp_update(
+    running_max: Tensor | None,
+    running_sum: Tensor | None,
+    value_tile: Tensor,
+) -> tuple[Tensor, Tensor]:
+    tile_max = value_tile.max(dim=-1, keepdim=True).values
+    tile_sum = torch.exp(value_tile - tile_max).sum(dim=-1, keepdim=True)
+    if running_max is None or running_sum is None:
+        return tile_max, tile_sum
+    new_max = torch.maximum(running_max, tile_max)
+    new_sum = (
+        running_sum * torch.exp(running_max - new_max)
+        + tile_sum * torch.exp(tile_max - new_max)
+    )
+    return new_max, new_sum
+
+
+def structured_scan_fallback_tiled(
+    local_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    transition_stay_probs: Tensor,
+    transition_gate: Tensor,
+    *,
+    chunk_size: int,
+    tile_size: int,
+    split_size: int | None = None,
+    backend: str = "python_tiled",
+    track_transition_kl: bool = False,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    batch_size, seq_len, num_states = local_logits.shape
+    if seq_len == 0:
+        empty_beliefs = torch.empty_like(local_logits)
+        return empty_beliefs, initial_log_belief.float(), None
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family=str(backend),
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_states=num_states,
+    )
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens if runtime_config is not None else None,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=local_logits.device,
+    )
+    carry_plan = runtime_config.prefix_carry_plan
+    assert carry_plan is not None
+    carry_plan.chunk_size = max(int(chunk_size), 1)
+    carry_plan.total_seq_len = int(seq_len)
+    carry_plan.seq_lens = seq_lens
+    belief_steps: list[Tensor] = []
+    prior_steps: list[Tensor] = []
+    prev_log_belief = initial_log_belief.float()
+    prev_probs = prev_log_belief.exp()
+    chunk_size = max(int(chunk_size), 1)
+    tile_size = max(int(tile_size), 1)
+    transition_rank = int(transition_source_probs.size(1))
+    split_size = _default_structured_scan_split_size(num_states, transition_rank) if split_size is None else max(int(split_size), 1)
+    transition_gate_f = transition_gate.to(device=local_logits.device, dtype=torch.float32)
+    source_probs_f = transition_source_probs.float()
+    dest_probs_f = transition_dest_probs.float()
+    stay_probs_f = transition_stay_probs.float()
+    use_split_combine = backend == "cuda_tiled" and local_logits.is_cuda
+    reduced_cache = runtime_config.reduced_transition_cache if runtime_config is not None else None
+    rank_ranges = [
+        (rank_start, min(rank_start + split_size, transition_rank))
+        for rank_start in range(0, transition_rank, split_size)
+    ]
+    source_prob_splits = (
+        list(reduced_cache.source_prob_splits)
+        if reduced_cache is not None and reduced_cache.split_size == split_size and len(reduced_cache.source_prob_splits) == len(rank_ranges)
+        else [source_probs_f[:, rank_start:rank_end].contiguous() for rank_start, rank_end in rank_ranges]
+        if use_split_combine
+        else []
+    )
+    dest_prob_splits = (
+        list(reduced_cache.dest_prob_splits)
+        if reduced_cache is not None and reduced_cache.split_size == split_size and len(reduced_cache.dest_prob_splits) == len(rank_ranges)
+        else [dest_probs_f[rank_start:rank_end, :].contiguous() for rank_start, rank_end in rank_ranges]
+        if use_split_combine
+        else []
+    )
+    for chunk_index, chunk_start in enumerate(range(0, seq_len, chunk_size)):
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        prev_log_belief = carry_plan.resolve_chunk_carry(chunk_index, prev_log_belief)
+        prev_probs = prev_log_belief.exp()
+        for t in range(chunk_start, chunk_end):
+            local_logits_t = local_logits[:, t, :].float()
+            transition_context_t = transition_context[:, t, :].float()
+            latent_probs = None if use_split_combine else (prev_probs @ source_probs_f)
+            latent_prob_splits = (
+                [prev_probs @ source_prob_split for source_prob_split in source_prob_splits]
+                if use_split_combine
+                else []
+            )
+            filtered_tiles: list[Tensor] = []
+            prior_tiles: list[Tensor] = []
+            running_max: Tensor | None = None
+            running_sum: Tensor | None = None
+            for state_start in range(0, num_states, tile_size):
+                state_end = min(state_start + tile_size, num_states)
+                prev_probs_tile = prev_probs[:, state_start:state_end]
+                stay_tile = stay_probs_f[state_start:state_end].unsqueeze(0)
+                if use_split_combine:
+                    mix_probs_tile: Tensor | None = None
+                    for latent_probs_split, dest_prob_split in zip(latent_prob_splits, dest_prob_splits):
+                        mix_probs_contrib = latent_probs_split @ dest_prob_split[:, state_start:state_end]
+                        mix_probs_tile = mix_probs_contrib if mix_probs_tile is None else (mix_probs_tile + mix_probs_contrib)
+                    assert mix_probs_tile is not None
+                else:
+                    assert latent_probs is not None
+                    mix_probs_tile = latent_probs @ dest_probs_f[:, state_start:state_end]
+                pred_probs_tile = stay_tile * prev_probs_tile + (1.0 - stay_tile) * mix_probs_tile
+                pred_log_tile = pred_probs_tile.clamp_min(1.0e-20).log()
+                prior_with_context_tile = pred_log_tile + transition_context_t[:, state_start:state_end]
+                filtered_tile = local_logits_t[:, state_start:state_end] + transition_gate_f * prior_with_context_tile
+                filtered_tiles.append(filtered_tile)
+                if track_transition_kl and _structured_scan_save_all(runtime_config):
+                    prior_tiles.append(prior_with_context_tile)
+                running_max, running_sum = _structured_running_logsumexp_update(
+                    running_max,
+                    running_sum,
+                    filtered_tile,
+                )
+            assert running_max is not None and running_sum is not None
+            log_norm = running_max + running_sum.clamp_min(1.0e-20).log()
+            next_log_belief = torch.cat([tile - log_norm for tile in filtered_tiles], dim=-1)
+            prior_with_context = torch.cat(prior_tiles, dim=-1) if prior_tiles else None
+            next_prev_log_belief = next_log_belief
+            if seq_lens is not None:
+                active = (seq_lens > t).unsqueeze(1)
+                if prior_with_context is not None:
+                    prior_with_context = torch.where(active, prior_with_context, prev_log_belief)
+                next_log_belief = torch.where(active, next_log_belief, prev_log_belief)
+                next_prev_log_belief = next_log_belief
+            if track_transition_kl and _structured_scan_save_all(runtime_config) and prior_with_context is not None:
+                prior_steps.append(prior_with_context.to(dtype=local_logits.dtype))
+            belief_steps.append(next_log_belief.to(dtype=local_logits.dtype))
+            prev_log_belief = next_prev_log_belief
+            prev_probs = prev_log_belief.exp()
+        carry_plan.record_chunk_summary(chunk_index, chunk_start, chunk_end, prev_log_belief)
+        if runtime_config.grouped_launch_pack is not None:
+            runtime_config.grouped_launch_pack.record_grouped_small_scan()
+    prior_log_beliefs = torch.stack(prior_steps, dim=1) if prior_steps else None
+    return torch.stack(belief_steps, dim=1), prev_log_belief, prior_log_beliefs
+
+
+def structured_scan_fallback(
+    local_logits: Tensor,
+    transition_context: Tensor,
+    initial_log_belief: Tensor,
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    transition_stay_probs: Tensor,
+    transition_gate: Tensor,
+    *,
+    chunk_size: int,
+    tile_size: int = 128,
+    split_size: int | None = None,
+    backend: str = "python",
+    track_transition_kl: bool = False,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    batch_size, seq_len, num_states = local_logits.shape
+    if seq_len == 0:
+        empty_beliefs = torch.empty_like(local_logits)
+        return empty_beliefs, initial_log_belief.float(), None
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=local_logits.device,
+        dtype=local_logits.dtype,
+        backend_family=str(backend),
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_states=num_states,
+    )
+    seq_lens = _canonicalize_structured_seq_lens(
+        runtime_config.seq_lens if runtime_config is not None else None,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        device=local_logits.device,
+    )
+    supports_tiled_backend = _structured_runtime_supports_tiled_backend(runtime_config)
+    use_masked_cuda_tiled_backend = (
+        backend == "cuda_tiled"
+        and USE_CAUSAL_MACHINE_CUDA_SCAN
+        and local_logits.is_cuda
+        and (runtime_config is None or runtime_config.allow_cuda)
+        and not track_transition_kl
+        and runtime_config is not None
+        and _structured_runtime_uses_transition_masking(runtime_config)
+        and supports_tiled_backend
+    )
+    if use_masked_cuda_tiled_backend:
+        beliefs, final_log_belief = causal_machine_scan_tiled_cuda(
+            local_logits,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            runtime_config=runtime_config,
+            chunk_size=chunk_size,
+            tile_size=tile_size,
+            split_size=_default_structured_scan_split_size(num_states, int(transition_source_probs.size(1)))
+            if split_size is None
+            else int(split_size),
+            packed_transition_tables=packed_transition_tables,
+        )
+        return beliefs, final_log_belief, None
+    reduced_cache = runtime_config.reduced_transition_cache if runtime_config is not None else None
+    transition_matrix = (
+        reduced_cache.dense_transition_matrix
+        if reduced_cache is not None and reduced_cache.dense_transition_matrix is not None
+        else _build_structured_transition_matrix(
+            transition_source_probs,
+            transition_dest_probs,
+            runtime_config=runtime_config,
+        )
+    )
+    use_cuda_tiled_backend = (
+        backend == "cuda_tiled"
+        and USE_CAUSAL_MACHINE_CUDA_SCAN
+        and local_logits.is_cuda
+        and (runtime_config is None or runtime_config.allow_cuda)
+        and not track_transition_kl
+        and transition_matrix is None
+        and supports_tiled_backend
+    )
+    if use_cuda_tiled_backend:
+        beliefs, final_log_belief = causal_machine_scan_tiled_cuda(
+            local_logits,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_context,
+            initial_log_belief,
+            transition_gate,
+            transition_stay_probs,
+            runtime_config=runtime_config,
+            chunk_size=chunk_size,
+            tile_size=tile_size,
+            split_size=_default_structured_scan_split_size(num_states, int(transition_source_probs.size(1)))
+            if split_size is None
+            else int(split_size),
+            packed_transition_tables=packed_transition_tables,
+        )
+        return beliefs, final_log_belief, None
+    use_tiled_backend = (
+        backend in {"python_tiled", "cuda_tiled"}
+        and transition_matrix is None
+        and supports_tiled_backend
+    )
+    if use_tiled_backend:
+        return structured_scan_fallback_tiled(
+            local_logits,
+            transition_context,
+            initial_log_belief,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_stay_probs,
+            transition_gate,
+            chunk_size=chunk_size,
+            tile_size=tile_size,
+            split_size=split_size,
+            backend=backend,
+            track_transition_kl=track_transition_kl,
+            runtime_config=runtime_config,
+        )
+    belief_steps: list[Tensor] = []
+    prior_steps: list[Tensor] = []
+    prev_log_belief = initial_log_belief.float()
+    chunk_size = max(int(chunk_size), 1)
+    transition_gate_f = transition_gate.to(device=local_logits.device, dtype=torch.float32)
+    for chunk_start in range(0, seq_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        for t in range(chunk_start, chunk_end):
+            if transition_matrix is not None:
+                pred_log_belief = structured_transition_predict_log_belief_dense(
+                    prev_log_belief,
+                    transition_matrix,
+                    transition_stay_probs,
+                )
+            else:
+                pred_log_belief = structured_transition_predict_log_belief(
+                    prev_log_belief,
+                    transition_source_probs,
+                    transition_dest_probs,
+                    transition_stay_probs,
+                )
+            pred_log_belief = _apply_structured_score_mod(
+                pred_log_belief,
+                time_idx=t,
+                runtime_config=runtime_config,
+            )
+            prior_with_context = pred_log_belief + transition_context[:, t, :].float()
+            filtered_logits = local_logits[:, t, :].float() + transition_gate_f * prior_with_context
+            next_log_belief = F.log_softmax(filtered_logits, dim=-1)
+            if seq_lens is not None:
+                active = (seq_lens > t).unsqueeze(1)
+                prior_with_context = torch.where(active, prior_with_context, prev_log_belief)
+                next_log_belief = torch.where(active, next_log_belief, prev_log_belief)
+            if track_transition_kl and _structured_scan_save_all(runtime_config):
+                prior_steps.append(prior_with_context.to(dtype=local_logits.dtype))
+            belief_steps.append(next_log_belief.to(dtype=local_logits.dtype))
+            prev_log_belief = next_log_belief
+        if runtime_config.grouped_launch_pack is not None:
+            runtime_config.grouped_launch_pack.record_grouped_small_scan()
+    prior_log_beliefs = torch.stack(prior_steps, dim=1) if prior_steps else None
+    return torch.stack(belief_steps, dim=1), prev_log_belief, prior_log_beliefs
+
+
 def inverse_softplus_scalar(value: float) -> float:
     value = max(float(value), 1e-6)
     if value > 20.0:
@@ -713,16 +4348,2109 @@ def inverse_sigmoid_scalar(value: float) -> float:
     return math.log(value / (1.0 - value))
 
 
+def _structured_scan_dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).replace("torch.", "")
+
+
+def _structured_scan_shape_bucket(*sizes: int, quantum: int = 32) -> tuple[int, ...]:
+    bucket: list[int] = []
+    for size in sizes:
+        value = max(int(size), 1)
+        rounded = ((value + quantum - 1) // quantum) * quantum
+        bucket.append(int(rounded))
+    return tuple(bucket)
+
+
+def _narrow_tensor_prefix(tensor: Tensor, shape: Sequence[int]) -> Tensor:
+    if tensor.dim() != len(shape):
+        raise ValueError(f"cannot narrow tensor with dim={tensor.dim()} to shape={tuple(shape)}")
+    view = tensor
+    for dim, size in enumerate(shape):
+        if int(view.size(dim)) < int(size):
+            raise ValueError(f"tensor shape {tuple(tensor.shape)} cannot satisfy requested shape {tuple(shape)}")
+        view = view.narrow(dim, 0, int(size))
+    return view
+
+
+@dataclass(frozen=True)
+class StructuredScanWorkspaceKey:
+    device_type: str
+    device_index: int
+    dtype_name: str
+    backend_family: str
+    shape_bucket: tuple[int, ...]
+
+
+@dataclass
+class StructuredScanWorkspace:
+    key: StructuredScanWorkspaceKey
+    buffers: dict[str, Tensor] = field(default_factory=dict)
+    high_water_bytes: int = 0
+
+    def reserve_tensor(
+        self,
+        name: str,
+        shape: Sequence[int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        zero: bool = False,
+    ) -> Tensor:
+        requested_shape = tuple(int(dim) for dim in shape)
+        existing = self.buffers.get(name)
+        if (
+            existing is None
+            or existing.device != device
+            or existing.dtype != dtype
+            or existing.dim() != len(requested_shape)
+            or any(int(existing.size(dim)) < requested_shape[dim] for dim in range(len(requested_shape)))
+        ):
+            buffer = torch.empty(requested_shape, device=device, dtype=dtype)
+            self.buffers[name] = buffer
+            self.high_water_bytes = max(self.high_water_bytes, int(buffer.numel()) * int(buffer.element_size()))
+            existing = buffer
+        view = _narrow_tensor_prefix(existing, requested_shape)
+        if zero:
+            view.zero_()
+        return view
+
+
+@dataclass
+class StructuredScanScratchArena:
+    workspace: StructuredScanWorkspace
+
+    def empty(
+        self,
+        name: str,
+        shape: Sequence[int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return self.workspace.reserve_tensor(name, shape, device=device, dtype=dtype, zero=False)
+
+    def zeros(
+        self,
+        name: str,
+        shape: Sequence[int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        return self.workspace.reserve_tensor(name, shape, device=device, dtype=dtype, zero=True)
+
+
+_STRUCTURED_SCAN_WORKSPACE_REGISTRY: dict[StructuredScanWorkspaceKey, StructuredScanWorkspace] = {}
+
+
+def get_structured_scan_workspace(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    backend_family: str,
+    shape_bucket: Sequence[int],
+) -> StructuredScanWorkspace:
+    device_index = int(device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else -1))
+    key = StructuredScanWorkspaceKey(
+        device_type=str(device.type),
+        device_index=device_index,
+        dtype_name=_structured_scan_dtype_name(dtype),
+        backend_family=str(backend_family),
+        shape_bucket=tuple(int(dim) for dim in shape_bucket),
+    )
+    workspace = _STRUCTURED_SCAN_WORKSPACE_REGISTRY.get(key)
+    if workspace is None:
+        workspace = StructuredScanWorkspace(key=key)
+        _STRUCTURED_SCAN_WORKSPACE_REGISTRY[key] = workspace
+    return workspace
+
+
+@dataclass(frozen=True)
+class StructuredScanBackendPolicy:
+    name: str
+    backend: str
+    arch_family: str
+    kernel_family: str
+    block_threads: int
+    items_per_thread: int
+    tile_size: int
+    split_size: int
+    chunk_size: int
+    load_path: str
+    supports_async_pipeline: bool = False
+    supports_tensor_memory_accel: bool = False
+    supports_cluster_launch_control: bool = False
+    supports_tma: bool = False
+    supports_wgmma: bool = False
+    supports_tcgen05: bool = False
+    use_virtual_shared_fallback: bool = False
+    grouped_launch_packing: bool = False
+    vector_bytes: int = 4
+    elements_per_load: int = 1
+    rank_unroll: int = 1
+    state_unroll: int = 1
+    workspace_mode: str = "tiled_forward"
+    workspace_mode_backward: str = "tiled_backward"
+    sparse_reorder_mode: str = "none"
+    benchmark_family: str = "structured_scan"
+
+
+@dataclass
+class StructuredReducedTransitionCache:
+    dense_transition_matrix: Tensor | None = None
+    source_prob_splits: tuple[Tensor, ...] = ()
+    dest_prob_splits: tuple[Tensor, ...] = ()
+    row_sums: Tensor | None = None
+    split_size: int = 0
+    tile_size: int = 0
+
+
+@dataclass
+class StructuredScanGroupedLaunchPack:
+    row_sum_preps: int = 0
+    paged_cache_ops: int = 0
+    small_decode_updates: int = 0
+    grouped_small_scans: int = 0
+
+    def record_row_sum_prep(self) -> None:
+        self.row_sum_preps += 1
+
+    def record_paged_cache_op(self, count: int = 1) -> None:
+        self.paged_cache_ops += max(int(count), 0)
+
+    def record_small_decode_update(self, count: int = 1) -> None:
+        self.small_decode_updates += max(int(count), 0)
+
+    def record_grouped_small_scan(self, count: int = 1) -> None:
+        self.grouped_small_scans += max(int(count), 0)
+
+
+@dataclass
+class StructuredScanSegmentPrefixState:
+    chunk_index: int
+    chunk_start: int
+    chunk_end: int
+    carry_log_belief: Tensor | None = None
+    active_mask: Tensor | None = None
+
+
+@dataclass
+class StructuredScanSegmentedCarryPlan:
+    chunk_size: int
+    total_seq_len: int
+    seq_lens: Tensor | None = None
+    prefix_states: list[StructuredScanSegmentPrefixState] = field(default_factory=list)
+
+    def resolve_chunk_carry(self, chunk_index: int, current: Tensor) -> Tensor:
+        if chunk_index == 0 or chunk_index - 1 >= len(self.prefix_states):
+            return current
+        prefix_state = self.prefix_states[chunk_index - 1]
+        if prefix_state.carry_log_belief is None:
+            return current
+        if prefix_state.active_mask is None:
+            return prefix_state.carry_log_belief
+        return torch.where(prefix_state.active_mask, prefix_state.carry_log_belief, current)
+
+    def record_chunk_summary(
+        self,
+        chunk_index: int,
+        chunk_start: int,
+        chunk_end: int,
+        carry_log_belief: Tensor,
+    ) -> None:
+        active_mask = None
+        if self.seq_lens is not None:
+            active_mask = (self.seq_lens > int(chunk_end - 1)).unsqueeze(1)
+        state = StructuredScanSegmentPrefixState(
+            chunk_index=int(chunk_index),
+            chunk_start=int(chunk_start),
+            chunk_end=int(chunk_end),
+            carry_log_belief=carry_log_belief.detach(),
+            active_mask=active_mask.detach() if active_mask is not None else None,
+        )
+        if chunk_index < len(self.prefix_states):
+            self.prefix_states[chunk_index] = state
+        else:
+            self.prefix_states.append(state)
+
+
+@dataclass(frozen=True)
+class StructuredScanLowPrecisionRecipe:
+    packed_kind: int
+    amax_history_len: int = 16
+    scale_momentum: float = 0.95
+    update_interval: int = 1
+    allow_graph_capture: bool = True
+
+
+@dataclass
+class StructuredScanLowPrecisionState:
+    source_amax_history: deque[float]
+    dest_amax_history: deque[float]
+    source_scale_estimate: float = 1.0
+    dest_scale_estimate: float = 1.0
+    step: int = 0
+
+
+@dataclass(frozen=True)
+class StructuredScanLowPrecisionMetadata:
+    packed_kind: int
+    source_amax: float
+    dest_amax: float
+    source_scale: float
+    dest_scale: float
+    source_scale_inv: float
+    dest_scale_inv: float
+    step: int
+
+
+@dataclass(frozen=True)
+class StructuredScanArchSpec:
+    arch_family: str
+    capability_major: int
+    capability_minor: int
+    supports_async_pipeline: bool
+    supports_tensor_memory_accel: bool
+    supports_cluster_launch_control: bool
+    supports_tma: bool
+    supports_wgmma: bool
+    supports_tcgen05: bool
+
+
+def _make_structured_scan_low_precision_state(
+    recipe: StructuredScanLowPrecisionRecipe,
+    cache: dict[str, object],
+) -> StructuredScanLowPrecisionState:
+    state = cache.get("low_precision_state")
+    if isinstance(state, StructuredScanLowPrecisionState):
+        return state
+    created = StructuredScanLowPrecisionState(
+        source_amax_history=deque(maxlen=max(int(recipe.amax_history_len), 1)),
+        dest_amax_history=deque(maxlen=max(int(recipe.amax_history_len), 1)),
+    )
+    cache["low_precision_state"] = created
+    return created
+
+
+def _update_structured_scan_low_precision_state(
+    *,
+    cache: dict[str, object],
+    recipe: StructuredScanLowPrecisionRecipe,
+    source_probs: Tensor,
+    dest_probs: Tensor,
+) -> StructuredScanLowPrecisionState:
+    state = _make_structured_scan_low_precision_state(recipe, cache)
+    source_amax = float(source_probs.detach().abs().amax().item())
+    dest_amax = float(dest_probs.detach().abs().amax().item())
+    state.source_amax_history.append(source_amax)
+    state.dest_amax_history.append(dest_amax)
+    state.step += 1
+    if state.step % max(int(recipe.update_interval), 1) == 0:
+        source_target = max(state.source_amax_history) if state.source_amax_history else source_amax
+        dest_target = max(state.dest_amax_history) if state.dest_amax_history else dest_amax
+        momentum = min(max(float(recipe.scale_momentum), 0.0), 0.9999)
+        state.source_scale_estimate = momentum * state.source_scale_estimate + (1.0 - momentum) * max(source_target, 1.0e-12)
+        state.dest_scale_estimate = momentum * state.dest_scale_estimate + (1.0 - momentum) * max(dest_target, 1.0e-12)
+    cache["low_precision_state"] = state
+    return state
+
+
+def _materialize_structured_scan_low_precision_metadata(
+    *,
+    cache: dict[str, object],
+    recipe: StructuredScanLowPrecisionRecipe,
+    source_probs: Tensor,
+    dest_probs: Tensor,
+) -> StructuredScanLowPrecisionMetadata:
+    state = _update_structured_scan_low_precision_state(
+        cache=cache,
+        recipe=recipe,
+        source_probs=source_probs,
+        dest_probs=dest_probs,
+    )
+    source_amax = float(source_probs.detach().abs().amax().item())
+    dest_amax = float(dest_probs.detach().abs().amax().item())
+    source_scale = max(float(state.source_scale_estimate), 1.0e-12)
+    dest_scale = max(float(state.dest_scale_estimate), 1.0e-12)
+    metadata = StructuredScanLowPrecisionMetadata(
+        packed_kind=int(recipe.packed_kind),
+        source_amax=source_amax,
+        dest_amax=dest_amax,
+        source_scale=source_scale,
+        dest_scale=dest_scale,
+        source_scale_inv=1.0 / source_scale,
+        dest_scale_inv=1.0 / dest_scale,
+        step=int(state.step),
+    )
+    cache["low_precision_metadata"] = metadata
+    return metadata
+
+
+def _describe_structured_scan_arch_spec(device: torch.device) -> StructuredScanArchSpec:
+    if device.type != "cuda":
+        return StructuredScanArchSpec(
+            arch_family="cpu",
+            capability_major=0,
+            capability_minor=0,
+            supports_async_pipeline=False,
+            supports_tensor_memory_accel=False,
+            supports_cluster_launch_control=False,
+            supports_tma=False,
+            supports_wgmma=False,
+            supports_tcgen05=False,
+        )
+    capability_major, capability_minor = torch.cuda.get_device_capability(device)
+    if capability_major >= 10:
+        return StructuredScanArchSpec(
+            arch_family="sm100+",
+            capability_major=int(capability_major),
+            capability_minor=int(capability_minor),
+            supports_async_pipeline=True,
+            supports_tensor_memory_accel=True,
+            supports_cluster_launch_control=True,
+            supports_tma=False,
+            supports_wgmma=False,
+            supports_tcgen05=True,
+        )
+    if capability_major >= 9:
+        return StructuredScanArchSpec(
+            arch_family="sm90+",
+            capability_major=int(capability_major),
+            capability_minor=int(capability_minor),
+            supports_async_pipeline=True,
+            supports_tensor_memory_accel=True,
+            supports_cluster_launch_control=True,
+            supports_tma=False,
+            supports_wgmma=False,
+            supports_tcgen05=False,
+        )
+    if capability_major >= 8:
+        return StructuredScanArchSpec(
+            arch_family="sm80+",
+            capability_major=int(capability_major),
+            capability_minor=int(capability_minor),
+            supports_async_pipeline=True,
+            supports_tensor_memory_accel=False,
+            supports_cluster_launch_control=False,
+            supports_tma=False,
+            supports_wgmma=False,
+            supports_tcgen05=False,
+        )
+    return StructuredScanArchSpec(
+        arch_family="legacy",
+        capability_major=int(capability_major),
+        capability_minor=int(capability_minor),
+        supports_async_pipeline=False,
+        supports_tensor_memory_accel=False,
+        supports_cluster_launch_control=False,
+        supports_tma=False,
+        supports_wgmma=False,
+        supports_tcgen05=False,
+    )
+
+
+@dataclass
+class StructuredScanGraphRuntime:
+    name: str
+    device: torch.device
+    static_buffers: dict[str, Tensor] = field(default_factory=dict)
+    shape_bucket: tuple[int, ...] = field(default_factory=tuple)
+    stable_pool_backed_memory: bool = True
+    graph_safe_rng_state: bool = True
+    capture_count: int = 0
+
+    def reserve_like(self, name: str, tensor: Tensor) -> Tensor:
+        existing = self.static_buffers.get(name)
+        if existing is None or existing.shape != tensor.shape or existing.dtype != tensor.dtype or existing.device != tensor.device:
+            existing = torch.empty_like(tensor)
+            self.static_buffers[name] = existing
+        return existing
+
+
+_STRUCTURED_SCAN_GRAPH_RUNTIME_REGISTRY: dict[tuple[str, str, int, tuple[int, ...]], StructuredScanGraphRuntime] = {}
+
+
+def get_structured_scan_graph_runtime(
+    *,
+    name: str,
+    device: torch.device,
+    shape_bucket: Sequence[int],
+) -> StructuredScanGraphRuntime:
+    device_index = int(device.index if device.index is not None else (torch.cuda.current_device() if device.type == "cuda" else -1))
+    key = (str(name), str(device.type), device_index, tuple(int(dim) for dim in shape_bucket))
+    runtime = _STRUCTURED_SCAN_GRAPH_RUNTIME_REGISTRY.get(key)
+    if runtime is None:
+        runtime = StructuredScanGraphRuntime(
+            name=str(name),
+            device=device,
+            shape_bucket=tuple(int(dim) for dim in shape_bucket),
+        )
+        _STRUCTURED_SCAN_GRAPH_RUNTIME_REGISTRY[key] = runtime
+    return runtime
+
+
+def _default_structured_scan_low_precision_recipe() -> StructuredScanLowPrecisionRecipe:
+    return StructuredScanLowPrecisionRecipe(
+        packed_kind=_structured_scan_packed_kind(),
+        amax_history_len=max(_cached_env_int("CAUSAL_MACHINE_SCAN_AMAX_HISTORY", 16), 1),
+        scale_momentum=min(max(_cached_env_float("CAUSAL_MACHINE_SCAN_SCALE_MOMENTUM", 0.95), 0.0), 0.9999),
+        update_interval=max(_cached_env_int("CAUSAL_MACHINE_SCAN_SCALE_UPDATE_INTERVAL", 1), 1),
+        allow_graph_capture=not _env_enabled("CAUSAL_MACHINE_SCAN_DISABLE_GRAPH_SAFE_PACKING", False),
+    )
+
+
+def _supports_virtual_shared_fallback(
+    *,
+    device_runtime: dict[str, int],
+    num_states: int,
+    transition_rank: int,
+) -> bool:
+    total_mem = int(device_runtime.get("total_global_mem_bytes", 0))
+    max_dynamic_smem_bytes = int(device_runtime.get("max_dynamic_smem_bytes", 0))
+    if total_mem <= 0:
+        return False
+    if max_dynamic_smem_bytes >= 96 * 1024:
+        return False
+    return int(num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES and int(transition_rank) > 64
+
+
+def _select_structured_scan_backend_policy(
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    device: torch.device,
+    default_chunk_size: int,
+    needs_grad: bool,
+    runtime_config: "StructuredScanRuntimeConfig" | None,
+) -> StructuredScanBackendPolicy:
+    device_runtime = _describe_structured_scan_device_runtime(device)
+    arch_spec = _describe_structured_scan_arch_spec(device)
+    major = int(arch_spec.capability_major)
+    max_dynamic_smem_bytes = int(device_runtime.get("max_dynamic_smem_bytes", 0))
+    ext_dense_policy = _select_structured_scan_dense_policy(
+        device,
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+        seq_len=int(seq_len),
+        chunk_size=int(default_chunk_size),
+        needs_grad=bool(needs_grad),
+    ) if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES else None
+    ext_tiled_policy = _select_structured_scan_tiled_policy(
+        device,
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+        seq_len=int(seq_len),
+        chunk_size=int(default_chunk_size),
+        needs_grad=bool(needs_grad),
+    ) if int(num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES else None
+    use_virtual_shared = _supports_virtual_shared_fallback(
+        device_runtime=device_runtime,
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+    )
+    backend = "python"
+    if device.type == "cuda" and supports_structured_scan_cuda_config(num_states, transition_rank):
+        backend = "cuda"
+    if int(num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        backend = "cuda_tiled" if device.type == "cuda" else "python_tiled"
+    tile_size = _default_structured_scan_tile_size(num_states)
+    split_size = _default_structured_scan_split_size(num_states, transition_rank)
+    chunk_size = max(int(default_chunk_size), 1)
+    block_threads = 128
+    items_per_thread = 1
+    vector_bytes = 4
+    elements_per_load = 1
+    rank_unroll = 1
+    state_unroll = 1
+    load_path = "direct"
+    kernel_family = "scalar_fallback"
+    workspace_mode = "tiled_forward"
+    workspace_mode_backward = "tiled_backward"
+    sparse_reorder_mode = "none"
+    benchmark_family = "structured_scan"
+    grouped = bool(runtime_config.grouped_launch_packing) if runtime_config is not None else True
+    if int(num_states) <= _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        name = "sm80_small_state"
+        if major >= 9:
+            name = "sm90_small_state"
+            block_threads = 128
+            items_per_thread = 2 if seq_len >= 1024 else 1
+            chunk_size = max(chunk_size, 128 if transition_rank <= 32 else 96)
+            load_path = "async_shared"
+            kernel_family = "small_state_persistent_async"
+        elif major >= 8:
+            block_threads = 128
+            items_per_thread = 1 if transition_rank > 32 else 2
+            chunk_size = max(chunk_size, 96 if transition_rank <= 32 else 80)
+            load_path = "shared"
+            kernel_family = "small_state_persistent_shared"
+        else:
+            name = "legacy_small_state"
+            block_threads = 64
+            load_path = "direct"
+            kernel_family = "small_state_legacy"
+        tile_size = min(int(num_states), _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES)
+        split_size = min(int(transition_rank), tile_size)
+        workspace_mode = "dense_forward"
+        workspace_mode_backward = "dense_backward"
+        benchmark_family = "small_state"
+        if ext_dense_policy is not None:
+            name = str(ext_dense_policy.get("selection_reason", name))
+            kernel_family = str(ext_dense_policy.get("kernel_family", kernel_family))
+            block_threads = int(ext_dense_policy.get("block_threads", block_threads))
+            items_per_thread = int(ext_dense_policy.get("items_per_thread", items_per_thread))
+            vector_bytes = int(ext_dense_policy.get("vector_bytes", vector_bytes))
+            elements_per_load = int(ext_dense_policy.get("elements_per_load", elements_per_load))
+            rank_unroll = int(ext_dense_policy.get("rank_unroll", rank_unroll))
+            state_unroll = int(ext_dense_policy.get("state_unroll", state_unroll))
+            load_path = str(ext_dense_policy.get("load_path", load_path))
+            workspace_mode = str(ext_dense_policy.get("workspace_mode", workspace_mode))
+            workspace_mode_backward = str(ext_dense_policy.get("workspace_mode_backward", workspace_mode_backward))
+            tile_size = int(ext_dense_policy.get("tile_size", tile_size))
+            split_size = int(ext_dense_policy.get("split_size", split_size))
+    elif _structured_runtime_uses_transition_masking(runtime_config):
+        name = "masked_tiled"
+        block_threads = 256 if major >= 9 else 128
+        items_per_thread = 1
+        tile_size = min(int(num_states), 192 if major >= 9 and max_dynamic_smem_bytes >= 160 * 1024 else 128)
+        split_size = min(int(transition_rank), 96 if major >= 8 else 64)
+        chunk_size = max(chunk_size, 128 if seq_len >= 1024 else 96)
+        load_path = "async_shared" if major >= 9 else ("virtual_shared" if use_virtual_shared else "shared")
+        kernel_family = (
+            "sm100_masked_tiled_async_proto"
+            if major >= 10
+            else "sm90_masked_tiled_async"
+            if major >= 9
+            else "sm80_masked_tiled_shared"
+        )
+        workspace_mode = "masked_tiled_forward"
+        workspace_mode_backward = "masked_tiled_backward"
+        benchmark_family = "masked_tiled"
+    elif backend == "cuda_tiled":
+        name = "sm90_tiled" if major >= 9 else "sm80_tiled"
+        block_threads = 256 if major >= 9 else 128
+        items_per_thread = 1 if needs_grad else 2
+        tile_size = min(int(num_states), 192 if major >= 9 and max_dynamic_smem_bytes >= 160 * 1024 else 160 if major >= 8 else 128)
+        split_size = min(int(transition_rank), 128 if major >= 9 else 96 if major >= 8 else 64)
+        chunk_size = max(chunk_size, 160 if seq_len >= 2048 else 128 if seq_len >= 1024 else 96)
+        load_path = "async_shared" if major >= 9 else ("virtual_shared" if use_virtual_shared else "shared")
+        workspace_mode = "tiled_backward" if needs_grad else "tiled_forward"
+        workspace_mode_backward = "tiled_backward"
+        kernel_family = (
+            "sm100_tiled_async_proto"
+            if major >= 10
+            else "sm90_tiled_async"
+            if major >= 9
+            else "sm80_tiled_shared"
+        )
+        benchmark_family = "tiled_large_state"
+    else:
+        name = "python_fallback"
+        tile_size = min(int(num_states), max(int(tile_size), 128))
+        split_size = min(int(transition_rank), max(int(split_size), 64))
+        load_path = "virtual_shared" if use_virtual_shared else "direct"
+        benchmark_family = "python_fallback"
+    if ext_tiled_policy is not None:
+        block_threads = int(ext_tiled_policy.get("block_threads", block_threads))
+        items_per_thread = int(ext_tiled_policy.get("items_per_thread", items_per_thread))
+        vector_bytes = int(ext_tiled_policy.get("vector_bytes", vector_bytes))
+        elements_per_load = int(ext_tiled_policy.get("elements_per_load", elements_per_load))
+        rank_unroll = int(ext_tiled_policy.get("rank_unroll", rank_unroll))
+        state_unroll = int(ext_tiled_policy.get("state_unroll", state_unroll))
+        load_path = str(ext_tiled_policy.get("load_path", load_path))
+        workspace_mode = str(ext_tiled_policy.get("workspace_mode", workspace_mode))
+        tile_size = int(ext_tiled_policy.get("tile_size", tile_size))
+        split_size = int(ext_tiled_policy.get("split_size", split_size))
+    if runtime_config is not None and _structured_runtime_prefers_sparse_cuda(runtime_config, num_states=int(num_states)):
+        sparse_reorder_mode = "grouped_src_blocks"
+    if runtime_config is not None and runtime_config.backend not in {"", "auto"}:
+        backend = str(runtime_config.backend).strip().lower()
+    return StructuredScanBackendPolicy(
+        name=name,
+        backend=backend,
+        arch_family=str(arch_spec.arch_family),
+        kernel_family=kernel_family,
+        block_threads=int(block_threads),
+        items_per_thread=int(items_per_thread),
+        tile_size=max(int(tile_size), 1),
+        split_size=max(int(split_size), 1),
+        chunk_size=max(int(chunk_size), 1),
+        load_path=load_path,
+        supports_async_pipeline=bool(arch_spec.supports_async_pipeline and load_path == "async_shared"),
+        supports_tensor_memory_accel=bool(arch_spec.supports_tensor_memory_accel),
+        supports_cluster_launch_control=bool(arch_spec.supports_cluster_launch_control),
+        supports_tma=bool(arch_spec.supports_tma),
+        supports_wgmma=bool(arch_spec.supports_wgmma),
+        supports_tcgen05=bool(arch_spec.supports_tcgen05),
+        use_virtual_shared_fallback=bool(use_virtual_shared),
+        grouped_launch_packing=bool(grouped),
+        vector_bytes=max(int(vector_bytes), 4),
+        elements_per_load=max(int(elements_per_load), 1),
+        rank_unroll=max(int(rank_unroll), 1),
+        state_unroll=max(int(state_unroll), 1),
+        workspace_mode=workspace_mode,
+        workspace_mode_backward=workspace_mode_backward,
+        sparse_reorder_mode=sparse_reorder_mode,
+        benchmark_family=benchmark_family,
+    )
+
+
 @dataclass
 class CausalMachineCache:
     log_belief: Tensor | None = None
     latent_state: Tensor | None = None
     num_updates: int = 0
+    workspace: StructuredScanWorkspace | None = None
+    grouped_launch_pack: StructuredScanGroupedLaunchPack | None = None
+    quant_transition_cache: dict[str, Any] = field(default_factory=dict)
+    save_mode: str = "all"
+    page_size: int | None = None
+    max_pages: int = 0
+    paged_layout: str = "belief_major"
+    page_table_owner: str = "cache"
+    paged_log_beliefs: Tensor | None = None
+    paged_latent_states: Tensor | None = None
+    paged_lengths: Tensor | None = None
+    paged_page_table: Tensor | None = None
+    resident_state_valid: bool = True
+    last_paged_write_backend: str = "disabled"
+    last_paged_write_error: str | None = None
+    last_paged_read_backend: str = "disabled"
+    last_paged_read_error: str | None = None
+    step_graph_runner: dict[str, object] | None = None
+
+    def enable_paged_history(
+        self,
+        *,
+        batch_size: int,
+        num_states: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        latent_rank: int = 0,
+        page_size: int = 128,
+        max_pages: int = 32,
+        workspace: StructuredScanWorkspace | None = None,
+        grouped_launch_pack: StructuredScanGroupedLaunchPack | None = None,
+        save_mode: str = "all",
+        paged_layout: str = "belief_major",
+    ) -> None:
+        page_size = max(int(page_size), 1)
+        max_pages = max(int(max_pages), 1)
+        self.workspace = workspace
+        self.grouped_launch_pack = grouped_launch_pack
+        self.save_mode = str(save_mode)
+        self.page_size = page_size
+        self.max_pages = max_pages
+        self.paged_layout = str(paged_layout)
+        num_slots = batch_size * max_pages
+        if workspace is None:
+            workspace = get_structured_scan_workspace(
+                device=device,
+                dtype=dtype,
+                backend_family="paged_cache",
+                shape_bucket=_structured_scan_shape_bucket(batch_size, max_pages, page_size, num_states, quantum=16),
+            )
+            self.workspace = workspace
+        self.paged_log_beliefs = workspace.reserve_tensor(
+            "paged_log_beliefs",
+            (num_slots, page_size, num_states),
+            device=device,
+            dtype=dtype,
+            zero=True,
+        )
+        self.paged_latent_states = (
+            workspace.reserve_tensor(
+                "paged_latent_states",
+                (num_slots, page_size, latent_rank),
+                device=device,
+                dtype=torch.float32,
+                zero=True,
+            )
+            if latent_rank > 0
+            else None
+        )
+        self.paged_lengths = workspace.reserve_tensor(
+            "paged_lengths",
+            (batch_size,),
+            device=device,
+            dtype=torch.int64,
+            zero=True,
+        )
+        self.paged_page_table = workspace.reserve_tensor(
+            "paged_page_table",
+            (batch_size, max_pages),
+            device=device,
+            dtype=torch.int64,
+            zero=False,
+        )
+        self.paged_page_table.copy_(
+            torch.arange(num_slots, device=device, dtype=torch.int64).view(batch_size, max_pages)
+        )
+        self.page_table_owner = "runtime"
+        self.resident_state_valid = self.log_belief is not None
+        self.last_paged_write_backend = "ready"
+        self.last_paged_write_error = None
+        self.last_paged_read_backend = "ready"
+        self.last_paged_read_error = None
+        self.step_graph_runner = None
+
+    def restore_latest_from_paged(self) -> None:
+        if (
+            self.paged_log_beliefs is None
+            or self.paged_lengths is None
+            or int(self.paged_log_beliefs.numel()) == 0
+            or int(self.paged_lengths.numel()) == 0
+        ):
+            return
+        restored = False
+        if self.paged_log_beliefs.is_cuda and self.paged_lengths.is_cuda:
+            try:
+                ext = load_causal_machine_scan_cuda()
+                paged_latent_states = (
+                    self.paged_latent_states
+                    if self.paged_latent_states is not None
+                    else torch.empty((0, 0, 0, 0), device=self.paged_log_beliefs.device, dtype=torch.float32)
+                )
+                log_belief, latent_state = ext.read_paged_latest_(
+                    self.paged_log_beliefs,
+                    paged_latent_states,
+                    self.paged_page_table,
+                    self.paged_lengths,
+                )
+                self.log_belief = log_belief.detach()
+                if latent_state.numel() > 0:
+                    self.latent_state = latent_state.detach().float()
+                else:
+                    self.latent_state = None
+                self.last_paged_read_backend = "cuda"
+                self.last_paged_read_error = None
+                self.resident_state_valid = True
+                restored = True
+            except Exception:
+                self.last_paged_read_backend = "python"
+                self.last_paged_read_error = "read_paged_latest_cuda_failed"
+                restored = False
+        if restored:
+            return
+        if not bool((self.paged_lengths > 0).any().item()):
+            return
+        lengths = self.paged_lengths.to(device=self.paged_log_beliefs.device, dtype=torch.int64)
+        clamped = lengths.clamp(min=1, max=self.max_pages * max(int(self.page_size or 1), 1)) - 1
+        page_idx = torch.div(clamped, int(self.page_size or 1), rounding_mode="floor")
+        page_offset = torch.remainder(clamped, int(self.page_size or 1))
+        if self.paged_page_table is not None:
+            page_idx = self.paged_page_table[torch.arange(self.paged_lengths.size(0), device=self.paged_log_beliefs.device), page_idx]
+        self.log_belief = self.paged_log_beliefs[page_idx, page_offset, :].detach()
+        if self.paged_latent_states is not None:
+            self.latent_state = self.paged_latent_states[page_idx, page_offset, :].detach().float()
+        else:
+            self.latent_state = None
+        self.resident_state_valid = True
+        self.last_paged_read_backend = "python"
+        self.last_paged_read_error = None
+
+    def drop_resident_state(self) -> None:
+        self.log_belief = None
+        self.latent_state = None
+        self.resident_state_valid = False
+
+    def ensure_resident_state(self) -> None:
+        if self.log_belief is None and self.paged_log_beliefs is not None:
+            self.restore_latest_from_paged()
+
+    def record_step(self, log_belief: Tensor, latent_state: Tensor | None = None) -> None:
+        self.log_belief = log_belief.detach()
+        self.resident_state_valid = True
+        if latent_state is not None:
+            self.latent_state = latent_state.detach().float()
+        elif self.latent_state is not None:
+            self.latent_state = self.latent_state.detach().float()
+        if (
+            self.page_size is not None
+            and self.page_size > 0
+            and self.paged_log_beliefs is not None
+            and self.paged_lengths is not None
+            and self.save_mode != "none"
+        ):
+            if self.grouped_launch_pack is not None:
+                self.grouped_launch_pack.record_paged_cache_op()
+            paged_written = False
+            if (
+                self.log_belief.is_cuda
+                and self.paged_log_beliefs.is_cuda
+                and self.paged_lengths.is_cuda
+            ):
+                try:
+                    ext = load_causal_machine_scan_cuda()
+                    paged_latent_states = (
+                        self.paged_latent_states
+                        if self.paged_latent_states is not None
+                        else torch.empty((0, 0, 0, 0), device=self.paged_log_beliefs.device, dtype=torch.float32)
+                    )
+                    latent_to_store = (
+                        self.latent_state
+                        if self.latent_state is not None and self.paged_latent_states is not None
+                        else torch.empty((0, 0), device=self.paged_log_beliefs.device, dtype=torch.float32)
+                    )
+                    ext.record_paged_step_(
+                        self.paged_log_beliefs,
+                        paged_latent_states,
+                        self.paged_page_table,
+                        self.paged_lengths,
+                        self.log_belief.to(device=self.paged_log_beliefs.device, dtype=self.paged_log_beliefs.dtype),
+                        latent_to_store,
+                        int(self.num_updates),
+                    )
+                    paged_written = True
+                    self.last_paged_write_backend = "cuda"
+                    self.last_paged_write_error = None
+                except Exception:
+                    paged_written = False
+                    self.last_paged_write_backend = "python"
+                    self.last_paged_write_error = "record_paged_step_cuda_failed"
+            if not paged_written:
+                page_idx = self.num_updates // self.page_size
+                page_offset = self.num_updates % self.page_size
+                if page_idx < self.max_pages:
+                    if self.paged_page_table is not None:
+                        slot_idx = self.paged_page_table[:, page_idx]
+                    else:
+                        slot_idx = torch.arange(self.paged_lengths.size(0), device=self.paged_log_beliefs.device, dtype=torch.int64) * self.max_pages + int(page_idx)
+                    belief_to_store = self.log_belief.to(
+                        device=self.paged_log_beliefs.device,
+                        dtype=self.paged_log_beliefs.dtype,
+                    )
+                    self.paged_log_beliefs[slot_idx, page_offset, :].copy_(belief_to_store)
+                    if self.paged_latent_states is not None and self.latent_state is not None:
+                        self.paged_latent_states[slot_idx, page_offset, :].copy_(
+                            self.latent_state.to(
+                                device=self.paged_latent_states.device,
+                                dtype=self.paged_latent_states.dtype,
+                            )
+                        )
+                self.paged_lengths.add_(1).clamp_(max=self.max_pages * self.page_size)
+                if self.last_paged_write_backend != "cuda":
+                    self.last_paged_write_backend = "python"
+        self.num_updates += 1
+
+    def record_sequence(self, state_log_beliefs: Tensor, latent_states: Tensor | None = None) -> None:
+        if state_log_beliefs.numel() == 0:
+            return
+        if self.save_mode == "final":
+            latent_final = latent_states[:, -1, :] if latent_states is not None and latent_states.numel() > 0 else None
+            self.record_step(state_log_beliefs[:, -1, :], latent_final)
+            return
+        self.log_belief = state_log_beliefs[:, -1, :].detach()
+        self.resident_state_valid = True
+        last_latent = None
+        if latent_states is not None and latent_states.numel() > 0:
+            last_latent = latent_states[:, -1, :]
+        elif self.latent_state is not None:
+            self.latent_state = self.latent_state.detach().float()
+        if last_latent is not None:
+            self.latent_state = last_latent.detach().float()
+        if (
+            self.page_size is not None
+            and self.page_size > 0
+            and self.paged_log_beliefs is not None
+            and self.paged_lengths is not None
+            and self.save_mode != "none"
+        ):
+            if self.grouped_launch_pack is not None:
+                self.grouped_launch_pack.record_paged_cache_op(int(state_log_beliefs.size(1)))
+            paged_written = False
+            if (
+                state_log_beliefs.is_cuda
+                and self.paged_log_beliefs.is_cuda
+                and self.paged_lengths.is_cuda
+            ):
+                try:
+                    ext = load_causal_machine_scan_cuda()
+                    paged_latent_states = (
+                        self.paged_latent_states
+                        if self.paged_latent_states is not None
+                        else torch.empty((0, 0, 0, 0), device=self.paged_log_beliefs.device, dtype=torch.float32)
+                    )
+                    latent_states_in = (
+                        latent_states
+                        if latent_states is not None and self.paged_latent_states is not None
+                        else torch.empty((0, 0, 0), device=self.paged_log_beliefs.device, dtype=torch.float32)
+                    )
+                    ext.record_paged_sequence_(
+                        self.paged_log_beliefs,
+                        paged_latent_states,
+                        self.paged_page_table,
+                        self.paged_lengths,
+                        state_log_beliefs.to(device=self.paged_log_beliefs.device, dtype=self.paged_log_beliefs.dtype),
+                        latent_states_in,
+                        int(self.num_updates),
+                    )
+                    paged_written = True
+                    self.last_paged_write_backend = "cuda"
+                    self.last_paged_write_error = None
+                except Exception:
+                    paged_written = False
+                    self.last_paged_write_backend = "python"
+                    self.last_paged_write_error = "record_paged_sequence_cuda_failed"
+            if paged_written:
+                self.num_updates += int(state_log_beliefs.size(1))
+                return
+        for t in range(int(state_log_beliefs.size(1))):
+            latent_t = latent_states[:, t, :] if latent_states is not None else None
+            self.record_step(state_log_beliefs[:, t, :], latent_t)
 
     def reset(self) -> None:
         self.log_belief = None
         self.latent_state = None
         self.num_updates = 0
+        self.resident_state_valid = False
+        if self.paged_log_beliefs is not None:
+            self.paged_log_beliefs.zero_()
+        if self.paged_latent_states is not None:
+            self.paged_latent_states.zero_()
+        if self.paged_lengths is not None:
+            self.paged_lengths.zero_()
+        if self.paged_page_table is not None:
+            self.paged_page_table.copy_(
+                torch.arange(
+                    self.paged_page_table.size(0) * self.max_pages,
+                    device=self.paged_page_table.device,
+                    dtype=self.paged_page_table.dtype,
+                ).view_as(self.paged_page_table)
+            )
+        self.last_paged_write_backend = "disabled" if self.paged_log_beliefs is None else "ready"
+        self.last_paged_write_error = None
+        self.last_paged_read_backend = "disabled" if self.paged_log_beliefs is None else "ready"
+        self.last_paged_read_error = None
+        self.step_graph_runner = None
+
+    def reorder_batch(self, beam_indices: Tensor) -> None:
+        if self.paged_page_table is None or self.paged_lengths is None:
+            return
+        order = beam_indices.to(device=self.paged_page_table.device, dtype=torch.int64).contiguous()
+        reordered = False
+        if self.paged_page_table.is_cuda and self.paged_lengths.is_cuda:
+            try:
+                ext = load_causal_machine_scan_cuda()
+                ext.reorder_paged_cache_(self.paged_page_table, self.paged_lengths, order)
+                reordered = True
+                self.last_paged_read_backend = "cuda"
+                self.last_paged_read_error = None
+            except Exception:
+                reordered = False
+        if not reordered:
+            self.paged_page_table.copy_(self.paged_page_table.index_select(0, order))
+            self.paged_lengths.copy_(self.paged_lengths.index_select(0, order))
+        if self.log_belief is not None:
+            self.log_belief = self.log_belief.index_select(0, order.to(device=self.log_belief.device))
+        if self.latent_state is not None:
+            self.latent_state = self.latent_state.index_select(0, order.to(device=self.latent_state.device))
+
+
+@dataclass(frozen=True)
+class StructuredScanKernelConfig:
+    num_states: int
+    transition_rank: int
+    chunk_size: int
+    tile_size: int = 128
+    split_size: int = 128
+    backend: str = "auto"
+    policy_name: str = "default"
+    arch_family: str = "legacy"
+    kernel_family: str = "scalar_fallback"
+    block_threads: int = 128
+    items_per_thread: int = 1
+    load_path: str = "direct"
+    vector_bytes: int = 4
+    elements_per_load: int = 1
+    rank_unroll: int = 1
+    state_unroll: int = 1
+    supports_async_pipeline: bool = False
+    supports_tensor_memory_accel: bool = False
+    supports_cluster_launch_control: bool = False
+    supports_tma: bool = False
+    supports_wgmma: bool = False
+    supports_tcgen05: bool = False
+    workspace_mode: str = "tiled_forward"
+    workspace_mode_backward: str = "tiled_backward"
+    sparse_reorder_mode: str = "none"
+    benchmark_family: str = "structured_scan"
+    use_virtual_shared_fallback: bool = False
+    grouped_launch_packing: bool = False
+    allow_cuda: bool = True
+    allow_tiled_cuda: bool = False
+    allow_quantized_tables: bool = True
+
+
+@dataclass
+class StructuredScoreModSpec:
+    additive_bias: Tensor | None = None
+    state_mask: Tensor | None = None
+    pred_scale: float | Tensor | None = None
+    threshold: float | Tensor | None = None
+    topk: int | None = None
+    clamp_min: float | None = None
+    clamp_max: float | None = None
+    masked_bias_value: float = -1.0e4
+
+
+def _structured_runtime_score_mod_spec(
+    runtime_config: "StructuredScanRuntimeConfig" | None,
+) -> StructuredScoreModSpec | None:
+    if runtime_config is None:
+        return None
+    score_mod = runtime_config.score_mod
+    return score_mod if isinstance(score_mod, StructuredScoreModSpec) else None
+
+
+def _structured_runtime_score_mod_callback(
+    runtime_config: "StructuredScanRuntimeConfig" | None,
+) -> Callable[[Tensor, int, "StructuredScanRuntimeConfig"], Tensor] | None:
+    if runtime_config is None:
+        return None
+    score_mod = runtime_config.score_mod
+    if score_mod is None or isinstance(score_mod, StructuredScoreModSpec):
+        return None
+    if not callable(score_mod):
+        raise TypeError("score_mod must be callable or StructuredScoreModSpec")
+    return score_mod
+
+
+@dataclass
+class StructuredScanRuntimeConfig:
+    seq_lens: Tensor | Sequence[int] | None = None
+    local_transition_window: int | None = None
+    transition_mask: Tensor | None = None
+    block_mask: Tensor | None = None
+    block_size: int | None = None
+    score_bias: Tensor | None = None
+    transition_mask_mod: Callable[[Tensor, Tensor, StructuredScanRuntimeConfig], Tensor] | None = None
+    score_mod: Callable[[Tensor, int, "StructuredScanRuntimeConfig"], Tensor] | StructuredScoreModSpec | None = None
+    backend: str = "auto"
+    allow_cuda: bool = True
+    workspace: StructuredScanWorkspace | None = None
+    scratch_arena: StructuredScanScratchArena | None = None
+    backend_policy: StructuredScanBackendPolicy | None = None
+    grouped_launch_pack: StructuredScanGroupedLaunchPack | None = None
+    prefix_carry_plan: StructuredScanSegmentedCarryPlan | None = None
+    reduced_transition_cache: StructuredReducedTransitionCache | None = None
+    low_precision_recipe: StructuredScanLowPrecisionRecipe | None = None
+    low_precision_metadata: StructuredScanLowPrecisionMetadata | None = None
+    graph_runtime: StructuredScanGraphRuntime | None = None
+    grouped_launch_packing: bool = True
+    allow_virtual_shared_fallback: bool = True
+    batch_mode: str = "auto"
+    save_mode: str = "all"
+    use_paged_cache: bool = False
+    paged_resident_only: bool = False
+    use_cuda_graphs: bool = True
+    page_size: int = 128
+    max_pages: int = 32
+    paged_layout: str = "belief_major"
+
+
+def _resolve_structured_scan_runtime_config(
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    backend_family: str,
+    batch_size: int,
+    seq_len: int,
+    num_states: int,
+) -> StructuredScanRuntimeConfig:
+    runtime = StructuredScanRuntimeConfig() if runtime_config is None else runtime_config
+    if runtime.workspace is None:
+        runtime.workspace = get_structured_scan_workspace(
+            device=device,
+            dtype=dtype,
+            backend_family=backend_family,
+            shape_bucket=_structured_scan_shape_bucket(batch_size, seq_len, num_states, quantum=32),
+        )
+    if runtime.scratch_arena is None:
+        runtime.scratch_arena = StructuredScanScratchArena(runtime.workspace)
+    if runtime.grouped_launch_pack is None:
+        runtime.grouped_launch_pack = StructuredScanGroupedLaunchPack()
+    if str(runtime.batch_mode or "auto").strip().lower() in {"", "auto"}:
+        runtime.batch_mode = "single" if int(batch_size) == 1 else "batched"
+    if runtime.prefix_carry_plan is None:
+        runtime.prefix_carry_plan = StructuredScanSegmentedCarryPlan(
+            chunk_size=1,
+            total_seq_len=max(int(seq_len), 0),
+            seq_lens=_canonicalize_structured_seq_lens(runtime.seq_lens, batch_size=batch_size, seq_len=seq_len, device=device)
+            if runtime.seq_lens is not None
+            else None,
+        )
+    if runtime.low_precision_recipe is None:
+        runtime.low_precision_recipe = _default_structured_scan_low_precision_recipe()
+    if runtime.graph_runtime is None and device.type == "cuda":
+        runtime.graph_runtime = get_structured_scan_graph_runtime(
+            name=f"structured_scan:{backend_family}",
+            device=device,
+            shape_bucket=_structured_scan_shape_bucket(batch_size, seq_len, num_states, quantum=32),
+        )
+    return runtime
+
+
+def _structured_scan_save_mode(runtime_config: StructuredScanRuntimeConfig | None) -> str:
+    raw = "all" if runtime_config is None else str(runtime_config.save_mode or "all").strip().lower()
+    if raw not in {"all", "final", "none"}:
+        raise ValueError(f"unsupported structured scan save_mode={raw!r}")
+    return raw
+
+
+def _structured_scan_save_all(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    return _structured_scan_save_mode(runtime_config) == "all"
+
+
+def supports_structured_scan_cuda_config(num_states: int, transition_rank: int) -> bool:
+    return (
+        _supports_structured_scan_num_states(num_states)
+        and _supports_structured_scan_transition_rank(transition_rank)
+    )
+
+
+def _structured_runtime_uses_generalized_features(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    if runtime_config is None:
+        return False
+    return bool(
+        runtime_config.seq_lens is not None
+        or runtime_config.local_transition_window is not None
+        or runtime_config.transition_mask is not None
+        or runtime_config.block_mask is not None
+        or runtime_config.transition_mask_mod is not None
+        or _structured_runtime_score_mod_callback(runtime_config) is not None
+        or runtime_config.backend not in {"", "auto", "cuda", "cuda_tiled", "python_tiled", "python"}
+        or not runtime_config.allow_cuda
+    )
+
+
+def _structured_runtime_uses_transition_masking(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    if runtime_config is None:
+        return False
+    return bool(
+        runtime_config.local_transition_window is not None
+        or runtime_config.transition_mask is not None
+        or runtime_config.block_mask is not None
+        or runtime_config.transition_mask_mod is not None
+    )
+
+
+def _structured_runtime_supports_masked_cuda(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    if runtime_config is None:
+        return False
+    if not runtime_config.allow_cuda:
+        return False
+    # The masked CUDA path can consume a fully materialized dense boolean mask,
+    # so transition_mask_mod is allowed here after Python lowers it to a mask.
+    # Callback-based score_mod still mutates the predicted belief itself and has
+    # no kernel contract. Lowered StructuredScoreModSpec values stay eligible.
+    if _structured_runtime_score_mod_callback(runtime_config) is not None:
+        return False
+    backend = str(runtime_config.backend or "").strip().lower()
+    if backend not in {"", "auto", "cuda", "cuda_tiled"}:
+        return False
+    return _structured_runtime_uses_transition_masking(runtime_config)
+
+
+def _structured_runtime_supports_sparse_cuda(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    if runtime_config is None:
+        return False
+    if not runtime_config.allow_cuda:
+        return False
+    if _has_native_structured_score_clamp(runtime_config) or _has_native_structured_score_filtering(runtime_config):
+        return False
+    if _structured_runtime_score_mod_callback(runtime_config) is not None:
+        return False
+    backend = str(runtime_config.backend or "").strip().lower()
+    if backend not in {"", "auto", "cuda"}:
+        return False
+    return _structured_runtime_uses_transition_masking(runtime_config)
+
+
+def _structured_runtime_supports_tiled_backend(runtime_config: StructuredScanRuntimeConfig | None) -> bool:
+    if runtime_config is None:
+        return True
+    if _structured_runtime_score_mod_callback(runtime_config) is not None:
+        return False
+    return True
+
+
+def _structured_runtime_prefers_sparse_cuda(
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    num_states: int,
+) -> bool:
+    if runtime_config is None or _structured_runtime_score_mod_callback(runtime_config) is not None:
+        return False
+    if not _structured_runtime_uses_transition_masking(runtime_config):
+        return False
+    return bool(int(num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES)
+
+
+def _packed_transition_kind_name(packed_kind: int | None) -> str | None:
+    if packed_kind is None:
+        return None
+    if int(packed_kind) == _PACKED_TRANSITION_INT8:
+        return "int8"
+    if int(packed_kind) == _PACKED_TRANSITION_FP8_E4M3:
+        return "fp8_e4m3"
+    if int(packed_kind) == _PACKED_TRANSITION_FP8_E5M2:
+        return "fp8_e5m2"
+    return f"unknown_{int(packed_kind)}"
+
+
+def _structured_scan_uses_lowp_tensor_core_path(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    kernel_config: StructuredScanKernelConfig,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None,
+) -> bool:
+    if packed_transition_tables is None:
+        return False
+    if device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return False
+    if int(kernel_config.num_states) < 16 or int(kernel_config.transition_rank) < 16:
+        return False
+    device_runtime = _describe_structured_scan_device_runtime(device)
+    if dtype == torch.bfloat16 and int(device_runtime.get("capability_major", 0)) < 8:
+        return False
+    return bool(int(device_runtime.get("supports_wmma", 0)) > 0)
+
+
+def _structured_scan_kernel_info(
+    *,
+    path: str,
+    kernel_config: StructuredScanKernelConfig,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+    cache: CausalMachineCache | None = None,
+) -> dict[str, object]:
+    packed_kind = None if packed_transition_tables is None else int(packed_transition_tables[0])
+    info: dict[str, object] = {
+        "path": str(path),
+        "backend": str(kernel_config.backend),
+        "policy_name": str(kernel_config.policy_name),
+        "arch_family": str(getattr(kernel_config, "arch_family", "legacy")),
+        "kernel_family": str(getattr(kernel_config, "kernel_family", "scalar_fallback")),
+        "chunk_size": int(kernel_config.chunk_size),
+        "tile_size": int(kernel_config.tile_size),
+        "split_size": int(kernel_config.split_size),
+        "block_threads": int(kernel_config.block_threads),
+        "items_per_thread": int(kernel_config.items_per_thread),
+        "load_path": str(kernel_config.load_path),
+        "vector_bytes": int(getattr(kernel_config, "vector_bytes", 4)),
+        "elements_per_load": int(getattr(kernel_config, "elements_per_load", 1)),
+        "rank_unroll": int(getattr(kernel_config, "rank_unroll", 1)),
+        "state_unroll": int(getattr(kernel_config, "state_unroll", 1)),
+        "workspace_mode": str(getattr(kernel_config, "workspace_mode", "tiled_forward")),
+        "workspace_mode_backward": str(getattr(kernel_config, "workspace_mode_backward", "tiled_backward")),
+        "sparse_reorder_mode": str(getattr(kernel_config, "sparse_reorder_mode", "none")),
+        "benchmark_family": str(getattr(kernel_config, "benchmark_family", "structured_scan")),
+        "supports_async_pipeline": bool(getattr(kernel_config, "supports_async_pipeline", False)),
+        "supports_tensor_memory_accel": bool(getattr(kernel_config, "supports_tensor_memory_accel", False)),
+        "supports_cluster_launch_control": bool(getattr(kernel_config, "supports_cluster_launch_control", False)),
+        "supports_tma": bool(getattr(kernel_config, "supports_tma", False)),
+        "supports_wgmma": bool(getattr(kernel_config, "supports_wgmma", False)),
+        "supports_tcgen05": bool(getattr(kernel_config, "supports_tcgen05", False)),
+        "use_virtual_shared_fallback": bool(kernel_config.use_virtual_shared_fallback),
+        "grouped_launch_packing": bool(kernel_config.grouped_launch_packing),
+        "num_states": int(kernel_config.num_states),
+        "transition_rank": int(kernel_config.transition_rank),
+        "allow_cuda": bool(kernel_config.allow_cuda),
+        "allow_tiled_cuda": bool(kernel_config.allow_tiled_cuda),
+        "allow_quantized_tables": bool(kernel_config.allow_quantized_tables),
+        "uses_transition_masking": _structured_runtime_uses_transition_masking(runtime_config),
+        "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
+        "packed_transition_kind": _packed_transition_kind_name(packed_kind),
+    }
+    if "lowp_tensor_core" in str(path):
+        arch_family = str(getattr(kernel_config, "arch_family", "legacy"))
+        if arch_family.startswith("sm100"):
+            info["selected_low_precision_kernel_family"] = "sm100_packed_wmma"
+        elif arch_family.startswith("sm90"):
+            info["selected_low_precision_kernel_family"] = "sm90_packed_wmma"
+        elif arch_family.startswith("sm80"):
+            info["selected_low_precision_kernel_family"] = "sm80_packed_wmma"
+        else:
+            info["selected_low_precision_kernel_family"] = "packed_wmma"
+        info["tensor_core_trained_path"] = True
+    if runtime_config is not None:
+        info["paged_layout"] = str(runtime_config.paged_layout)
+        info["allow_virtual_shared_runtime"] = bool(runtime_config.allow_virtual_shared_fallback)
+        info["batch_mode"] = str(runtime_config.batch_mode)
+        info["save_mode"] = _structured_scan_save_mode(runtime_config)
+        if runtime_config.workspace is not None:
+            info["workspace_backend_family"] = str(runtime_config.workspace.key.backend_family)
+            info["workspace_high_water_bytes"] = int(runtime_config.workspace.high_water_bytes)
+        if runtime_config.scratch_arena is not None:
+            info["scratch_allocator"] = "persistent_workspace"
+        if runtime_config.backend_policy is not None:
+            info["backend_policy_runtime"] = str(runtime_config.backend_policy.name)
+        if runtime_config.reduced_transition_cache is not None:
+            info["has_reduced_transition_cache"] = True
+            info["reduced_transition_split_size"] = int(runtime_config.reduced_transition_cache.split_size)
+            info["reduced_transition_tile_size"] = int(runtime_config.reduced_transition_cache.tile_size)
+        if runtime_config.grouped_launch_pack is not None:
+            info["grouped_row_sum_preps"] = int(runtime_config.grouped_launch_pack.row_sum_preps)
+            info["grouped_paged_cache_ops"] = int(runtime_config.grouped_launch_pack.paged_cache_ops)
+            info["grouped_small_decode_updates"] = int(runtime_config.grouped_launch_pack.small_decode_updates)
+            info["grouped_small_scans"] = int(runtime_config.grouped_launch_pack.grouped_small_scans)
+        if runtime_config.low_precision_recipe is not None:
+            info["low_precision_recipe"] = _packed_transition_kind_name(runtime_config.low_precision_recipe.packed_kind)
+            info["low_precision_amax_history_len"] = int(runtime_config.low_precision_recipe.amax_history_len)
+        low_precision_metadata = getattr(runtime_config, "low_precision_metadata", None)
+        if isinstance(low_precision_metadata, StructuredScanLowPrecisionMetadata):
+            info["low_precision_source_amax"] = float(low_precision_metadata.source_amax)
+            info["low_precision_dest_amax"] = float(low_precision_metadata.dest_amax)
+            info["low_precision_source_scale"] = float(low_precision_metadata.source_scale)
+            info["low_precision_dest_scale"] = float(low_precision_metadata.dest_scale)
+            info["low_precision_source_scale_inv"] = float(low_precision_metadata.source_scale_inv)
+            info["low_precision_dest_scale_inv"] = float(low_precision_metadata.dest_scale_inv)
+            info["low_precision_step"] = int(low_precision_metadata.step)
+        if runtime_config.graph_runtime is not None:
+            info["graph_runtime_name"] = str(runtime_config.graph_runtime.name)
+            info["graph_runtime_captures"] = int(runtime_config.graph_runtime.capture_count)
+    if cache is not None:
+        info["paged_cache_write_backend"] = str(cache.last_paged_write_backend)
+        if cache.last_paged_write_error is not None:
+            info["paged_cache_write_error"] = str(cache.last_paged_write_error)
+        info["paged_cache_read_backend"] = str(cache.last_paged_read_backend)
+        if cache.last_paged_read_error is not None:
+            info["paged_cache_read_error"] = str(cache.last_paged_read_error)
+        info["resident_state_valid"] = bool(cache.resident_state_valid)
+        info["page_table_owner"] = str(cache.page_table_owner)
+    if cache is not None:
+        packed_transition_cache = getattr(cache, "_packed_transition_cache", None)
+        cache_low_precision = packed_transition_cache.get("low_precision_metadata") if isinstance(packed_transition_cache, dict) else None
+        if isinstance(cache_low_precision, StructuredScanLowPrecisionMetadata):
+            info["low_precision_source_amax"] = float(cache_low_precision.source_amax)
+            info["low_precision_dest_amax"] = float(cache_low_precision.dest_amax)
+            info["low_precision_source_scale"] = float(cache_low_precision.source_scale)
+            info["low_precision_dest_scale"] = float(cache_low_precision.dest_scale)
+            info["low_precision_source_scale_inv"] = float(cache_low_precision.source_scale_inv)
+            info["low_precision_dest_scale_inv"] = float(cache_low_precision.dest_scale_inv)
+            info["low_precision_step"] = int(cache_low_precision.step)
+    return info
+
+
+_COMPETITION_STRUCTURED_SCAN_PATHS = frozenset(
+    {
+        "cuda_dense",
+        "cuda_dense_lowp_tensor_core",
+        "cuda_masked",
+        "cuda_sparse",
+    }
+)
+
+
+def _enforce_structured_scan_cuda_contract(info: dict[str, object], *, context: str) -> None:
+    if not _require_fused_cuda_path_contract():
+        return
+    path = str(info.get("path", ""))
+    if path in _COMPETITION_STRUCTURED_SCAN_PATHS:
+        return
+    backend = str(info.get("backend", ""))
+    policy_name = str(info.get("policy_name", ""))
+    kernel_family = str(info.get("kernel_family", ""))
+    raise RuntimeError(
+        f"{context} requires the fused CUDA structured-scan path in competition mode; "
+        f"got path={path!r}, backend={backend!r}, policy={policy_name!r}, kernel_family={kernel_family!r}. "
+        f"Expected one of: {', '.join(sorted(_COMPETITION_STRUCTURED_SCAN_PATHS))}."
+    )
+
+
+def _structured_runtime_supports_fused_paged_step(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> bool:
+    if runtime_config is None:
+        return False
+    if not runtime_config.use_paged_cache or not runtime_config.allow_cuda:
+        return False
+    if _structured_runtime_uses_transition_masking(runtime_config):
+        return False
+    if _structured_runtime_score_mod_callback(runtime_config) is not None:
+        return False
+    return True
+
+
+def _structured_runtime_supports_step_cuda_graph(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> bool:
+    return _structured_runtime_supports_fused_paged_step(runtime_config) and bool(
+        runtime_config.use_cuda_graphs if runtime_config is not None else False
+    )
+
+
+def _empty_packed_transition_tensors(device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return (
+        torch.empty((0, 0), device=device, dtype=torch.int8),
+        torch.empty((0,), device=device, dtype=torch.float32),
+        torch.empty((0, 0), device=device, dtype=torch.int8),
+        torch.empty((0,), device=device, dtype=torch.float32),
+    )
+
+
+def _update_cache_after_fused_paged_step(
+    cache: CausalMachineCache,
+    final_log_belief: Tensor,
+) -> None:
+    cache.log_belief = final_log_belief.detach()
+    cache.last_paged_read_backend = "cuda"
+    cache.last_paged_read_error = None
+    cache.last_paged_write_backend = "cuda"
+    cache.last_paged_write_error = None
+    cache.resident_state_valid = True
+    cache.num_updates += 1
+
+
+def _structured_fused_paged_step_cuda(
+    *,
+    local_logits: Tensor,
+    transition_source_logits: Tensor,
+    transition_dest_logits: Tensor,
+    transition_context: Tensor,
+    transition_gate: Tensor,
+    transition_stay_probs: Tensor,
+    cache: CausalMachineCache,
+    kernel_config: StructuredScanKernelConfig,
+    runtime_config: StructuredScanRuntimeConfig | None,
+    packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+) -> tuple[Tensor, Tensor, str]:
+    if cache.paged_log_beliefs is None or cache.paged_lengths is None:
+        raise RuntimeError("fused paged step requires paged_log_beliefs and paged_lengths")
+    ext = load_causal_machine_scan_cuda()
+    score_clamp_min, score_clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    clamp_active = math.isfinite(score_clamp_min) or math.isfinite(score_clamp_max)
+    packed_kind = -1
+    if packed_transition_tables is None or clamp_active:
+        packed_source, packed_source_scales, packed_dest, packed_dest_scales = _empty_packed_transition_tensors(
+            local_logits.device
+        )
+    else:
+        packed_kind, packed_source, packed_source_scales, packed_dest, packed_dest_scales = packed_transition_tables
+    transition_source_probs = F.softmax(transition_source_logits.contiguous().float(), dim=-1).contiguous()
+    transition_dest_probs = F.softmax(transition_dest_logits.contiguous().float(), dim=-1).contiguous()
+    paged_latent_states = (
+        cache.paged_latent_states
+        if cache.paged_latent_states is not None
+        else torch.empty((0, 0, 0, 0), device=local_logits.device, dtype=torch.float32)
+    )
+    beliefs, final_log_belief = ext.paged_step_(
+        cache.paged_log_beliefs,
+        paged_latent_states,
+        cache.paged_page_table,
+        cache.paged_lengths,
+        local_logits.contiguous(),
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context.contiguous(),
+        transition_stay_probs.contiguous().float(),
+        transition_gate.reshape(()).contiguous().float(),
+        packed_source,
+        packed_source_scales,
+        packed_dest,
+        packed_dest_scales,
+        int(packed_kind),
+        int(kernel_config.tile_size),
+        int(kernel_config.split_size),
+        float(score_clamp_min),
+        float(score_clamp_max),
+    )
+    if int(kernel_config.num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+        path = "cuda_tiled_paged"
+    elif packed_kind >= 0:
+        path = (
+            "cuda_dense_paged_decode_lowp_tensor_core"
+            if _structured_scan_uses_lowp_tensor_core_path(
+                device=local_logits.device,
+                dtype=local_logits.dtype,
+                kernel_config=kernel_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            else "cuda_dense_paged_decode_lowp"
+        )
+    else:
+        path = (
+            f"cuda_{kernel_config.kernel_family}_paged"
+            if str(kernel_config.kernel_family).startswith("dense_128_rank8")
+            else "cuda_dense_paged"
+        )
+    return beliefs, final_log_belief, path
+
+
+def autotune_structured_scan_kernel_config(
+    *,
+    num_states: int,
+    transition_rank: int,
+    seq_len: int,
+    device: torch.device,
+    default_chunk_size: int,
+    needs_grad: bool = False,
+    runtime_config: StructuredScanRuntimeConfig | None = None,
+) -> StructuredScanKernelConfig:
+    runtime_config = _resolve_structured_scan_runtime_config(
+        runtime_config,
+        device=device,
+        dtype=torch.float32,
+        backend_family="structured_scan",
+        batch_size=1,
+        seq_len=max(int(seq_len), 1),
+        num_states=max(int(num_states), 1),
+    )
+    policy = _select_structured_scan_backend_policy(
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+        seq_len=int(seq_len),
+        device=device,
+        default_chunk_size=int(default_chunk_size),
+        needs_grad=bool(needs_grad),
+        runtime_config=runtime_config,
+    )
+    runtime_config.backend_policy = policy
+    chunk_size = max(int(policy.chunk_size), 1)
+    tile_size = max(int(policy.tile_size), 1)
+    split_size = max(int(policy.split_size), 1)
+    device_runtime = _describe_structured_scan_device_runtime(device)
+    major = int(device_runtime.get("capability_major", 0))
+    max_dynamic_smem_bytes = int(device_runtime.get("max_dynamic_smem_bytes", 0))
+    sm_count = int(device_runtime.get("sm_count", 0))
+    if device.type == "cuda":
+        if major >= 9 and transition_rank <= 32 and seq_len >= 1024:
+            chunk_size = max(chunk_size, 128)
+        elif major >= 8 and transition_rank <= 16 and seq_len >= 512:
+            chunk_size = max(chunk_size, 96)
+        elif (
+            major >= 8
+            and _is_optimized_structured_scan_transition_rank(transition_rank)
+            and transition_rank <= 64
+            and seq_len >= 512
+        ):
+            chunk_size = max(chunk_size, 80)
+        if sm_count >= 96 and seq_len >= 2048:
+            chunk_size = max(chunk_size, 160 if transition_rank <= 64 else 128)
+        if num_states > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES:
+            if major >= 9:
+                tile_size = min(
+                    int(num_states),
+                    192 if max_dynamic_smem_bytes >= 160 * 1024 and transition_rank <= 192 else 160,
+                )
+                split_size = min(int(transition_rank), 128 if max_dynamic_smem_bytes >= 160 * 1024 else 96)
+            elif major >= 8:
+                tile_size = min(
+                    int(num_states),
+                    160 if max_dynamic_smem_bytes >= 128 * 1024 and transition_rank <= 160 else 128,
+                )
+                split_size = min(int(transition_rank), 96 if max_dynamic_smem_bytes >= 96 * 1024 else 64)
+            else:
+                tile_size = min(int(tile_size), 128)
+                split_size = min(int(split_size), 64)
+            tile_size = max(32, int(tile_size))
+            split_size = max(16, int(split_size))
+    allow_cuda = (
+        device.type == "cuda"
+        and supports_structured_scan_cuda_config(num_states, transition_rank)
+        and not _structured_runtime_uses_generalized_features(runtime_config)
+        and not _has_native_structured_score_filtering(runtime_config, num_states=int(num_states))
+        and _can_use_causal_machine_scan_cuda(device, transition_rank, num_states=num_states)
+    )
+    allow_cuda_tiled = (
+        device.type == "cuda"
+        and (runtime_config is None or runtime_config.allow_cuda)
+        and num_states > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+        and transition_rank > 0
+        and transition_rank <= num_states
+        and _structured_runtime_supports_tiled_backend(runtime_config)
+        and _can_use_causal_machine_tiled_scan_cuda(
+            device,
+            num_states=int(num_states),
+            transition_rank=int(transition_rank),
+            needs_grad=bool(needs_grad),
+            runtime_config=runtime_config,
+        )
+    )
+    if allow_cuda_tiled:
+        tiled_kernel_config = _resolve_structured_scan_tiled_kernel_config(
+            device,
+            num_states=int(num_states),
+            transition_rank=int(transition_rank),
+            seq_len=int(seq_len),
+            chunk_size=int(chunk_size),
+            preferred_tile_size=int(tile_size),
+            preferred_split_size=int(split_size),
+            needs_grad=bool(needs_grad),
+            runtime_config=runtime_config,
+        )
+        if tiled_kernel_config is not None:
+            tile_size, split_size = tiled_kernel_config
+    allow_python_tiled = (
+        num_states > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+        and transition_rank > 0
+        and transition_rank <= num_states
+        and _structured_runtime_supports_tiled_backend(runtime_config)
+    )
+    backend = "cuda" if allow_cuda else ("cuda_tiled" if allow_cuda_tiled else ("python_tiled" if allow_python_tiled else "python"))
+    if runtime_config is not None and runtime_config.backend not in {"", "auto"}:
+        backend = str(runtime_config.backend).strip().lower()
+        if backend == "cuda" and not allow_cuda:
+            backend = "cuda_tiled" if allow_cuda_tiled else ("python_tiled" if allow_python_tiled else "python")
+        if backend == "cuda_tiled" and not allow_cuda_tiled:
+            backend = "python_tiled" if allow_python_tiled else "python"
+        if backend == "python_tiled" and not allow_python_tiled:
+            backend = "python"
+    return StructuredScanKernelConfig(
+        num_states=int(num_states),
+        transition_rank=int(transition_rank),
+        chunk_size=chunk_size,
+        tile_size=tile_size,
+        split_size=split_size,
+        backend=backend,
+        policy_name=str(policy.name),
+        arch_family=str(policy.arch_family),
+        kernel_family=str(policy.kernel_family),
+        block_threads=int(policy.block_threads),
+        items_per_thread=int(policy.items_per_thread),
+        load_path=str(policy.load_path),
+        vector_bytes=int(policy.vector_bytes),
+        elements_per_load=int(policy.elements_per_load),
+        rank_unroll=int(policy.rank_unroll),
+        state_unroll=int(policy.state_unroll),
+        supports_async_pipeline=bool(policy.supports_async_pipeline),
+        supports_tensor_memory_accel=bool(policy.supports_tensor_memory_accel),
+        supports_cluster_launch_control=bool(policy.supports_cluster_launch_control),
+        supports_tma=bool(policy.supports_tma),
+        supports_wgmma=bool(policy.supports_wgmma),
+        supports_tcgen05=bool(policy.supports_tcgen05),
+        workspace_mode=str(policy.workspace_mode),
+        workspace_mode_backward=str(policy.workspace_mode_backward),
+        sparse_reorder_mode=str(policy.sparse_reorder_mode),
+        benchmark_family=str(policy.benchmark_family),
+        use_virtual_shared_fallback=bool(policy.use_virtual_shared_fallback and runtime_config.allow_virtual_shared_fallback),
+        grouped_launch_packing=bool(policy.grouped_launch_packing and runtime_config.grouped_launch_packing),
+        allow_cuda=allow_cuda,
+        allow_tiled_cuda=allow_cuda_tiled,
+        allow_quantized_tables=allow_cuda and major >= 8,
+    )
+
+
+def describe_structured_scan_cuda_runtime_config(
+    *,
+    batch_size: int = 1,
+    num_states: int = _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES,
+    seq_len: int,
+    transition_rank: int,
+    chunk_size: int,
+    device: torch.device,
+    backward: bool = False,
+) -> dict[str, object]:
+    if device.type != "cuda":
+        raise ValueError("describe_structured_scan_cuda_runtime_config requires a CUDA device")
+    ext = load_causal_machine_scan_cuda()
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    info = dict(
+        ext.describe_runtime_config(
+            int(batch_size),
+            int(seq_len),
+            int(num_states),
+            int(transition_rank),
+            int(chunk_size),
+            device_index,
+            bool(backward),
+        )
+    )
+    info["device_runtime"] = _describe_structured_scan_device_runtime(device)
+    return info
+
+
+def _canonicalize_structured_seq_lens(
+    seq_lens: Tensor | Sequence[int] | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+) -> Tensor | None:
+    if seq_lens is None:
+        return None
+    if isinstance(seq_lens, Tensor):
+        seq_lens_t = seq_lens.to(device=device, dtype=torch.int64).reshape(-1)
+    else:
+        seq_lens_t = torch.tensor(list(seq_lens), device=device, dtype=torch.int64)
+    if seq_lens_t.numel() != batch_size:
+        raise ValueError(f"seq_lens must have {batch_size} elements, got {seq_lens_t.numel()}")
+    return seq_lens_t.clamp_(min=0, max=max(int(seq_len), 0))
+
+
+def _canonicalize_structured_score_bias(
+    score_bias: Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_states: int,
+    device: torch.device,
+) -> Tensor | None:
+    if score_bias is None:
+        return None
+    bias = score_bias.to(device=device, dtype=torch.float32)
+    if bias.dim() == 1:
+        if bias.size(0) != num_states:
+            raise ValueError(f"score_bias must have shape [{num_states}], got {tuple(bias.shape)}")
+        return bias.view(1, 1, num_states).expand(batch_size, seq_len, num_states).contiguous()
+    if bias.dim() == 2:
+        if bias.size(0) != seq_len or bias.size(1) != num_states:
+            raise ValueError(f"score_bias must have shape [{seq_len}, {num_states}], got {tuple(bias.shape)}")
+        return bias.view(1, seq_len, num_states).expand(batch_size, seq_len, num_states).contiguous()
+    if bias.dim() == 3:
+        if bias.size(2) != num_states:
+            raise ValueError(
+                f"score_bias last dim must equal num_states={num_states}, got {tuple(bias.shape)}"
+            )
+        if bias.size(0) not in {1, batch_size} or bias.size(1) not in {1, seq_len}:
+            raise ValueError(
+                f"score_bias must broadcast to [{batch_size}, {seq_len}, {num_states}], got {tuple(bias.shape)}"
+            )
+        return bias.expand(batch_size, seq_len, num_states).contiguous()
+    raise ValueError(
+        f"score_bias must be 1D [N], 2D [L, N], or 3D [B, L, N]-broadcastable, got {tuple(bias.shape)}"
+    )
+
+
+def _canonicalize_structured_score_mask(
+    score_mask: Tensor | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_states: int,
+    device: torch.device,
+) -> Tensor | None:
+    if score_mask is None:
+        return None
+    mask = score_mask.to(device=device, dtype=torch.bool)
+    if mask.dim() == 1:
+        if mask.size(0) != num_states:
+            raise ValueError(f"state_mask must have shape [{num_states}], got {tuple(mask.shape)}")
+        return mask.view(1, 1, num_states).expand(batch_size, seq_len, num_states).contiguous()
+    if mask.dim() == 2:
+        if mask.size(0) != seq_len or mask.size(1) != num_states:
+            raise ValueError(f"state_mask must have shape [{seq_len}, {num_states}], got {tuple(mask.shape)}")
+        return mask.view(1, seq_len, num_states).expand(batch_size, seq_len, num_states).contiguous()
+    if mask.dim() == 3:
+        if mask.size(2) != num_states:
+            raise ValueError(
+                f"state_mask last dim must equal num_states={num_states}, got {tuple(mask.shape)}"
+            )
+        if mask.size(0) not in {1, batch_size} or mask.size(1) not in {1, seq_len}:
+            raise ValueError(
+                f"state_mask must broadcast to [{batch_size}, {seq_len}, {num_states}], got {tuple(mask.shape)}"
+            )
+        return mask.expand(batch_size, seq_len, num_states).contiguous()
+    raise ValueError(
+        f"state_mask must be 1D [N], 2D [L, N], or 3D [B, L, N]-broadcastable, got {tuple(mask.shape)}"
+    )
+
+
+def _materialize_native_structured_score_bias(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_states: int,
+    device: torch.device,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor | None:
+    if runtime_config is None:
+        return None
+    combined_bias = _canonicalize_structured_score_bias(
+        runtime_config.score_bias,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_states=num_states,
+        device=device,
+    )
+    score_mod_spec = _structured_runtime_score_mod_spec(runtime_config)
+    if score_mod_spec is None:
+        return combined_bias
+    if score_mod_spec.additive_bias is not None:
+        additive_bias = _canonicalize_structured_score_bias(
+            score_mod_spec.additive_bias,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_states=num_states,
+            device=device,
+        )
+        combined_bias = additive_bias if combined_bias is None else (combined_bias + additive_bias)
+    if score_mod_spec.state_mask is not None:
+        state_mask = _canonicalize_structured_score_mask(
+            score_mod_spec.state_mask,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_states=num_states,
+            device=device,
+        )
+        assert state_mask is not None
+        masked_bias = torch.where(
+            state_mask,
+            torch.zeros((), device=device, dtype=torch.float32),
+            torch.full(
+                (),
+                float(score_mod_spec.masked_bias_value),
+                device=device,
+                dtype=torch.float32,
+            ),
+        ).expand(batch_size, seq_len, num_states)
+        combined_bias = masked_bias if combined_bias is None else (combined_bias + masked_bias)
+    return combined_bias.contiguous() if combined_bias is not None else None
+
+
+def _resolve_native_structured_score_pred_scale(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> float:
+    score_mod_spec = _structured_runtime_score_mod_spec(runtime_config)
+    if score_mod_spec is None or score_mod_spec.pred_scale is None:
+        return 1.0
+    pred_scale = score_mod_spec.pred_scale
+    if isinstance(pred_scale, Tensor):
+        if pred_scale.numel() != 1:
+            raise ValueError("StructuredScoreModSpec.pred_scale tensor must be scalar")
+        scale_value = float(pred_scale.detach().cpu().item())
+    else:
+        scale_value = float(pred_scale)
+    if not math.isfinite(scale_value) or scale_value <= 0.0:
+        raise ValueError("StructuredScoreModSpec.pred_scale must be a finite positive scalar")
+    return scale_value
+
+
+def _resolve_native_structured_score_threshold(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> float:
+    score_mod_spec = _structured_runtime_score_mod_spec(runtime_config)
+    if score_mod_spec is None or score_mod_spec.threshold is None:
+        return -math.inf
+    threshold = score_mod_spec.threshold
+    if isinstance(threshold, Tensor):
+        if threshold.numel() != 1:
+            raise ValueError("StructuredScoreModSpec.threshold tensor must be scalar")
+        threshold_value = float(threshold.detach().cpu().item())
+    else:
+        threshold_value = float(threshold)
+    if math.isnan(threshold_value):
+        raise ValueError("StructuredScoreModSpec.threshold must not be NaN")
+    return threshold_value
+
+
+def _resolve_native_structured_score_topk(
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    num_states: int | None = None,
+) -> int:
+    score_mod_spec = _structured_runtime_score_mod_spec(runtime_config)
+    if score_mod_spec is None or score_mod_spec.topk is None:
+        return 0
+    topk_value = int(score_mod_spec.topk)
+    if topk_value <= 0:
+        raise ValueError("StructuredScoreModSpec.topk must be a positive integer")
+    if num_states is not None and topk_value >= int(num_states):
+        return 0
+    return topk_value
+
+
+def _resolve_native_structured_score_clamp_bounds(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> tuple[float, float]:
+    score_mod_spec = _structured_runtime_score_mod_spec(runtime_config)
+    if score_mod_spec is None:
+        return -math.inf, math.inf
+    clamp_min = float(score_mod_spec.clamp_min) if score_mod_spec.clamp_min is not None else -math.inf
+    clamp_max = float(score_mod_spec.clamp_max) if score_mod_spec.clamp_max is not None else math.inf
+    if math.isnan(clamp_min) or math.isnan(clamp_max):
+        raise ValueError("StructuredScoreModSpec clamp bounds must not be NaN")
+    if clamp_min > clamp_max:
+        raise ValueError("StructuredScoreModSpec.clamp_min must be <= clamp_max")
+    return clamp_min, clamp_max
+
+
+def _has_native_structured_score_clamp(
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> bool:
+    clamp_min, clamp_max = _resolve_native_structured_score_clamp_bounds(runtime_config)
+    return math.isfinite(clamp_min) or math.isfinite(clamp_max)
+
+
+def _has_native_structured_score_filtering(
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    num_states: int | None = None,
+) -> bool:
+    threshold = _resolve_native_structured_score_threshold(runtime_config)
+    topk = _resolve_native_structured_score_topk(runtime_config, num_states=num_states)
+    return math.isfinite(threshold) or topk > 0
+
+
+def _apply_native_structured_score_mod_inputs(
+    transition_context: Tensor,
+    transition_gate: Tensor,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> tuple[Tensor, Tensor]:
+    score_bias = _materialize_native_structured_score_bias(
+        batch_size=int(transition_context.size(0)),
+        seq_len=int(transition_context.size(1)),
+        num_states=int(transition_context.size(2)),
+        device=transition_context.device,
+        runtime_config=runtime_config,
+    )
+    pred_scale = _resolve_native_structured_score_pred_scale(runtime_config)
+    context_out = transition_context.float()
+    if score_bias is not None:
+        context_out = context_out + score_bias
+    gate_out = transition_gate.to(device=transition_context.device, dtype=torch.float32)
+    if pred_scale != 1.0:
+        context_out = context_out / pred_scale
+        gate_out = gate_out * pred_scale
+    return context_out.to(dtype=transition_context.dtype), gate_out
+
+
+def _apply_native_structured_score_bias(
+    transition_context: Tensor,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor:
+    score_bias = _materialize_native_structured_score_bias(
+        batch_size=int(transition_context.size(0)),
+        seq_len=int(transition_context.size(1)),
+        num_states=int(transition_context.size(2)),
+        device=transition_context.device,
+        runtime_config=runtime_config,
+    )
+    if score_bias is None:
+        return transition_context
+    return (transition_context.float() + score_bias).to(dtype=transition_context.dtype)
+
+
+def _build_structured_transition_mask(
+    num_states: int,
+    *,
+    device: torch.device,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor | None:
+    if runtime_config is None:
+        return None
+    row_idx = torch.arange(num_states, device=device, dtype=torch.int64).view(num_states, 1)
+    col_idx = torch.arange(num_states, device=device, dtype=torch.int64).view(1, num_states)
+    mask: Tensor | None = None
+    if runtime_config.transition_mask is not None:
+        mask = runtime_config.transition_mask.to(device=device, dtype=torch.bool)
+        if mask.shape != (num_states, num_states):
+            raise ValueError(
+                f"transition_mask must have shape {(num_states, num_states)}, got {tuple(mask.shape)}"
+            )
+    if runtime_config.local_transition_window is not None:
+        local_mask = (row_idx - col_idx).abs() <= int(runtime_config.local_transition_window)
+        mask = local_mask if mask is None else (mask & local_mask)
+    if runtime_config.block_mask is not None:
+        block_mask = runtime_config.block_mask.to(device=device, dtype=torch.bool)
+        if block_mask.dim() != 2:
+            raise ValueError(f"block_mask must be 2D, got shape={tuple(block_mask.shape)}")
+        block_rows, block_cols = block_mask.shape
+        if block_rows != block_cols:
+            raise ValueError(f"block_mask must be square, got shape={tuple(block_mask.shape)}")
+        block_size = int(runtime_config.block_size or math.ceil(num_states / max(block_rows, 1)))
+        row_block = torch.div(row_idx, block_size, rounding_mode="floor").clamp(max=block_rows - 1)
+        col_block = torch.div(col_idx, block_size, rounding_mode="floor").clamp(max=block_cols - 1)
+        block_sparse_mask = block_mask[row_block, col_block]
+        mask = block_sparse_mask if mask is None else (mask & block_sparse_mask)
+    if runtime_config.transition_mask_mod is not None:
+        mod_mask = runtime_config.transition_mask_mod(row_idx.expand(-1, num_states), col_idx.expand(num_states, -1), runtime_config)
+        mod_mask = mod_mask.to(device=device, dtype=torch.bool)
+        if mod_mask.shape != (num_states, num_states):
+            raise ValueError(
+                f"transition_mask_mod must return shape {(num_states, num_states)}, got {tuple(mod_mask.shape)}"
+            )
+        mask = mod_mask if mask is None else (mask & mod_mask)
+    return mask
+
+
+def _evaluate_structured_transition_mask_mod(
+    num_states: int,
+    *,
+    device: torch.device,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor | None:
+    if runtime_config is None or runtime_config.transition_mask_mod is None:
+        return None
+    row_idx = torch.arange(num_states, device=device, dtype=torch.int64).view(num_states, 1)
+    col_idx = torch.arange(num_states, device=device, dtype=torch.int64).view(1, num_states)
+    mod_mask = runtime_config.transition_mask_mod(
+        row_idx.expand(-1, num_states),
+        col_idx.expand(num_states, -1),
+        runtime_config,
+    )
+    mod_mask = mod_mask.to(device=device, dtype=torch.bool)
+    if mod_mask.shape != (num_states, num_states):
+        raise ValueError(
+            f"transition_mask_mod must return shape {(num_states, num_states)}, got {tuple(mod_mask.shape)}"
+        )
+    return mod_mask.contiguous()
+
+
+def _build_structured_transition_matrix(
+    transition_source_probs: Tensor,
+    transition_dest_probs: Tensor,
+    *,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor | None:
+    mask = _build_structured_transition_mask(
+        int(transition_source_probs.size(0)),
+        device=transition_source_probs.device,
+        runtime_config=runtime_config,
+    )
+    if mask is None:
+        return None
+    raw_transition_matrix = transition_source_probs.float() @ transition_dest_probs.float()
+    masked_transition_matrix = raw_transition_matrix.masked_fill(~mask, 0.0)
+    denom = masked_transition_matrix.sum(dim=-1, keepdim=True).clamp_min(1.0e-20)
+    normalized = masked_transition_matrix / denom
+    if runtime_config is None or runtime_config.scratch_arena is None:
+        return normalized
+    arena = runtime_config.scratch_arena
+    scratch = arena.empty(
+        "dense_transition_matrix",
+        tuple(int(dim) for dim in normalized.shape),
+        device=normalized.device,
+        dtype=normalized.dtype,
+    )
+    scratch.copy_(normalized)
+    return scratch
+
+
+def structured_transition_predict_log_belief_dense(
+    prev_log_belief: Tensor,
+    transition_matrix: Tensor,
+    transition_stay_probs: Tensor,
+) -> Tensor:
+    prev_probs = prev_log_belief.float().exp()
+    mix_probs = prev_probs @ transition_matrix.float()
+    stay_probs = transition_stay_probs.float().unsqueeze(0)
+    pred_probs = stay_probs * prev_probs + (1.0 - stay_probs) * mix_probs
+    return pred_probs.clamp_min(1.0e-20).log()
+
+
+def _apply_structured_score_mod(
+    pred_log_belief: Tensor,
+    *,
+    time_idx: int,
+    runtime_config: StructuredScanRuntimeConfig | None,
+) -> Tensor:
+    score_mod = _structured_runtime_score_mod_callback(runtime_config)
+    if score_mod is None:
+        return pred_log_belief
+    assert runtime_config is not None
+    updated = score_mod(pred_log_belief, int(time_idx), runtime_config)
+    if not isinstance(updated, Tensor):
+        raise TypeError("score_mod must return a Tensor")
+    if updated.shape != pred_log_belief.shape:
+        raise ValueError(
+            f"score_mod must preserve shape {tuple(pred_log_belief.shape)}, got {tuple(updated.shape)}"
+        )
+    return updated
 
 
 @dataclass
@@ -780,10 +6508,14 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "causal_machine_latent_gate_init": -0.5,
     "causal_machine_latent_decay_init": 0.995,
     "causal_machine_teacher_loss_coeff": 0.0,
-    "causal_machine_state_loss_coeff": 0.06,
+    # Competition-safe default: keep extra state-space objectives off unless
+    # a launch explicitly opts into them. Profile-backed teacher supervision is
+    # not allowed by default, and online-teacher wiring should not inherit
+    # hidden nonzero losses from this recipe.
+    "causal_machine_state_loss_coeff": 0.0,
     "causal_machine_next_token_loss_coeff": 0.0,
-    "causal_machine_transition_kl_coeff": 0.005,
-    "causal_machine_future_sketch_loss_coeff": 0.015,
+    "causal_machine_transition_kl_coeff": 0.0,
+    "causal_machine_future_sketch_loss_coeff": 0.0,
     "causal_machine_transition_gate_init": -0.25,
     "causal_machine_transition_stickiness_init": 2.5,
     "causal_machine_emit_delta_scale_init": 0.10,
@@ -895,19 +6627,20 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "2048"))
-    training_preset = os.environ.get("TRAINING_PRESET", "").strip().lower()
+    competition_mode = _competition_mode_enabled()
+    training_preset = os.environ.get("TRAINING_PRESET", "local_proxy_promotion").strip().lower()
     recipe_family = os.environ.get("RECIPE_FAMILY", "").strip().lower()
     curriculum_policy = os.environ.get("CURRICULUM_POLICY", "").strip().lower()
     data_policy = os.environ.get("DATA_POLICY", "").strip().lower()
-    optimizer_policy = os.environ.get("OPTIMIZER_POLICY", "").strip().lower()
+    optimizer_policy = os.environ.get("OPTIMIZER_POLICY", "local_proxy_faststart").strip().lower()
     precision_policy = os.environ.get("PRECISION_POLICY", "").strip().lower()
     eval_policy = os.environ.get("EVAL_POLICY", "").strip().lower()
-    runtime_policy = os.environ.get("RUNTIME_POLICY", "").strip().lower()
+    runtime_policy = os.environ.get("RUNTIME_POLICY", "compiled").strip().lower()
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     rope_dims = int(os.environ.get("ROPE_DIMS", "16"))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
-    enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "0")))
+    enable_torch_compile = bool(int(os.environ.get("ENABLE_TORCH_COMPILE", "1")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 256))
     val_max_seqs = int(os.environ.get("VAL_MAX_SEQS", "0"))
@@ -1071,6 +6804,9 @@ class Hyperparameters:
         "CAUSAL_MACHINE_PROFILE_JSON",
         DEFAULT_CAUSAL_MACHINE_PROFILE_JSON,
     ).strip()
+    causal_machine_allow_offline_teacher = bool(
+        int(os.environ.get("CAUSAL_MACHINE_ALLOW_OFFLINE_TEACHER", "0"))
+    )
     causal_machine_hidden_rank = int(
         os.environ.get(
             "CAUSAL_MACHINE_HIDDEN_RANK",
@@ -1185,6 +6921,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["matrix_lr"]))))
     mlp_matrix_lr_mult = float(os.environ.get("MLP_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["mlp_matrix_lr_mult"]))))
     scalar_lr = float(os.environ.get("SCALAR_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["scalar_lr"]))))
+    use_muon = bool(int(os.environ.get("USE_MUON", "1")))
     head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", str(float(LOCAL_PROXY_RECIPE_COMMON["head_weight_decay"]))))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.03"))
@@ -1228,6 +6965,7 @@ class Hyperparameters:
             "tied_embed_warmup_steps": "TIED_EMBED_WARMUP_STEPS",
             "matrix_lr": "MATRIX_LR",
             "scalar_lr": "SCALAR_LR",
+            "use_muon": "USE_MUON",
             "muon_momentum": "MUON_MOMENTUM",
             "muon_momentum_warmup_start": "MUON_MOMENTUM_WARMUP_START",
             "muon_momentum_warmup_steps": "MUON_MOMENTUM_WARMUP_STEPS",
@@ -1359,6 +7097,9 @@ class Hyperparameters:
                 "muon_momentum_warmup_steps": 250,
                 "muon_weight_decay": 0.03,
             },
+            "graph_first": {
+                "use_muon": False,
+            },
         }
         runtime_policies: dict[str, dict[str, object]] = {
             "compiled": {"enable_torch_compile": True},
@@ -1470,6 +7211,63 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
+def _muon_python_step_param(
+    p: Tensor,
+    g: Tensor,
+    state: dict[str, Tensor],
+    *,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    nesterov: bool,
+    backend_steps: int,
+) -> None:
+    if weight_decay > 0.0:
+        p.mul_(1.0 - lr * weight_decay)
+    buf = state.get("momentum_buffer")
+    if buf is None:
+        buf = torch.zeros_like(g)
+        state["momentum_buffer"] = buf
+    buf.mul_(momentum).add_(g)
+    effective_g = g.add(buf, alpha=momentum) if nesterov else buf
+    update = zeropower_via_newtonschulz5(effective_g, steps=backend_steps)
+    update *= max(1, update.size(0) / update.size(1)) ** 0.5
+    p.add_(update.to(dtype=p.dtype), alpha=-lr)
+
+
+def _muon_prefers_cuda_bucket(
+    shape: tuple[int, int],
+    *,
+    bucket_size: int,
+) -> bool:
+    policy = MUON_CUDA_BUCKET_POLICY
+    if policy in {"0", "false", "off", "none"}:
+        return False
+    if policy in {"1", "true", "on", "all", "force"}:
+        return True
+    rows, cols = int(shape[0]), int(shape[1])
+    elements = rows * cols
+    bucket_elements = elements * int(bucket_size)
+    if bucket_size < 4:
+        return False
+    # Large square attention buckets now win on CUDA, but the small square
+    # family still tends to lose to launch and gather overhead.
+    if rows == cols:
+        return bucket_size >= 8 or bucket_elements >= 1_000_000
+    return rows < cols or elements >= 524288
+
+
+def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
+    rows, cols = int(shape[0]), int(shape[1])
+    if rows == cols:
+        return 0
+    if rows > cols:
+        return 1
+    if rows <= 384:
+        return 2
+    return 3
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(
         self,
@@ -1481,6 +7279,7 @@ class Muon(torch.optim.Optimizer):
         backend_refresh_interval: int = 1,
         weight_decay: float = 0.0,
         nesterov: bool = True,
+        capturable: bool = False,
     ):
         super().__init__(
             params,
@@ -1494,6 +7293,186 @@ class Muon(torch.optim.Optimizer):
                 nesterov=nesterov,
             ),
         )
+        self.last_step_stats: dict[str, float | int | bool] = {}
+        self._cuda_bucket_workspaces: dict[tuple[int, ...], dict[str, Any]] = {}
+        self._cuda_ext: Any | None = None
+        self._capturable_requested = bool(capturable)
+        self._graph_capture_ready = False
+        self._graph_capture_disable_reason = ""
+        self._static_group_buckets: dict[int, list[dict[str, Any]]] = {}
+        if self._capturable_requested:
+            self._init_capturable_group_tensors()
+
+    def _init_capturable_group_tensors(self) -> None:
+        for group in self.param_groups:
+            params = list(group.get("params", []))
+            first_param = next((p for p in params if isinstance(p, Tensor)), None)
+            if first_param is None or first_param.device.type != "cuda":
+                continue
+            device = first_param.device
+            if not isinstance(group.get("lr_tensor"), Tensor):
+                lr_tensor = torch.tensor(float(group["lr"]), device=device, dtype=torch.float32)
+                group["lr_tensor"] = lr_tensor
+                group["lr"] = lr_tensor
+            if not isinstance(group.get("momentum_tensor"), Tensor):
+                group["momentum_tensor"] = torch.tensor(float(group["momentum"]), device=device, dtype=torch.float32)
+            if not isinstance(group.get("weight_decay_tensor"), Tensor):
+                group["weight_decay_tensor"] = torch.tensor(float(group["weight_decay"]), device=device, dtype=torch.float32)
+
+    def _group_tensor_or_float(self, group: dict[str, Any], name: str, fallback: float = 0.0) -> float | Tensor:
+        tensor_name = f"{name}_tensor"
+        value = group.get(tensor_name)
+        if isinstance(value, Tensor):
+            return value
+        return group.get(name, fallback)
+
+    def _load_cuda_ext_or_none(self):
+        if self._cuda_ext is not None:
+            return self._cuda_ext
+        try:
+            self._cuda_ext = load_muon_cuda()
+        except Exception:
+            self._cuda_ext = None
+        return self._cuda_ext
+
+    def supports_full_step_cuda_graph(self) -> bool:
+        return bool(self._graph_capture_ready)
+
+    def graph_capture_disable_reason(self) -> str:
+        return str(self._graph_capture_disable_reason)
+
+    def prepare_cuda_graph_capture(self) -> bool:
+        self._graph_capture_ready = False
+        self._graph_capture_disable_reason = ""
+        self._static_group_buckets = {}
+        if not self._capturable_requested:
+            self._graph_capture_disable_reason = "capturable_disabled"
+            return False
+        ext = self._load_cuda_ext_or_none()
+        if ext is None or not hasattr(ext, "grouped_step_family_workspace_capturable"):
+            self._graph_capture_disable_reason = "capturable_extension_unavailable"
+            return False
+        for group_idx, group in enumerate(self.param_groups):
+            backend_refresh_interval = max(int(group.get("backend_refresh_interval", 1)), 1)
+            backend_steps = int(group.get("backend_steps", 0))
+            backend_steps_light = int(group.get("backend_steps_light", 0))
+            if backend_refresh_interval > 1 and backend_steps != backend_steps_light:
+                self._graph_capture_disable_reason = "dynamic_backend_steps"
+                self._static_group_buckets = {}
+                return False
+            bucket_map: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[tuple[Tensor, dict[str, Tensor]]]] = {}
+            for p in group["params"]:
+                if p.ndim != 2:
+                    continue
+                state = self.state[p]
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(p, dtype=torch.float32 if p.dtype != torch.float32 else p.dtype)
+                    state["momentum_buffer"] = buf
+                if (
+                    p.device.type != "cuda"
+                    or not p.is_contiguous()
+                    or not buf.is_contiguous()
+                ):
+                    self._graph_capture_disable_reason = "non_cuda_or_noncontiguous_param"
+                    self._static_group_buckets = {}
+                    return False
+                bucket_key = (tuple(int(v) for v in p.shape), p.dtype, p.device)
+                bucket_map.setdefault(bucket_key, []).append((p, state))
+            group_buckets: list[dict[str, Any]] = []
+            for (shape, _dtype, _device), items in bucket_map.items():
+                if not _muon_prefers_cuda_bucket(shape, bucket_size=len(items)):
+                    self._graph_capture_disable_reason = "python_fallback_bucket"
+                    self._static_group_buckets = {}
+                    return False
+                params_bucket = [item[0] for item in items]
+                states_bucket = [item[1] for item in items]
+                workspace = self._get_cuda_bucket_workspace(
+                    [(param, param, state) for param, state in zip(params_bucket, states_bucket, strict=True)]
+                )
+                group_buckets.append(
+                    {
+                        "params": params_bucket,
+                        "states": states_bucket,
+                        "family_code": int(workspace["family_code"]),
+                        "workspace": workspace,
+                        "shape": tuple(int(v) for v in shape),
+                    }
+                )
+            self._static_group_buckets[group_idx] = group_buckets
+        self._graph_capture_ready = True
+        return True
+
+    def _get_cuda_bucket_workspace(
+        self,
+        bucket_items: list[tuple[Tensor, Tensor, dict[str, Tensor]]],
+    ) -> dict[str, Any]:
+        params_bucket = [item[0] for item in bucket_items]
+        states_bucket = [item[2] for item in bucket_items]
+        shape = tuple(int(v) for v in params_bucket[0].shape)
+        device = params_bucket[0].device
+        key = (
+            device.index if device.index is not None else -1,
+            params_bucket[0].dtype,
+            len(bucket_items),
+            shape[0],
+            shape[1],
+            *(id(param) for param in params_bucket),
+        )
+        workspace = self._cuda_bucket_workspaces.get(key)
+        if workspace is None:
+            family_code = _muon_bucket_family_code(shape)
+            transpose_input = family_code == 1
+            ns_rows = shape[1] if transpose_input else shape[0]
+            ns_cols = shape[0] if transpose_input else shape[1]
+            effective_batch = torch.empty(
+                (len(bucket_items), shape[0], shape[1]),
+                device=device,
+                dtype=torch.float32,
+            )
+            momentum_batch = torch.empty(
+                (len(bucket_items), shape[0], shape[1]),
+                device=device,
+                dtype=torch.float32,
+            )
+            norms = torch.empty(
+                (len(bucket_items), 1),
+                device=device,
+                dtype=torch.float32,
+            )
+            ns_input_batch = torch.empty(
+                (len(bucket_items), ns_rows, ns_cols),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            gram_batch = torch.empty(
+                (len(bucket_items), ns_rows, ns_rows),
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            gram_sq_batch = torch.empty_like(gram_batch)
+            next_x_batch = torch.empty_like(ns_input_batch)
+            momentum_views = [momentum_batch[idx] for idx in range(len(bucket_items))]
+            for state, view in zip(states_bucket, momentum_views, strict=True):
+                existing = state.get("momentum_buffer")
+                if existing is None:
+                    view.zero_()
+                else:
+                    view.copy_(existing.to(dtype=view.dtype))
+                state["momentum_buffer"] = view
+            workspace = {
+                "family_code": family_code,
+                "effective_batch": effective_batch,
+                "momentum_batch": momentum_batch,
+                "norms": norms,
+                "ns_input_batch": ns_input_batch,
+                "gram_batch": gram_batch,
+                "gram_sq_batch": gram_sq_batch,
+                "next_x_batch": next_x_batch,
+                "momentum_views": momentum_views,
+            }
+            self._cuda_bucket_workspaces[key] = workspace
+        return workspace
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -1502,10 +7481,82 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        total_stats: dict[str, float | int | bool] = {
+            "group_count": 0,
+            "tensor_count": 0,
+            "bucket_count": 0,
+            "cuda_tensor_count": 0,
+            "fallback_tensor_count": 0,
+            "cuda_element_count": 0,
+            "fallback_element_count": 0,
+            "cuda_failure_count": 0,
+            "extension_available": False,
+            "total_ms": 0.0,
+            "cuda_ms": 0.0,
+            "fallback_ms": 0.0,
+        }
+        step_started_at = time.perf_counter() if PROFILE_MUON_STEP else 0.0
+        if self._graph_capture_ready:
+            muon_ext = self._load_cuda_ext_or_none()
+            if muon_ext is None or not hasattr(muon_ext, "grouped_step_family_workspace_capturable"):
+                raise RuntimeError("graph-safe Muon step requested without capturable muon_cuda extension")
+            for group_idx, group in enumerate(self.param_groups):
+                params = group["params"]
+                if not params:
+                    continue
+                total_stats["group_count"] = int(total_stats["group_count"]) + 1
+                total_stats["extension_available"] = True
+                nesterov = bool(group["nesterov"])
+                backend_refresh_interval = max(int(group["backend_refresh_interval"]), 1)
+                step_index = int(group.get("step_index", 0)) + 1
+                group["step_index"] = step_index
+                use_full_backend = backend_refresh_interval <= 1 or step_index % backend_refresh_interval == 0
+                current_backend_steps = int(group["backend_steps"] if use_full_backend else group["backend_steps_light"])
+                lr_tensor = group.get("lr_tensor")
+                momentum_tensor = group.get("momentum_tensor")
+                weight_decay_tensor = group.get("weight_decay_tensor")
+                if not isinstance(lr_tensor, Tensor) or not isinstance(momentum_tensor, Tensor) or not isinstance(weight_decay_tensor, Tensor):
+                    raise RuntimeError("graph-safe Muon step requires tensor-backed lr/momentum/weight_decay")
+                for bucket in self._static_group_buckets.get(group_idx, []):
+                    params_bucket = bucket["params"]
+                    grads_bucket = []
+                    for p in params_bucket:
+                        if p.grad is None:
+                            raise RuntimeError("graph-safe Muon step encountered a parameter without grad")
+                        grads_bucket.append(p.grad)
+                    workspace = bucket["workspace"]
+                    bucket_element_count = sum(int(param.numel()) for param in params_bucket)
+                    muon_ext.grouped_step_family_workspace_capturable(
+                        params_bucket,
+                        grads_bucket,
+                        workspace["effective_batch"],
+                        workspace["momentum_batch"],
+                        workspace["norms"],
+                        workspace["ns_input_batch"],
+                        workspace["gram_batch"],
+                        workspace["gram_sq_batch"],
+                        workspace["next_x_batch"],
+                        int(bucket["family_code"]),
+                        lr_tensor,
+                        momentum_tensor,
+                        weight_decay_tensor,
+                        nesterov,
+                        current_backend_steps,
+                        1.0e-7,
+                    )
+                    total_stats["bucket_count"] = int(total_stats["bucket_count"]) + 1
+                    total_stats["tensor_count"] = int(total_stats["tensor_count"]) + len(params_bucket)
+                    total_stats["cuda_tensor_count"] = int(total_stats["cuda_tensor_count"]) + len(params_bucket)
+                    total_stats["cuda_element_count"] = int(total_stats["cuda_element_count"]) + bucket_element_count
+            if PROFILE_MUON_STEP:
+                total_stats["total_ms"] = (time.perf_counter() - step_started_at) * 1000.0
+            self.last_step_stats = total_stats
+            return loss
         for group in self.param_groups:
             params = group["params"]
             if not params:
                 continue
+            total_stats["group_count"] = int(total_stats["group_count"]) + 1
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
@@ -1517,27 +7568,104 @@ class Muon(torch.optim.Optimizer):
             group["step_index"] = step_index
             use_full_backend = backend_refresh_interval <= 1 or step_index % backend_refresh_interval == 0
             current_backend_steps = backend_steps if use_full_backend else backend_steps_light
+            grouped_buckets: dict[tuple[tuple[int, ...], torch.dtype, torch.device], list[tuple[Tensor, Tensor, dict[str, Tensor]]]] = {}
+            fallback_items: list[tuple[Tensor, Tensor, dict[str, Tensor]]] = []
+            muon_ext = None
+            if USE_MUON_CUDA:
+                try:
+                    muon_ext = load_muon_cuda()
+                except Exception:
+                    muon_ext = None
+            if muon_ext is not None:
+                total_stats["extension_available"] = True
             for p in params:
-                if weight_decay > 0.0:
-                    p.mul_(1.0 - lr * weight_decay)
                 if p.grad is None:
                     continue
+                total_stats["tensor_count"] = int(total_stats["tensor_count"]) + 1
                 g = p.grad
                 state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-                g = zeropower_via_newtonschulz5(g, steps=current_backend_steps)
-                # DDP already synchronizes gradients, so applying Muon locally on
-                # every rank avoids an extra all-reduce over flattened updates.
-                g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                g = g.to(dtype=p.dtype)
-                state["last_applied_update"] = g.detach().clone()
-                p.add_(g, alpha=-lr)
+                buf = state.get("momentum_buffer")
+                if buf is None:
+                    buf = torch.zeros_like(g)
+                    state["momentum_buffer"] = buf
+                item = (p, g, state)
+                if (
+                    muon_ext is None
+                    or p.device.type != "cuda"
+                    or p.ndim != 2
+                    or g.ndim != 2
+                    or not p.is_contiguous()
+                    or not g.is_contiguous()
+                    or not buf.is_contiguous()
+                ):
+                    fallback_items.append(item)
+                    continue
+                bucket_key = (tuple(int(v) for v in p.shape), p.dtype, p.device)
+                grouped_buckets.setdefault(bucket_key, []).append(item)
 
+            for bucket_items in grouped_buckets.values():
+                total_stats["bucket_count"] = int(total_stats["bucket_count"]) + 1
+                params_bucket = [item[0] for item in bucket_items]
+                grads_bucket = [item[1] for item in bucket_items]
+                bucket_element_count = sum(int(param.numel()) for param in params_bucket)
+                bucket_shape = tuple(int(v) for v in params_bucket[0].shape)
+                if not _muon_prefers_cuda_bucket(bucket_shape, bucket_size=len(bucket_items)):
+                    fallback_items.extend(bucket_items)
+                    continue
+                workspace = self._get_cuda_bucket_workspace(bucket_items)
+                bucket_started_at = time.perf_counter() if PROFILE_MUON_STEP else 0.0
+                try:
+                    assert muon_ext is not None
+                    muon_ext.grouped_step_family_workspace(
+                        params_bucket,
+                        grads_bucket,
+                        workspace["effective_batch"],
+                        workspace["momentum_batch"],
+                        workspace["norms"],
+                        workspace["ns_input_batch"],
+                        workspace["gram_batch"],
+                        workspace["gram_sq_batch"],
+                        workspace["next_x_batch"],
+                        int(workspace["family_code"]),
+                        float(lr),
+                        float(momentum),
+                        float(weight_decay),
+                        bool(nesterov),
+                        int(current_backend_steps),
+                        1.0e-7,
+                    )
+                    total_stats["cuda_tensor_count"] = int(total_stats["cuda_tensor_count"]) + len(bucket_items)
+                    total_stats["cuda_element_count"] = int(total_stats["cuda_element_count"]) + bucket_element_count
+                    if PROFILE_MUON_STEP:
+                        total_stats["cuda_ms"] = float(total_stats["cuda_ms"]) + (
+                            (time.perf_counter() - bucket_started_at) * 1000.0
+                        )
+                except Exception:
+                    total_stats["cuda_failure_count"] = int(total_stats["cuda_failure_count"]) + 1
+                    fallback_items.extend(bucket_items)
+
+            for p, g, state in fallback_items:
+                total_stats["fallback_tensor_count"] = int(total_stats["fallback_tensor_count"]) + 1
+                total_stats["fallback_element_count"] = int(total_stats["fallback_element_count"]) + int(p.numel())
+                fallback_started_at = time.perf_counter() if PROFILE_MUON_STEP else 0.0
+                _muon_python_step_param(
+                    p,
+                    g,
+                    state,
+                    lr=lr,
+                    momentum=momentum,
+                    weight_decay=weight_decay,
+                    nesterov=nesterov,
+                    backend_steps=current_backend_steps,
+                )
+                if PROFILE_MUON_STEP:
+                    total_stats["fallback_ms"] = float(total_stats["fallback_ms"]) + (
+                        (time.perf_counter() - fallback_started_at) * 1000.0
+                    )
+
+        if PROFILE_MUON_STEP:
+            total_stats["total_ms"] = (time.perf_counter() - step_started_at) * 1000.0
+        self.last_step_stats = total_stats
         return loss
 
 
@@ -3822,18 +9950,14 @@ class DistributedTokenLoader:
         self.bos_token_id = int(bos_token_id)
         self.debug_static_shapes = bool(debug_static_shapes)
         self.stream = TokenStream(pattern, random_offset_tokens=random_offset_tokens, seed=seed + rank)
+        self._prepare_lock = threading.Lock()
         self.last_batch_info: dict[str, object] = {}
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        self._prefetched_batch: dict[str, object] | None = None
-        self._prefetched_kind: str | None = None
-        self._x_host_buffer: Tensor | None = None
-        self._y_host_buffer: Tensor | None = None
-        self._loss_mask_host_buffer: Tensor | None = None
+        self.prefetch_depth = max(int(os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH", "2")), 1)
+        self._prefetched_batches: deque[dict[str, object]] = deque()
         batch_prep_workers = _resolve_loader_worker_count("TOKEN_LOADER_BATCH_PREP_WORKERS")
         self._batch_prep_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=batch_prep_workers)
-        self._prepared_batch_future: Future[dict[str, object]] | None = None
-        self._prepared_kind: str | None = None
-        self._prepared_request: tuple[int, int, int] | None = None
+        self._prepared_batches: deque[tuple[str, tuple[int, int, int], Future[dict[str, object]]]] = deque()
 
     def __del__(self) -> None:
         self._batch_prep_executor.shutdown(wait=False, cancel_futures=True)
@@ -3847,11 +9971,10 @@ class DistributedTokenLoader:
     def load_state_dict(self, state: dict[str, object]) -> None:
         self.stream.load_state_dict(state["stream"])  # type: ignore[arg-type]
         self.last_batch_info = copy.deepcopy(state.get("last_batch_info", {}))
-        self._prefetched_batch = None
-        self._prefetched_kind = None
-        self._prepared_batch_future = None
-        self._prepared_kind = None
-        self._prepared_request = None
+        self._prefetched_batches.clear()
+        for _kind, _request, future in self._prepared_batches:
+            future.cancel()
+        self._prepared_batches.clear()
 
     def _prepare_batch(
         self,
@@ -3860,13 +9983,13 @@ class DistributedTokenLoader:
         grad_accum_steps: int,
         packed: bool,
     ) -> dict[str, object]:
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        per_rank_span = local_tokens + 1
-        local = self.stream.take_distributed(per_rank_span, self.rank, self.world_size).to(dtype=torch.int64)
-        x = local[:-1].reshape(-1, seq_len)
-        y = local[1:].reshape(-1, seq_len)
+        with self._prepare_lock:
+            local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+            per_rank_span = local_tokens + 1
+            local = self.stream.take_distributed(per_rank_span, self.rank, self.world_size).to(dtype=torch.int64)
+            stream_take_info = copy.deepcopy(self.stream.last_take_info)
         batch_info: dict[str, object] = {
-            **self.stream.last_take_info,
+            **stream_take_info,
             "rank": int(self.rank),
             "world_size": int(self.world_size),
             "local_span_start": int(self.rank * per_rank_span),
@@ -3875,28 +9998,30 @@ class DistributedTokenLoader:
             "seq_len": int(seq_len),
             "grad_accum_steps": int(grad_accum_steps),
         }
-        loss_mask = None
         if packed:
             # Keep packed training on compile-stable shapes by using the same fixed
             # grid as the standard loader and masking only cross-document targets.
             # This preserves BOS-delimited document boundaries without creating
             # variable numbers of packed rows from short documents.
-            loss_mask = y != self.bos_token_id
+            valid_mask = local[1:] != self.bos_token_id
             batch_info.update(
                 {
                     "batch_mode": "packed",
-                    "packed_sequences": int(x.size(0)),
+                    "packed_sequences": int(local_tokens // seq_len),
                     "packed_max_seq_len": int(seq_len),
-                    "packed_valid_tokens": int(loss_mask.sum().item()),
-                    "packed_boundary_drop_tokens": int(max(local_tokens - int(loss_mask.sum().item()), 0)),
+                    "packed_valid_tokens": int(valid_mask.sum().item()),
+                    "packed_boundary_drop_tokens": int(max(local_tokens - int(valid_mask.sum().item()), 0)),
                     "packed_fixed_shape": True,
                 }
             )
         if self.debug_static_shapes:
             expected_rows = local_tokens // seq_len
+            x = local[:-1].reshape(-1, seq_len)
+            y = local[1:].reshape(-1, seq_len)
             enforce_static_shape(x, (expected_rows, seq_len), name="packed_x" if packed else "x")
             enforce_static_shape(y, (expected_rows, seq_len), name="packed_y" if packed else "y")
-            if packed and loss_mask is not None:
+            if packed:
+                loss_mask = y != self.bos_token_id
                 enforce_static_shape(loss_mask, (expected_rows, seq_len), name="packed_loss_mask")
                 batch_info["packed_expected_shape"] = [int(expected_rows), int(seq_len)]
                 batch_info["packed_shape_trace"] = {
@@ -3905,64 +10030,76 @@ class DistributedTokenLoader:
                     "loss_mask": list(trace_shape(loss_mask)),
                 }
         return {
-            "x_cpu": x.contiguous(),
-            "y_cpu": y.contiguous(),
-            "loss_mask_cpu": loss_mask.contiguous() if loss_mask is not None else None,
+            "token_span_cpu": local.contiguous(),
+            "seq_len": int(seq_len),
+            "packed": bool(packed),
             "batch_info": batch_info,
         }
 
     def _copy_prepared_batch_to_device(self, prepared: dict[str, object]) -> dict[str, object]:
-        x_cpu = prepared["x_cpu"]
-        y_cpu = prepared["y_cpu"]
-        loss_mask_cpu = prepared["loss_mask_cpu"]
-        assert isinstance(x_cpu, Tensor) and isinstance(y_cpu, Tensor)
-        assert loss_mask_cpu is None or isinstance(loss_mask_cpu, Tensor)
+        token_span_cpu = prepared["token_span_cpu"]
+        seq_len = prepared["seq_len"]
+        packed = prepared["packed"]
+        assert isinstance(token_span_cpu, Tensor)
+        assert isinstance(seq_len, int)
+        assert isinstance(packed, bool)
 
-        if (
-            self._x_host_buffer is None
-            or self._x_host_buffer.shape != x_cpu.shape
-            or self._x_host_buffer.dtype != x_cpu.dtype
-        ):
-            self._x_host_buffer = torch.empty_like(x_cpu, pin_memory=True)
-        if (
-            self._y_host_buffer is None
-            or self._y_host_buffer.shape != y_cpu.shape
-            or self._y_host_buffer.dtype != y_cpu.dtype
-        ):
-            self._y_host_buffer = torch.empty_like(y_cpu, pin_memory=True)
-        x_host = self._x_host_buffer
-        y_host = self._y_host_buffer
-        x_host.copy_(x_cpu)
-        y_host.copy_(y_cpu)
-        loss_mask_host = None
-        if loss_mask_cpu is not None:
-            if (
-                self._loss_mask_host_buffer is None
-                or self._loss_mask_host_buffer.shape != loss_mask_cpu.shape
-                or self._loss_mask_host_buffer.dtype != loss_mask_cpu.dtype
-            ):
-                self._loss_mask_host_buffer = torch.empty_like(loss_mask_cpu, pin_memory=True)
-            loss_mask_host = self._loss_mask_host_buffer
-            loss_mask_host.copy_(loss_mask_cpu)
+        token_span_host = torch.empty_like(token_span_cpu, pin_memory=True)
+        token_span_host.copy_(token_span_cpu)
 
         if self.prefetch_stream is None:
-            x_dev = x_host.to(self.device, non_blocking=False)
-            y_dev = y_host.to(self.device, non_blocking=False)
-            loss_mask_dev = loss_mask_host.to(self.device, non_blocking=False) if loss_mask_host is not None else None
+            token_span_dev = token_span_host.to(self.device, non_blocking=False)
         else:
             with torch.cuda.stream(self.prefetch_stream):
-                x_dev = x_host.to(self.device, non_blocking=True)
-                y_dev = y_host.to(self.device, non_blocking=True)
-                loss_mask_dev = (
-                    loss_mask_host.to(self.device, non_blocking=True) if loss_mask_host is not None else None
-                )
+                token_span_dev = token_span_host.to(self.device, non_blocking=True)
+
+        x_dev = token_span_dev[:-1].view(-1, seq_len)
+        y_dev = token_span_dev[1:].view(-1, seq_len)
+        loss_mask_dev = (y_dev != self.bos_token_id) if packed else None
 
         return {
+            "kind": prepared.get("kind", "standard"),
+            "request": prepared.get("request"),
+            "token_span_host": token_span_host,
+            "token_span": token_span_dev,
             "x": x_dev,
             "y": y_dev,
             "loss_mask": loss_mask_dev,
             "batch_info": prepared["batch_info"],
         }
+
+    def _clear_prefetch_pipeline(self) -> None:
+        self._prefetched_batches.clear()
+        for _kind, _request, future in self._prepared_batches:
+            future.cancel()
+        self._prepared_batches.clear()
+
+    def _prefetch_signature(
+        self,
+        kind: str,
+        global_tokens: int,
+        seq_len: int,
+        grad_accum_steps: int,
+    ) -> tuple[str, tuple[int, int, int]]:
+        return kind, (global_tokens, seq_len, grad_accum_steps)
+
+    def _ensure_prefetch_signature(
+        self,
+        kind: str,
+        global_tokens: int,
+        seq_len: int,
+        grad_accum_steps: int,
+    ) -> None:
+        expected_kind, expected_request = self._prefetch_signature(kind, global_tokens, seq_len, grad_accum_steps)
+        if self._prefetched_batches:
+            front = self._prefetched_batches[0]
+            if front.get("kind") != expected_kind or front.get("request") != expected_request:
+                self._clear_prefetch_pipeline()
+                return
+        if self._prepared_batches:
+            queued_kind, queued_request, _future = self._prepared_batches[0]
+            if queued_kind != expected_kind or queued_request != expected_request:
+                self._clear_prefetch_pipeline()
 
     def _submit_prepared_batch(
         self,
@@ -3972,39 +10109,23 @@ class DistributedTokenLoader:
         grad_accum_steps: int,
     ) -> None:
         request = (global_tokens, seq_len, grad_accum_steps)
-        if (
-            self._prepared_batch_future is not None
-            and self._prepared_kind == kind
-            and self._prepared_request == request
-        ):
-            return
         packed = kind == "packed"
-        self._prepared_batch_future = self._batch_prep_executor.submit(
-            self._prepare_batch, global_tokens, seq_len, grad_accum_steps, packed
-        )
-        self._prepared_kind = kind
-        self._prepared_request = request
+        while len(self._prepared_batches) + len(self._prefetched_batches) < self.prefetch_depth:
+            future = self._batch_prep_executor.submit(
+                self._prepare_batch, global_tokens, seq_len, grad_accum_steps, packed
+            )
+            self._prepared_batches.append((kind, request, future))
 
-    def _materialize_prefetched_batch(
-        self,
-        kind: str,
-        global_tokens: int,
-        seq_len: int,
-        grad_accum_steps: int,
-    ) -> None:
-        request = (global_tokens, seq_len, grad_accum_steps)
-        if (
-            self._prepared_batch_future is None
-            or self._prepared_kind != kind
-            or self._prepared_request != request
-        ):
-            self._submit_prepared_batch(kind, global_tokens, seq_len, grad_accum_steps)
-        prepared = self._prepared_batch_future.result()
-        self._prepared_batch_future = None
-        self._prepared_kind = None
-        self._prepared_request = None
-        self._prefetched_batch = self._copy_prepared_batch_to_device(prepared)
-        self._prefetched_kind = kind
+    def _try_launch_prefetch_copy(self) -> None:
+        while self._prepared_batches and len(self._prefetched_batches) < self.prefetch_depth:
+            kind, request, future = self._prepared_batches[0]
+            if not future.done():
+                break
+            prepared = future.result()
+            prepared["kind"] = kind
+            prepared["request"] = request
+            self._prepared_batches.popleft()
+            self._prefetched_batches.append(self._copy_prepared_batch_to_device(prepared))
 
     def _get_prefetched_batch(
         self,
@@ -4013,21 +10134,27 @@ class DistributedTokenLoader:
         seq_len: int,
         grad_accum_steps: int,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
-        if self._prefetched_batch is None or self._prefetched_kind != kind:
-            self._materialize_prefetched_batch(kind, global_tokens, seq_len, grad_accum_steps)
-        batch = self._prefetched_batch
-        assert batch is not None
-        self._prefetched_batch = None
-        self._prefetched_kind = None
+        self._ensure_prefetch_signature(kind, global_tokens, seq_len, grad_accum_steps)
+        self._submit_prepared_batch(kind, global_tokens, seq_len, grad_accum_steps)
+        self._try_launch_prefetch_copy()
+        if not self._prefetched_batches:
+            queued_kind, request, future = self._prepared_batches.popleft()
+            prepared = future.result()
+            prepared["kind"] = queued_kind
+            prepared["request"] = request
+            self._prefetched_batches.append(self._copy_prepared_batch_to_device(prepared))
+        batch = self._prefetched_batches.popleft()
         if self.prefetch_stream is not None:
             current_stream = torch.cuda.current_stream(self.device)
             current_stream.wait_stream(self.prefetch_stream)
+            batch["token_span"].record_stream(current_stream)
             batch["x"].record_stream(current_stream)
             batch["y"].record_stream(current_stream)
             if batch["loss_mask"] is not None:
                 batch["loss_mask"].record_stream(current_stream)
         self.last_batch_info = batch["batch_info"]  # type: ignore[assignment]
         self._submit_prepared_batch(kind, global_tokens, seq_len, grad_accum_steps)
+        self._try_launch_prefetch_copy()
         return batch["x"], batch["y"], batch["loss_mask"]  # type: ignore[return-value]
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
@@ -4586,7 +10713,7 @@ class CausalStateMixer(nn.Module):
             latent_mode = "off"
         self.latent_mode = latent_mode
         self.uses_structured_transition_params = not (self.latent_mode == "replace" and self.latent_rank > 0)
-        self.filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
+        self.filter_chunk_size = _resolve_structured_scan_chunk_size(train_seq_len, transition_rank)
         self.transition_context_rank = max(8, min(16, hidden_rank))
         self.track_state_ce = bool(track_state_ce)
         self.track_transition_kl = bool(track_transition_kl)
@@ -4601,6 +10728,10 @@ class CausalStateMixer(nn.Module):
         self.latent_gate_in = CastedLinear(hidden_rank, self.latent_rank, bias=True) if self.latent_rank > 0 else None
         self.latent_out = CastedLinear(self.latent_rank, num_states, bias=False) if self.latent_rank > 0 else None
         self.hidden_gate = CastedLinear(hidden_rank, 1, bias=True)
+        self.transition_gate_proj = CastedLinear(hidden_rank, 1, bias=False)
+        self.transition_gate_proj._zero_init = True
+        self.transition_pred_scale_proj = CastedLinear(hidden_rank, 1, bias=False)
+        self.transition_pred_scale_proj._zero_init = True
         self.belief_out = CastedLinear(num_states, dim, bias=False)
         self.output_scale = nn.Parameter(torch.tensor(inverse_softplus_scalar(scale_init), dtype=torch.float32))
         self.output_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
@@ -4645,9 +10776,12 @@ class CausalStateMixer(nn.Module):
         self.future_sketch_head: CastedLinear | None = None
         self.future_sketch_dim = 0
         self.last_aux: dict[str, Tensor | None] = {}
+        self.last_kernel_info: dict[str, object] = {}
         self.fast_path = True
         self._auto_mode_cache: dict[tuple[int, int, int, int, str], str] = {}
         self._packed_transition_cache: dict[str, object] = {}
+        self._sparse_transition_cache: dict[str, object] = {}
+        self._reduced_transition_cache: dict[str, object] = {}
 
     def _uses_latent_additive(self) -> bool:
         return self.latent_mode == "additive" and self.latent_rank > 0
@@ -4792,6 +10926,30 @@ class CausalStateMixer(nn.Module):
         ).to(device=latent_states.device, dtype=out_dtype)
         return gate * self.latent_out(latent_hidden.to(dtype=out_dtype))
 
+    def _latent_replace_token_trust(
+        self,
+        state_hidden: Tensor,
+        *,
+        out_dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        base_gate = _bounded_gate(
+            self.transition_gate,
+            "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
+            "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
+            default_min=0.01,
+            default_max=0.995,
+        ).to(device=state_hidden.device, dtype=out_dtype)
+        token_gate_mult = 2.0 * torch.sigmoid(self.transition_gate_proj(state_hidden).float())
+        token_gate = (base_gate * token_gate_mult.to(device=state_hidden.device, dtype=out_dtype)).clamp_(0.0, 1.0)
+        pred_scale = _bounded_gate(
+            self.transition_pred_scale_proj(state_hidden),
+            "CAUSAL_MACHINE_TRANSITION_PRED_SCALE_MIN",
+            "CAUSAL_MACHINE_TRANSITION_PRED_SCALE_MAX",
+            default_min=0.75,
+            default_max=1.25,
+        ).to(device=state_hidden.device, dtype=out_dtype)
+        return token_gate, pred_scale
+
     def _compute_latent_logits_sequence(self, state_hidden: Tensor) -> Tensor | None:
         latent_scan = self._compute_latent_sequence_states(state_hidden, prior_only=False)
         if latent_scan is None:
@@ -4831,8 +10989,7 @@ class CausalStateMixer(nn.Module):
 
     def _latent_only_step_beliefs(self, local_logits: Tensor, cache: CausalMachineCache) -> Tensor:
         next_log_belief = F.log_softmax(local_logits[:, 0, :].float(), dim=-1)
-        cache.log_belief = next_log_belief.detach().to(dtype=local_logits.dtype)
-        cache.num_updates += 1
+        cache.record_step(next_log_belief.to(dtype=local_logits.dtype))
         return next_log_belief.to(dtype=local_logits.dtype).unsqueeze(1)
 
     def _latent_replace_sequence_beliefs(
@@ -4848,21 +11005,38 @@ class CausalStateMixer(nn.Module):
         prior_logits = self._decode_latent_state_logits(latent_prior_states, out_dtype=local_logits.dtype)
         if prior_logits is None:
             return self._latent_only_sequence_beliefs(local_logits)
-        transition_gate = _bounded_gate(
-            self.transition_gate,
-            "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
-            "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
-            default_min=0.10,
-            default_max=0.995,
-        ).to(device=local_logits.device, dtype=local_logits.dtype)
-        prior_with_context = prior_logits + transition_context.to(dtype=local_logits.dtype)
-        prior_log_beliefs = (
-            F.log_softmax(prior_with_context.float(), dim=-1).to(dtype=local_logits.dtype)
-            if self.track_transition_kl
-            else None
+        transition_gate, pred_scale = self._latent_replace_token_trust(
+            state_hidden,
+            out_dtype=local_logits.dtype,
         )
-        filtered_logits = local_logits + transition_gate * prior_with_context
-        state_log_beliefs = F.log_softmax(filtered_logits.float(), dim=-1).to(dtype=local_logits.dtype)
+        transition_context = transition_context.to(dtype=local_logits.dtype)
+        use_cuda_latent_replace = bool(
+            USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and local_logits.is_cuda
+            and prior_logits.is_cuda
+            and transition_context.is_cuda
+            and transition_gate.is_cuda
+            and pred_scale.is_cuda
+        )
+        if use_cuda_latent_replace:
+            state_log_beliefs, prior_log_beliefs_full = causal_machine_latent_replace_cuda(
+                local_logits,
+                prior_logits,
+                transition_context,
+                transition_gate,
+                pred_scale,
+            )
+            prior_log_beliefs = prior_log_beliefs_full if self.track_transition_kl else None
+        else:
+            prior_with_context = prior_logits + transition_context
+            prior_with_context = prior_with_context / pred_scale.clamp_min(1.0e-4)
+            prior_log_beliefs = (
+                F.log_softmax(prior_with_context.float(), dim=-1).to(dtype=local_logits.dtype)
+                if self.track_transition_kl
+                else None
+            )
+            filtered_logits = local_logits + transition_gate * prior_with_context
+            state_log_beliefs = F.log_softmax(filtered_logits.float(), dim=-1).to(dtype=local_logits.dtype)
         return state_log_beliefs, final_latent_state.float(), prior_log_beliefs
 
     def _latent_replace_step_beliefs(
@@ -4879,27 +11053,39 @@ class CausalStateMixer(nn.Module):
         prior_logits = self._decode_latent_state_logits(prior_state.unsqueeze(1), out_dtype=local_logits.dtype)
         if prior_logits is None:
             return self._latent_only_step_beliefs(local_logits, cache), None
-        transition_gate = _bounded_gate(
-            self.transition_gate,
-            "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
-            "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
-            default_min=0.10,
-            default_max=0.995,
-        ).to(device=local_logits.device, dtype=local_logits.dtype)
-        effective_context, effective_gate = _prepare_structured_filter_inputs(
-            transition_context.to(dtype=local_logits.dtype),
-            transition_gate,
+        transition_gate, pred_scale = self._latent_replace_token_trust(
+            state_hidden,
+            out_dtype=local_logits.dtype,
         )
-        prior_with_context = prior_logits + effective_context
-        prior_log_beliefs = (
-            F.log_softmax(prior_with_context[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
-            if self.track_transition_kl
-            else None
+        transition_context = transition_context.to(dtype=local_logits.dtype)
+        use_cuda_latent_replace = bool(
+            USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and local_logits.is_cuda
+            and prior_logits.is_cuda
+            and transition_context.is_cuda
+            and transition_gate.is_cuda
+            and pred_scale.is_cuda
         )
-        filtered_logits = local_logits + effective_gate.to(dtype=local_logits.dtype) * prior_with_context
-        state_log_beliefs = F.log_softmax(filtered_logits[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
-        cache.log_belief = state_log_beliefs[:, 0, :].detach()
-        cache.num_updates += 1
+        if use_cuda_latent_replace:
+            state_log_beliefs, prior_log_beliefs_full = causal_machine_latent_replace_cuda(
+                local_logits,
+                prior_logits,
+                transition_context,
+                transition_gate,
+                pred_scale,
+            )
+            prior_log_beliefs = prior_log_beliefs_full if self.track_transition_kl else None
+        else:
+            prior_with_context = prior_logits + transition_context
+            prior_with_context = prior_with_context / pred_scale.clamp_min(1.0e-4)
+            prior_log_beliefs = (
+                F.log_softmax(prior_with_context[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
+                if self.track_transition_kl
+                else None
+            )
+            filtered_logits = local_logits + transition_gate * prior_with_context
+            state_log_beliefs = F.log_softmax(filtered_logits[:, 0, :].float(), dim=-1).to(dtype=local_logits.dtype).unsqueeze(1)
+        cache.record_step(state_log_beliefs[:, 0, :])
         return state_log_beliefs, prior_log_beliefs
 
     def _structured_transition_params(self) -> tuple[Tensor, Tensor, Tensor]:
@@ -4908,7 +11094,7 @@ class CausalStateMixer(nn.Module):
         transition_stay_probs = torch.sigmoid(self.transition_stay_logits.float())
         return transition_source_probs, transition_dest_probs, transition_stay_probs
 
-    def _get_packed_transition_tables(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    def _get_packed_transition_tables(self, device: torch.device) -> tuple[int, Tensor, Tensor, Tensor, Tensor] | None:
         return get_or_update_scan_transition_prepack(
             self._packed_transition_cache,
             self.transition_source_logits,
@@ -4916,33 +11102,186 @@ class CausalStateMixer(nn.Module):
             device,
         )
 
+    def _get_sparse_transition_tables(
+        self,
+        device: torch.device,
+        runtime_config: StructuredScanRuntimeConfig | None,
+        packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+    ) -> StructuredSparseTransitionTables | None:
+        if _structured_filter_mode() == "composable":
+            return None
+        return get_or_update_scan_transition_sparse_blocks(
+            self._sparse_transition_cache,
+            self.transition_source_logits,
+            self.transition_dest_logits,
+            device,
+            runtime_config,
+            packed_transition_tables,
+        )
+
+    def _get_reduced_transition_cache(
+        self,
+        device: torch.device,
+        runtime_config: StructuredScanRuntimeConfig | None,
+        *,
+        tile_size: int,
+        split_size: int,
+    ) -> StructuredReducedTransitionCache | None:
+        return get_or_update_structured_reduced_transition_cache(
+            self._reduced_transition_cache,
+            self.transition_source_logits,
+            self.transition_dest_logits,
+            device,
+            runtime_config,
+            num_states=self.num_states,
+            tile_size=int(tile_size),
+            split_size=int(split_size),
+        )
+
     def _filter_sequence(
         self,
         local_logits: Tensor,
         transition_context: Tensor,
         initial_log_belief: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        runtime_config: StructuredScanRuntimeConfig | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         transition_stay_probs = torch.sigmoid(self.transition_stay_logits.float())
         transition_gate = _bounded_gate(
             self.transition_gate,
             "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
-            default_min=0.10,
+            default_min=0.01,
             default_max=0.995,
         )
         transition_context, transition_gate = _prepare_structured_filter_inputs(
             transition_context,
             transition_gate,
         )
-        packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
-        use_cuda_scan = (
-            USE_CAUSAL_MACHINE_CUDA_SCAN
-            and local_logits.is_cuda
-            and local_logits.size(-1) == 128
-            and self.transition_rank <= 128
-            and _can_use_causal_machine_scan_cuda(local_logits.device, self.transition_rank)
+        transition_context, transition_gate = _apply_native_structured_score_mod_inputs(
+            transition_context,
+            transition_gate,
+            runtime_config,
         )
-        if use_cuda_scan:
+        tiled_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
+        kernel_config = autotune_structured_scan_kernel_config(
+            num_states=self.num_states,
+            transition_rank=self.transition_rank,
+            seq_len=int(local_logits.size(1)),
+            device=local_logits.device,
+            default_chunk_size=self.filter_chunk_size,
+            needs_grad=tiled_needs_grad,
+            runtime_config=runtime_config,
+        )
+        if runtime_config is not None:
+            runtime_config.reduced_transition_cache = self._get_reduced_transition_cache(
+                local_logits.device,
+                runtime_config,
+                tile_size=int(kernel_config.tile_size),
+                split_size=int(kernel_config.split_size),
+            )
+        sparse_transition_tables = (
+            self._get_sparse_transition_tables(
+                local_logits.device,
+                runtime_config,
+                packed_transition_tables,
+            )
+            if (
+                USE_CAUSAL_MACHINE_CUDA_SCAN
+                and _structured_runtime_supports_sparse_cuda(runtime_config)
+            )
+            else None
+        )
+        sparse_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        sparse_runtime_result = _execute_structured_sparse_runtime_cuda(
+            local_logits,
+            self.transition_source_logits,
+            self.transition_dest_logits,
+            transition_context,
+            initial_log_belief.to(dtype=local_logits.dtype),
+            transition_gate.reshape(()),
+            transition_stay_probs,
+            sparse_transition_tables,
+            runtime_config=runtime_config,
+            chunk_size=int(kernel_config.chunk_size),
+            needs_grad=sparse_needs_grad,
+        )
+        if sparse_runtime_result is not None:
+            state_log_beliefs, final_log_belief = sparse_runtime_result
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path="cuda_sparse",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            _enforce_structured_scan_cuda_contract(self.last_kernel_info, context="state mixer structured scan")
+            return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, None
+        masked_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        use_masked_cuda = (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _structured_runtime_supports_masked_cuda(runtime_config)
+            and _can_use_causal_machine_masked_scan_cuda(
+                local_logits.device,
+                num_states=self.num_states,
+                transition_rank=self.transition_rank,
+                needs_grad=masked_needs_grad,
+                runtime_config=runtime_config,
+            )
+        )
+        if use_masked_cuda:
+            state_log_beliefs, final_log_belief = causal_machine_scan_masked_cuda(
+                local_logits,
+                self.transition_source_logits,
+                self.transition_dest_logits,
+                transition_context,
+                initial_log_belief.to(dtype=local_logits.dtype),
+                transition_gate.reshape(()),
+                transition_stay_probs,
+                runtime_config=runtime_config,
+                chunk_size=int(kernel_config.chunk_size),
+            )
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path="cuda_masked",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            _enforce_structured_scan_cuda_contract(self.last_kernel_info, context="state mixer structured scan")
+            return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, None
+        if USE_CAUSAL_MACHINE_CUDA_SCAN and kernel_config.backend == "cuda":
             state_log_beliefs, final_log_belief = causal_machine_scan_cuda(
                 local_logits,
                 self.transition_source_logits,
@@ -4952,43 +11291,62 @@ class CausalStateMixer(nn.Module):
                 transition_gate.reshape(()),
                 transition_stay_probs,
                 packed_transition_tables=packed_transition_tables,
-                chunk_size=int(self.filter_chunk_size),
+                chunk_size=int(kernel_config.chunk_size),
+                runtime_config=runtime_config,
             )
             # Keep the CUDA-scan competition path to a single fused recurrent pass.
             # Transition-KL priors are not reconstructed in Python here because that
             # would add a second token-by-token recurrence for every SSM block.
             prior_log_beliefs = None
+            dense_path = (
+                "cuda_dense_lowp_tensor_core"
+                if _structured_scan_uses_lowp_tensor_core_path(
+                    device=local_logits.device,
+                    dtype=local_logits.dtype,
+                    kernel_config=kernel_config,
+                    packed_transition_tables=packed_transition_tables,
+                )
+                else "cuda_dense"
+            )
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path=dense_path,
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            _enforce_structured_scan_cuda_contract(self.last_kernel_info, context="state mixer structured scan")
             return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, prior_log_beliefs
         transition_source_probs, transition_dest_probs, _ = self._structured_transition_params()
-        belief_steps: list[Tensor] = []
-        prior_steps: list[Tensor] = []
-        prev_log_belief = initial_log_belief.float()
-        seq_len = int(local_logits.size(1))
-        chunk_size = max(int(self.filter_chunk_size), 1)
-        for chunk_start in range(0, seq_len, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, seq_len)
-            for t in range(chunk_start, chunk_end):
-                pred_log_belief = structured_transition_predict_log_belief(
-                    prev_log_belief,
-                    transition_source_probs,
-                    transition_dest_probs,
-                    transition_stay_probs,
-                )
-                if self.track_transition_kl:
-                    prior_steps.append((pred_log_belief + transition_context[:, t, :].float()).to(dtype=local_logits.dtype))
-                filtered_logits = local_logits[:, t, :].float() + transition_gate * (
-                    pred_log_belief + transition_context[:, t, :].float()
-                )
-                prev_log_belief = F.log_softmax(filtered_logits, dim=-1)
-                belief_steps.append(prev_log_belief.to(dtype=local_logits.dtype))
-        prior_log_beliefs = torch.stack(prior_steps, dim=1) if prior_steps else None
-        return torch.stack(belief_steps, dim=1), prev_log_belief, prior_log_beliefs
+        self.last_kernel_info = _structured_scan_kernel_info(
+            path=f"fallback_{kernel_config.backend}",
+            kernel_config=kernel_config,
+            runtime_config=runtime_config,
+            packed_transition_tables=packed_transition_tables,
+        )
+        _enforce_structured_scan_cuda_contract(self.last_kernel_info, context="state mixer structured scan")
+        return structured_scan_fallback(
+            local_logits,
+            transition_context,
+            initial_log_belief,
+            transition_source_probs,
+            transition_dest_probs,
+            transition_stay_probs,
+            transition_gate,
+            chunk_size=int(kernel_config.chunk_size),
+            tile_size=int(kernel_config.tile_size),
+            split_size=int(kernel_config.split_size),
+            backend=str(kernel_config.backend),
+            track_transition_kl=self.track_transition_kl and _structured_scan_save_all(runtime_config),
+            runtime_config=runtime_config,
+            packed_transition_tables=packed_transition_tables,
+        )
 
     def _filter_step(
         self,
         local_logits: Tensor,
         transition_context: Tensor,
         cache: CausalMachineCache,
+        runtime_config: StructuredScanRuntimeConfig | None = None,
     ) -> Tensor:
         batch_size = int(local_logits.size(0))
         prev_log_belief = (
@@ -4996,31 +11354,312 @@ class CausalStateMixer(nn.Module):
             if cache.log_belief is not None
             else self._initial_log_belief(batch_size, local_logits.device, torch.float32)
         )
-        transition_source_probs, transition_dest_probs, transition_stay_probs = self._structured_transition_params()
         transition_gate = _bounded_gate(
             self.transition_gate,
             "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
-            default_min=0.10,
+            default_min=0.01,
             default_max=0.995,
         )
         transition_context, transition_gate = _prepare_structured_filter_inputs(
             transition_context,
             transition_gate,
         )
-        pred_log_belief = structured_transition_predict_log_belief(
+        transition_context, transition_gate = _apply_native_structured_score_mod_inputs(
+            transition_context,
+            transition_gate,
+            runtime_config,
+        )
+        tiled_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or prev_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or self.transition_stay_logits.requires_grad
+            )
+        )
+        packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
+        kernel_config = autotune_structured_scan_kernel_config(
+            num_states=self.num_states,
+            transition_rank=self.transition_rank,
+            seq_len=1,
+            device=local_logits.device,
+            default_chunk_size=1,
+            needs_grad=tiled_needs_grad,
+            runtime_config=runtime_config,
+        )
+        transition_stay_probs = torch.sigmoid(self.transition_stay_logits.float())
+        sparse_transition_tables = (
+            self._get_sparse_transition_tables(
+                local_logits.device,
+                runtime_config,
+                packed_transition_tables,
+            )
+            if (
+                USE_CAUSAL_MACHINE_CUDA_SCAN
+                and _structured_runtime_supports_sparse_cuda(runtime_config)
+            )
+            else None
+        )
+        sparse_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or prev_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        sparse_runtime_result = _execute_structured_sparse_runtime_cuda(
+            local_logits,
+            self.transition_source_logits,
+            self.transition_dest_logits,
+            transition_context,
+            prev_log_belief.to(dtype=local_logits.dtype),
+            transition_gate.reshape(()),
+            transition_stay_probs,
+            sparse_transition_tables,
+            runtime_config=runtime_config,
+            chunk_size=1,
+            needs_grad=sparse_needs_grad,
+        )
+        if sparse_runtime_result is not None:
+            state_log_beliefs, _final_log_belief = sparse_runtime_result
+            cache.record_step(state_log_beliefs[:, 0, :])
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path="cuda_sparse",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            return state_log_beliefs
+        masked_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.transition_source_logits.requires_grad
+                or self.transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or prev_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        use_masked_cuda = (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _structured_runtime_supports_masked_cuda(runtime_config)
+            and _can_use_causal_machine_masked_scan_cuda(
+                local_logits.device,
+                num_states=self.num_states,
+                transition_rank=self.transition_rank,
+                needs_grad=masked_needs_grad,
+                runtime_config=runtime_config,
+            )
+        )
+        can_use_fused_paged_step = (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and kernel_config.backend in {"cuda", "cuda_tiled"}
+            and self.latent_rank == 0
+            and _structured_runtime_supports_fused_paged_step(runtime_config)
+            and cache.paged_log_beliefs is not None
+            and cache.paged_lengths is not None
+            and local_logits.is_cuda
+            and int(local_logits.size(1)) == 1
+            and not torch.is_grad_enabled()
+            and not use_masked_cuda
+        )
+        if sparse_runtime_result is None and can_use_fused_paged_step:
+            graph_used = False
+            if _structured_runtime_supports_step_cuda_graph(runtime_config):
+                packed_kind = -1 if packed_transition_tables is None else int(packed_transition_tables[0])
+                packed_source_ptr = 0 if packed_transition_tables is None else int(packed_transition_tables[1].data_ptr())
+                packed_dest_ptr = 0 if packed_transition_tables is None else int(packed_transition_tables[3].data_ptr())
+                graph_signature = (
+                    int(id(self)),
+                    tuple(int(dim) for dim in local_logits.shape),
+                    str(local_logits.dtype),
+                    int(kernel_config.num_states),
+                    int(kernel_config.transition_rank),
+                    str(kernel_config.backend),
+                    int(kernel_config.tile_size),
+                    int(kernel_config.split_size),
+                    int(packed_kind),
+                    int(cache.paged_log_beliefs.data_ptr()),
+                    int(cache.paged_lengths.data_ptr()),
+                    int(packed_source_ptr),
+                    int(packed_dest_ptr),
+                )
+                runner = cache.step_graph_runner if isinstance(cache.step_graph_runner, dict) else None
+                if runner is None or runner.get("signature") != graph_signature:
+                    try:
+                        static_local_logits = torch.empty_like(local_logits)
+                        static_transition_context = torch.empty_like(transition_context)
+                        static_local_logits.copy_(local_logits, non_blocking=True)
+                        static_transition_context.copy_(transition_context, non_blocking=True)
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            static_state_log_beliefs, static_final_log_belief, path = _structured_fused_paged_step_cuda(
+                                local_logits=static_local_logits,
+                                transition_source_logits=self.transition_source_logits,
+                                transition_dest_logits=self.transition_dest_logits,
+                                transition_context=static_transition_context,
+                                transition_gate=transition_gate.reshape(()),
+                                transition_stay_probs=transition_stay_probs,
+                                cache=cache,
+                                kernel_config=kernel_config,
+                                runtime_config=runtime_config,
+                                packed_transition_tables=packed_transition_tables,
+                            )
+                        runner = {
+                            "signature": graph_signature,
+                            "graph": graph,
+                            "static_local_logits": static_local_logits,
+                            "static_transition_context": static_transition_context,
+                            "static_state_log_beliefs": static_state_log_beliefs,
+                            "static_final_log_belief": static_final_log_belief,
+                            "path": path,
+                        }
+                        cache.step_graph_runner = runner
+                        graph_used = True
+                    except Exception:
+                        cache.step_graph_runner = None
+                        runner = None
+                else:
+                    static_local_logits = runner["static_local_logits"]
+                    static_transition_context = runner["static_transition_context"]
+                    static_local_logits.copy_(local_logits, non_blocking=True)
+                    static_transition_context.copy_(transition_context, non_blocking=True)
+                    runner["graph"].replay()
+                    graph_used = True
+                if runner is not None and graph_used:
+                    state_log_beliefs = runner["static_state_log_beliefs"]
+                    final_log_belief = runner["static_final_log_belief"]
+                    path = str(runner["path"])
+                    _update_cache_after_fused_paged_step(cache, final_log_belief)
+                    if runtime_config is not None and runtime_config.grouped_launch_pack is not None:
+                        runtime_config.grouped_launch_pack.record_paged_cache_op()
+                        runtime_config.grouped_launch_pack.record_small_decode_update()
+                    self.last_kernel_info = _structured_scan_kernel_info(
+                        path=path,
+                        kernel_config=kernel_config,
+                        runtime_config=runtime_config,
+                        packed_transition_tables=packed_transition_tables,
+                        cache=cache,
+                    )
+                    self.last_kernel_info["graph_replay"] = True
+                    return state_log_beliefs
+            state_log_beliefs, final_log_belief, path = _structured_fused_paged_step_cuda(
+                local_logits=local_logits,
+                transition_source_logits=self.transition_source_logits,
+                transition_dest_logits=self.transition_dest_logits,
+                transition_context=transition_context,
+                transition_gate=transition_gate.reshape(()),
+                transition_stay_probs=transition_stay_probs,
+                cache=cache,
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            _update_cache_after_fused_paged_step(cache, final_log_belief)
+            if runtime_config is not None and runtime_config.grouped_launch_pack is not None:
+                runtime_config.grouped_launch_pack.record_paged_cache_op()
+                runtime_config.grouped_launch_pack.record_small_decode_update()
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path=path,
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            return state_log_beliefs
+        if use_masked_cuda:
+            state_log_beliefs, _final_log_belief = causal_machine_scan_masked_cuda(
+                local_logits,
+                self.transition_source_logits,
+                self.transition_dest_logits,
+                transition_context,
+                prev_log_belief.to(dtype=local_logits.dtype),
+                transition_gate.reshape(()),
+                transition_stay_probs,
+                runtime_config=runtime_config,
+                chunk_size=1,
+            )
+            cache.record_step(state_log_beliefs[:, 0, :])
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path="cuda_masked",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            return state_log_beliefs
+        packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
+        if USE_CAUSAL_MACHINE_CUDA_SCAN and kernel_config.backend == "cuda":
+            state_log_beliefs, _final_log_belief = causal_machine_scan_cuda(
+                local_logits,
+                self.transition_source_logits,
+                self.transition_dest_logits,
+                transition_context,
+                prev_log_belief.to(dtype=local_logits.dtype),
+                transition_gate.reshape(()),
+                torch.sigmoid(self.transition_stay_logits.float()),
+                packed_transition_tables=packed_transition_tables,
+                chunk_size=1,
+                runtime_config=runtime_config,
+            )
+            cache.record_step(state_log_beliefs[:, 0, :])
+            dense_path = (
+                "cuda_dense_lowp_tensor_core"
+                if _structured_scan_uses_lowp_tensor_core_path(
+                    device=local_logits.device,
+                    dtype=local_logits.dtype,
+                    kernel_config=kernel_config,
+                    packed_transition_tables=packed_transition_tables,
+                )
+                else "cuda_dense"
+            )
+            self.last_kernel_info = _structured_scan_kernel_info(
+                path=dense_path,
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            return state_log_beliefs
+        transition_source_probs, transition_dest_probs, transition_stay_probs = self._structured_transition_params()
+        state_log_beliefs, _final_log_belief, _ = structured_scan_fallback(
+            local_logits,
+            transition_context,
             prev_log_belief,
             transition_source_probs,
             transition_dest_probs,
             transition_stay_probs,
+            transition_gate,
+            chunk_size=1,
+            tile_size=int(kernel_config.tile_size),
+            split_size=int(kernel_config.split_size),
+            backend=str(kernel_config.backend),
+            track_transition_kl=False,
+            runtime_config=runtime_config,
+            packed_transition_tables=packed_transition_tables,
         )
-        filtered_logits = local_logits[:, 0, :].float() + transition_gate * (
-            pred_log_belief + transition_context[:, 0, :].float()
+        cache.record_step(state_log_beliefs[:, 0, :])
+        self.last_kernel_info = _structured_scan_kernel_info(
+            path=f"fallback_{kernel_config.backend}",
+            kernel_config=kernel_config,
+            runtime_config=runtime_config,
+            packed_transition_tables=packed_transition_tables,
+            cache=cache,
         )
-        next_log_belief = F.log_softmax(filtered_logits, dim=-1)
-        cache.log_belief = next_log_belief.detach().to(dtype=local_logits.dtype)
-        cache.num_updates += 1
-        return next_log_belief.to(dtype=local_logits.dtype).unsqueeze(1)
+        return state_log_beliefs
 
     def _decode(self, state_hidden: Tensor, state_log_beliefs: Tensor) -> Tensor:
         scale = F.softplus(self.output_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
@@ -5030,23 +11669,34 @@ class CausalStateMixer(nn.Module):
         emit_scale = F.softplus(self.emit_delta_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
         return scale * gate * belief_features * (1.0 + emit_scale * hidden_gate)
 
-    def forward_simple(self, x: Tensor) -> Tensor:
+    def forward_simple(self, x: Tensor, runtime_config: StructuredScanRuntimeConfig | None = None) -> Tensor:
         batch_size = int(x.size(0))
         state_hidden, local_logits, transition_context = self._project_hidden(x)
         latent_mode = self._resolved_latent_mode(int(x.size(1)), x.device)
+        self.last_kernel_info = {}
         if latent_mode == "replace":
             state_log_beliefs, _, prior_log_beliefs = self._latent_replace_sequence_beliefs(
                 local_logits,
                 transition_context,
                 state_hidden,
             )
+            self.last_kernel_info = {
+                "path": "latent_replace",
+                "backend": "cuda" if bool(USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and x.is_cuda and self.latent_rank > 0) else "python",
+                "uses_paged_cache": False,
+            }
         else:
             if latent_mode == "additive":
                 latent_logits = self._compute_latent_logits_sequence(state_hidden)
                 if latent_logits is not None:
                     local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
             initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
-            state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(local_logits, transition_context, initial_log_belief)
+            state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(
+                local_logits,
+                transition_context,
+                initial_log_belief,
+                runtime_config=runtime_config,
+            )
         future_sketch_pred = (
             self.future_sketch_head(state_hidden)
             if self.track_future_sketch and self.future_sketch_head is not None
@@ -5061,11 +11711,48 @@ class CausalStateMixer(nn.Module):
         }
         return self._decode(state_hidden, state_log_beliefs)
 
-    def forward_step(self, x: Tensor, cache: CausalMachineCache) -> Tensor:
+    def forward_step(
+        self,
+        x: Tensor,
+        cache: CausalMachineCache,
+        runtime_config: StructuredScanRuntimeConfig | None = None,
+    ) -> Tensor:
         if x.size(1) != 1:
             raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
         state_hidden, local_logits, transition_context = self._project_hidden(x)
         latent_mode = self._resolved_latent_mode(1, x.device)
+        self.last_kernel_info = {}
+        if runtime_config is not None and runtime_config.use_paged_cache and cache.paged_log_beliefs is None:
+            runtime_config = _resolve_structured_scan_runtime_config(
+                runtime_config,
+                device=x.device,
+                dtype=x.dtype,
+                backend_family="decode_paged_cache",
+                batch_size=int(x.size(0)),
+                seq_len=1,
+                num_states=self.num_states,
+            )
+            cache.enable_paged_history(
+                batch_size=int(x.size(0)),
+                num_states=self.num_states,
+                device=x.device,
+                dtype=x.dtype,
+                latent_rank=self.latent_rank,
+                page_size=runtime_config.page_size,
+                max_pages=runtime_config.max_pages,
+                workspace=runtime_config.workspace,
+                grouped_launch_pack=runtime_config.grouped_launch_pack,
+                save_mode=runtime_config.save_mode,
+                paged_layout=runtime_config.paged_layout,
+            )
+        if (
+            runtime_config is not None
+            and runtime_config.use_paged_cache
+            and cache.log_belief is None
+            and cache.paged_log_beliefs is not None
+            and not _structured_runtime_supports_fused_paged_step(runtime_config)
+        ):
+            cache.restore_latest_from_paged()
         if latent_mode == "replace":
             state_log_beliefs, _prior_log_beliefs = self._latent_replace_step_beliefs(
                 local_logits,
@@ -5073,13 +11760,27 @@ class CausalStateMixer(nn.Module):
                 state_hidden,
                 cache,
             )
+            self.last_kernel_info = {
+                "path": "latent_replace",
+                "backend": "cuda" if bool(USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and x.is_cuda and self.latent_rank > 0) else "python",
+                "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
+                "paged_cache_write_backend": str(cache.last_paged_write_backend),
+            }
         else:
             if latent_mode == "additive":
                 latent_logits = self._compute_latent_logits_step(state_hidden, cache)
                 if latent_logits is not None:
                     local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
-            state_log_beliefs = self._filter_step(local_logits, transition_context, cache)
-        return self._decode(state_hidden, state_log_beliefs)
+            state_log_beliefs = self._filter_step(
+                local_logits,
+                transition_context,
+                cache,
+                runtime_config=runtime_config,
+            )
+        decoded = self._decode(state_hidden, state_log_beliefs)
+        if runtime_config is not None and runtime_config.use_paged_cache and runtime_config.paged_resident_only:
+            cache.drop_resident_state()
+        return decoded
 
 
 class StateSpaceBlock(nn.Module):
@@ -5312,7 +12013,7 @@ class GPT(nn.Module):
             self.causal_machine_latent_mode = "off"
         self.causal_machine_replace_uses_structured = _env_enabled(
             "CAUSAL_MACHINE_GLOBAL_REPLACE_STRUCTURED",
-            default=False,
+            default=_competition_mode_enabled(),
         )
         self.causal_machine_uses_structured_transition_params = (
             self.causal_machine_num_states > 0
@@ -5334,9 +12035,14 @@ class GPT(nn.Module):
         self.causal_machine_transition_stickiness_init = float(causal_machine_transition_stickiness_init)
         self.causal_machine_emit_delta_scale_init = max(float(causal_machine_emit_delta_scale_init), 0.0)
         self.causal_machine_online_teacher_ema = float(DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA)
-        self.causal_machine_filter_chunk_size = max(16, min(128, max(int(train_seq_len), 16) // 8))
+        self.causal_machine_filter_chunk_size = _resolve_structured_scan_chunk_size(
+            train_seq_len,
+            self.causal_machine_transition_rank,
+        )
         self._global_causal_auto_mode_cache: dict[tuple[int, int, int, int, str], str] = {}
         self._global_packed_transition_cache: dict[str, object] = {}
+        self._global_sparse_transition_cache: dict[str, object] = {}
+        self._global_reduced_transition_cache: dict[str, object] = {}
         self.shared_tail_output_gate = bool(shared_tail_output_gate)
         self.shared_tail_output_init = float(shared_tail_output_init)
         self.shared_tail_enable_step = max(int(shared_tail_enable_step), 0)
@@ -5496,7 +12202,12 @@ class GPT(nn.Module):
             else None
         )
         self.use_causal_machine_cuda_scan = bool(
-            USE_CAUSAL_MACHINE_CUDA_SCAN and causal_machine_enabled and self.causal_machine_num_states == 128
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and causal_machine_enabled
+            and supports_structured_scan_cuda_config(
+                self.causal_machine_num_states,
+                self.causal_machine_transition_rank,
+            )
         )
         if causal_machine_enabled:
             causal_machine_log_probs = torch.full(
@@ -5566,6 +12277,7 @@ class GPT(nn.Module):
         self.register_buffer("causal_machine_online_state_counts", online_state_counts, persistent=False)
         self.register_buffer("causal_machine_online_teacher_ready", torch.zeros((), dtype=torch.bool), persistent=False)
         self.causal_machine_profile_loaded = False
+        self.last_causal_machine_kernel_info: dict[str, object] = {}
         needs_default_online_sketch = (
             self.causal_machine_num_states > 0
             and self.vocab_size > 0
@@ -5782,9 +12494,20 @@ class GPT(nn.Module):
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
+        runtime_config: StructuredScanRuntimeConfig | None = None,
     ) -> CausalMachineCache:
         if self.causal_machine_num_states <= 0:
             return CausalMachineCache(log_belief=None, num_updates=0)
+        if runtime_config is not None:
+            runtime_config = _resolve_structured_scan_runtime_config(
+                runtime_config,
+                device=device,
+                dtype=dtype,
+                backend_family="paged_cache",
+                batch_size=batch_size,
+                seq_len=1,
+                num_states=self.causal_machine_num_states,
+            )
         if self.causal_machine_log_state_priors.numel() == self.causal_machine_num_states:
             log_belief = self.causal_machine_log_state_priors.to(device=device, dtype=dtype).unsqueeze(0).expand(
                 batch_size, -1
@@ -5796,7 +12519,22 @@ class GPT(nn.Module):
                 device=device,
                 dtype=dtype,
             )
-        return CausalMachineCache(log_belief=log_belief.clone(), num_updates=0)
+        cache = CausalMachineCache(log_belief=log_belief.clone(), num_updates=0)
+        if runtime_config is not None and runtime_config.use_paged_cache:
+            cache.enable_paged_history(
+                batch_size=batch_size,
+                num_states=self.causal_machine_num_states,
+                device=device,
+                dtype=dtype,
+                latent_rank=self.causal_machine_latent_rank,
+                page_size=runtime_config.page_size,
+                max_pages=runtime_config.max_pages,
+                workspace=runtime_config.workspace,
+                grouped_launch_pack=runtime_config.grouped_launch_pack,
+                save_mode=runtime_config.save_mode,
+                paged_layout=runtime_config.paged_layout,
+            )
+        return cache
 
     def _compute_causal_machine_emit_log_probs(self, device: torch.device, dtype: torch.dtype) -> Tensor:
         emit_logits = self.causal_machine_log_probs.to(device=device, dtype=torch.float32)
@@ -5945,7 +12683,7 @@ class GPT(nn.Module):
         transition_stay_probs = torch.sigmoid(self.causal_machine_transition_stay_logits.float())
         return transition_source_probs, transition_dest_probs, transition_stay_probs
 
-    def _get_global_packed_transition_tables(self, device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    def _get_global_packed_transition_tables(self, device: torch.device) -> tuple[int, Tensor, Tensor, Tensor, Tensor] | None:
         if (
             self.causal_machine_transition_source_logits is None
             or self.causal_machine_transition_dest_logits is None
@@ -5958,12 +12696,60 @@ class GPT(nn.Module):
             device,
         )
 
+    def _get_global_sparse_transition_tables(
+        self,
+        device: torch.device,
+        runtime_config: StructuredScanRuntimeConfig | None,
+        packed_transition_tables: tuple[int, Tensor, Tensor, Tensor, Tensor] | None = None,
+    ) -> StructuredSparseTransitionTables | None:
+        if _structured_filter_mode() == "composable":
+            return None
+        if (
+            self.causal_machine_transition_source_logits is None
+            or self.causal_machine_transition_dest_logits is None
+        ):
+            return None
+        return get_or_update_scan_transition_sparse_blocks(
+            self._global_sparse_transition_cache,
+            self.causal_machine_transition_source_logits,
+            self.causal_machine_transition_dest_logits,
+            device,
+            runtime_config,
+            packed_transition_tables,
+        )
+
+    def _get_global_reduced_transition_cache(
+        self,
+        device: torch.device,
+        runtime_config: StructuredScanRuntimeConfig | None,
+        *,
+        tile_size: int,
+        split_size: int,
+    ) -> StructuredReducedTransitionCache | None:
+        if (
+            self.causal_machine_transition_source_logits is None
+            or self.causal_machine_transition_dest_logits is None
+        ):
+            return None
+        return get_or_update_structured_reduced_transition_cache(
+            self._global_reduced_transition_cache,
+            self.causal_machine_transition_source_logits,
+            self.causal_machine_transition_dest_logits,
+            device,
+            runtime_config,
+            num_states=self.causal_machine_num_states,
+            tile_size=int(tile_size),
+            split_size=int(split_size),
+        )
+
     def _filter_causal_machine_beliefs(
         self,
         state_hidden: Tensor,
         cache: CausalMachineCache | None = None,
         update_cache: bool = False,
+        runtime_config: StructuredScanRuntimeConfig | None = None,
     ) -> tuple[Tensor, Tensor]:
+        self.last_causal_machine_kernel_info = {}
         if (
             self.causal_machine_state_head is None
             or self.causal_machine_transition_source_logits is None
@@ -5973,6 +12759,11 @@ class GPT(nn.Module):
         ):
             state_logits = self._apply_output_head(self.causal_machine_state_head, state_hidden) if self.causal_machine_state_head is not None else state_hidden
             state_log_beliefs = F.log_softmax(state_logits.float(), dim=-1)
+            self.last_causal_machine_kernel_info = {
+                "path": "softmax_only",
+                "backend": "python",
+                "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
+            }
             return state_logits, state_log_beliefs.to(dtype=state_hidden.dtype)
         batch_size, seq_len, _ = state_hidden.shape
         local_logits, transition_context = self._compute_causal_machine_local_logits_and_transition_context(state_hidden)
@@ -5987,23 +12778,54 @@ class GPT(nn.Module):
                 local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
         if latent_mode == "replace" and not self.causal_machine_replace_uses_structured:
             state_log_beliefs = F.log_softmax(local_logits.float(), dim=-1)
+            self.last_causal_machine_kernel_info = {
+                "path": "latent_replace",
+                "backend": "cuda" if bool(USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and state_hidden.is_cuda and self.causal_machine_latent_rank > 0) else "python",
+                "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
+            }
             if update_cache and cache is not None:
-                cache.log_belief = state_log_beliefs[:, -1, :].detach().to(dtype=state_hidden.dtype)
-                cache.num_updates += int(seq_len)
+                if runtime_config is not None and runtime_config.use_paged_cache and cache.paged_log_beliefs is None:
+                    cache.enable_paged_history(
+                        batch_size=batch_size,
+                        num_states=self.causal_machine_num_states,
+                        device=state_hidden.device,
+                        dtype=state_hidden.dtype,
+                        latent_rank=self.causal_machine_latent_rank,
+                        page_size=runtime_config.page_size,
+                        max_pages=runtime_config.max_pages,
+                        workspace=runtime_config.workspace,
+                        grouped_launch_pack=runtime_config.grouped_launch_pack,
+                        save_mode=runtime_config.save_mode,
+                        paged_layout=runtime_config.paged_layout,
+                    )
+                cache.record_sequence(state_log_beliefs.to(dtype=state_hidden.dtype))
+                if runtime_config is not None and runtime_config.use_paged_cache and runtime_config.paged_resident_only:
+                    cache.drop_resident_state()
+                self.last_causal_machine_kernel_info = dict(self.last_causal_machine_kernel_info)
+                self.last_causal_machine_kernel_info["paged_cache_write_backend"] = str(cache.last_paged_write_backend)
+                if cache.last_paged_write_error is not None:
+                    self.last_causal_machine_kernel_info["paged_cache_write_error"] = str(cache.last_paged_write_error)
             return local_logits, state_log_beliefs.to(dtype=state_hidden.dtype)
         transition_stay_probs = torch.sigmoid(self.causal_machine_transition_stay_logits.float())
         transition_gate = _bounded_gate(
             self.causal_machine_transition_gate,
             "CAUSAL_MACHINE_TRANSITION_GATE_MIN",
             "CAUSAL_MACHINE_TRANSITION_GATE_MAX",
-            default_min=0.10,
+            default_min=0.01,
             default_max=0.995,
         )
         transition_context, transition_gate = _prepare_structured_filter_inputs(
             transition_context,
             transition_gate,
         )
+        transition_context, transition_gate = _apply_native_structured_score_mod_inputs(
+            transition_context,
+            transition_gate,
+            runtime_config,
+        )
         packed_transition_tables = self._get_global_packed_transition_tables(state_hidden.device)
+        if cache is not None and cache.log_belief is None and cache.paged_log_beliefs is not None:
+            cache.ensure_resident_state()
         if cache is not None and cache.log_belief is not None:
             initial_log_belief = cache.log_belief.to(device=state_hidden.device, dtype=torch.float32)
         else:
@@ -6019,15 +12841,137 @@ class GPT(nn.Module):
                 device=state_hidden.device,
                 dtype=torch.float32,
             )
-        use_cuda_scan = (
-            self.use_causal_machine_cuda_scan
-            and state_hidden.is_cuda
-            and local_logits.size(-1) == 128
-            and self.causal_machine_transition_rank <= 128
-            and self.supports_incremental_backbone_cache()
-            and _can_use_causal_machine_scan_cuda(state_hidden.device, self.causal_machine_transition_rank)
+        tiled_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.causal_machine_transition_source_logits.requires_grad
+                or self.causal_machine_transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
         )
-        if use_cuda_scan:
+        kernel_config = autotune_structured_scan_kernel_config(
+            num_states=self.causal_machine_num_states,
+            transition_rank=self.causal_machine_transition_rank,
+            seq_len=int(seq_len),
+            device=state_hidden.device,
+            default_chunk_size=self.causal_machine_filter_chunk_size,
+            needs_grad=tiled_needs_grad,
+            runtime_config=runtime_config,
+        )
+        if runtime_config is not None:
+            runtime_config.reduced_transition_cache = self._get_global_reduced_transition_cache(
+                state_hidden.device,
+                runtime_config,
+                tile_size=int(kernel_config.tile_size),
+                split_size=int(kernel_config.split_size),
+            )
+        sparse_transition_tables = (
+            self._get_global_sparse_transition_tables(
+                state_hidden.device,
+                runtime_config,
+                packed_transition_tables,
+            )
+            if (
+                self.use_causal_machine_cuda_scan
+                and self.supports_incremental_backbone_cache()
+                and _structured_runtime_supports_sparse_cuda(runtime_config)
+            )
+            else None
+        )
+        sparse_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.causal_machine_transition_source_logits.requires_grad
+                or self.causal_machine_transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        sparse_runtime_result = _execute_structured_sparse_runtime_cuda(
+            local_logits,
+            self.causal_machine_transition_source_logits,
+            self.causal_machine_transition_dest_logits,
+            transition_context,
+            initial_log_belief.to(dtype=local_logits.dtype),
+            transition_gate.reshape(()),
+            transition_stay_probs,
+            sparse_transition_tables,
+            runtime_config=runtime_config,
+            chunk_size=int(kernel_config.chunk_size),
+            needs_grad=sparse_needs_grad,
+        )
+        masked_needs_grad = (
+            torch.is_grad_enabled()
+            and (
+                local_logits.requires_grad
+                or self.causal_machine_transition_source_logits.requires_grad
+                or self.causal_machine_transition_dest_logits.requires_grad
+                or transition_context.requires_grad
+                or initial_log_belief.requires_grad
+                or transition_gate.requires_grad
+                or transition_stay_probs.requires_grad
+            )
+        )
+        use_masked_cuda = (
+            self.use_causal_machine_cuda_scan
+            and self.supports_incremental_backbone_cache()
+            and _structured_runtime_supports_masked_cuda(runtime_config)
+            and _can_use_causal_machine_masked_scan_cuda(
+                state_hidden.device,
+                num_states=self.causal_machine_num_states,
+                transition_rank=self.causal_machine_transition_rank,
+                needs_grad=masked_needs_grad,
+                runtime_config=runtime_config,
+            )
+        )
+        if sparse_runtime_result is not None:
+            state_log_beliefs, final_log_belief = sparse_runtime_result
+            self.last_causal_machine_kernel_info = _structured_scan_kernel_info(
+                path="cuda_sparse",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            _enforce_structured_scan_cuda_contract(
+                self.last_causal_machine_kernel_info,
+                context="global causal machine structured scan",
+            )
+        elif use_masked_cuda:
+            state_log_beliefs, final_log_belief = causal_machine_scan_masked_cuda(
+                local_logits,
+                self.causal_machine_transition_source_logits,
+                self.causal_machine_transition_dest_logits,
+                transition_context,
+                initial_log_belief.to(dtype=local_logits.dtype),
+                transition_gate.reshape(()),
+                transition_stay_probs,
+                runtime_config=runtime_config,
+                chunk_size=int(kernel_config.chunk_size),
+            )
+            self.last_causal_machine_kernel_info = _structured_scan_kernel_info(
+                path="cuda_masked",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            _enforce_structured_scan_cuda_contract(
+                self.last_causal_machine_kernel_info,
+                context="global causal machine structured scan",
+            )
+        elif (
+            self.use_causal_machine_cuda_scan
+            and self.supports_incremental_backbone_cache()
+            and kernel_config.backend == "cuda"
+        ):
             state_log_beliefs, final_log_belief = causal_machine_scan_cuda(
                 local_logits,
                 self.causal_machine_transition_source_logits,
@@ -6037,32 +12981,82 @@ class GPT(nn.Module):
                 transition_gate.reshape(()),
                 transition_stay_probs,
                 packed_transition_tables=packed_transition_tables,
-                chunk_size=int(self.causal_machine_filter_chunk_size),
+                chunk_size=int(kernel_config.chunk_size),
+                runtime_config=runtime_config,
+            )
+            dense_path = (
+                "cuda_dense_lowp_tensor_core"
+                if _structured_scan_uses_lowp_tensor_core_path(
+                    device=local_logits.device,
+                    dtype=local_logits.dtype,
+                    kernel_config=kernel_config,
+                    packed_transition_tables=packed_transition_tables,
+                )
+                else "cuda_dense"
+            )
+            self.last_causal_machine_kernel_info = _structured_scan_kernel_info(
+                path=dense_path,
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            _enforce_structured_scan_cuda_contract(
+                self.last_causal_machine_kernel_info,
+                context="global causal machine structured scan",
             )
         else:
             transition_source_probs, transition_dest_probs, _ = self._structured_causal_machine_transition_params()
-            chunk_size = max(int(self.causal_machine_filter_chunk_size), 1)
-            belief_steps: list[Tensor] = []
-            prev_log_belief = initial_log_belief
-            for chunk_start in range(0, seq_len, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, seq_len)
-                for t in range(chunk_start, chunk_end):
-                    pred_log_belief = structured_transition_predict_log_belief(
-                        prev_log_belief,
-                        transition_source_probs,
-                        transition_dest_probs,
-                        transition_stay_probs,
-                    )
-                    filtered_logits = local_logits[:, t, :].float() + transition_gate * (
-                        pred_log_belief + transition_context[:, t, :].float()
-                    )
-                    prev_log_belief = F.log_softmax(filtered_logits, dim=-1)
-                    belief_steps.append(prev_log_belief.to(dtype=state_hidden.dtype))
-            state_log_beliefs = torch.stack(belief_steps, dim=1)
-            final_log_belief = prev_log_belief
+            state_log_beliefs, final_log_belief, _ = structured_scan_fallback(
+                local_logits,
+                transition_context,
+                initial_log_belief,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_stay_probs,
+                transition_gate,
+                chunk_size=int(kernel_config.chunk_size),
+                tile_size=int(kernel_config.tile_size),
+                split_size=int(kernel_config.split_size),
+                backend=str(kernel_config.backend),
+                track_transition_kl=False,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+            )
+            self.last_causal_machine_kernel_info = _structured_scan_kernel_info(
+                path=f"fallback_{kernel_config.backend}",
+                kernel_config=kernel_config,
+                runtime_config=runtime_config,
+                packed_transition_tables=packed_transition_tables,
+                cache=cache,
+            )
+            _enforce_structured_scan_cuda_contract(
+                self.last_causal_machine_kernel_info,
+                context="global causal machine structured scan",
+            )
         if update_cache and cache is not None:
+            if runtime_config is not None and runtime_config.use_paged_cache and cache.paged_log_beliefs is None:
+                cache.enable_paged_history(
+                    batch_size=batch_size,
+                    num_states=self.causal_machine_num_states,
+                    device=state_hidden.device,
+                    dtype=state_hidden.dtype,
+                    latent_rank=self.causal_machine_latent_rank,
+                    page_size=runtime_config.page_size,
+                    max_pages=runtime_config.max_pages,
+                    workspace=runtime_config.workspace,
+                    grouped_launch_pack=runtime_config.grouped_launch_pack,
+                    save_mode=runtime_config.save_mode,
+                    paged_layout=runtime_config.paged_layout,
+                )
+            cache.record_sequence(state_log_beliefs)
             cache.log_belief = final_log_belief.detach().to(dtype=state_hidden.dtype)
-            cache.num_updates += int(seq_len)
+            if runtime_config is not None and runtime_config.use_paged_cache and runtime_config.paged_resident_only:
+                cache.drop_resident_state()
+            self.last_causal_machine_kernel_info = dict(self.last_causal_machine_kernel_info)
+            self.last_causal_machine_kernel_info["paged_cache_write_backend"] = str(cache.last_paged_write_backend)
+            if cache.last_paged_write_error is not None:
+                self.last_causal_machine_kernel_info["paged_cache_write_error"] = str(cache.last_paged_write_error)
         return local_logits, state_log_beliefs.to(dtype=state_hidden.dtype)
 
     def _compute_causal_machine_outputs(
@@ -6070,6 +13064,7 @@ class GPT(nn.Module):
         x: Tensor,
         cache: CausalMachineCache | None = None,
         update_cache: bool = False,
+        runtime_config: StructuredScanRuntimeConfig | None = None,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None, Tensor | None]:
         if (
             self.causal_machine_prefix_down is None
@@ -6085,6 +13080,7 @@ class GPT(nn.Module):
             state_hidden,
             cache=cache,
             update_cache=update_cache,
+            runtime_config=runtime_config,
         )
         local_state_log_probs = F.log_softmax(state_logits.float(), dim=-1).to(dtype=x.dtype)
         emit_logits = self._compute_causal_machine_emit_log_probs(device=x.device, dtype=torch.float32)
@@ -6717,8 +13713,17 @@ def init_ema_state(module: nn.Module) -> dict[str, Tensor]:
 @torch.no_grad()
 def update_ema_state(ema_state: dict[str, Tensor], module: nn.Module, decay: float) -> None:
     one_minus_decay = 1.0 - decay
-    for name, tensor in module.state_dict().items():
-        ema_state[name].mul_(decay).add_(tensor.detach().float(), alpha=one_minus_decay)
+    state_items = list(module.state_dict().items())
+    if not state_items:
+        return
+    ema_tensors = [ema_state[name] for name, _tensor in state_items]
+    current_tensors = [tensor.detach().float() for _name, tensor in state_items]
+    try:
+        torch._foreach_mul_(ema_tensors, decay)
+        torch._foreach_add_(ema_tensors, current_tensors, alpha=one_minus_decay)
+    except Exception:
+        for name, tensor in state_items:
+            ema_state[name].mul_(decay).add_(tensor.detach().float(), alpha=one_minus_decay)
 
 
 def fake_quant_active(args: Hyperparameters, step: int, elapsed_ms: float, lr_scale: float) -> bool:
@@ -6816,6 +13821,30 @@ def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
     }
 
 
+def validate_causal_machine_objective_config(args: Hyperparameters) -> None:
+    args.causal_machine_teacher_loss_coeff = max(float(args.causal_machine_teacher_loss_coeff), 0.0)
+    args.causal_machine_state_loss_coeff = max(float(args.causal_machine_state_loss_coeff), 0.0)
+    args.causal_machine_next_token_loss_coeff = max(float(args.causal_machine_next_token_loss_coeff), 0.0)
+    args.causal_machine_transition_kl_coeff = max(float(args.causal_machine_transition_kl_coeff), 0.0)
+    args.causal_machine_future_sketch_loss_coeff = max(float(args.causal_machine_future_sketch_loss_coeff), 0.0)
+    uses_offline_teacher = args.causal_machine_teacher_loss_coeff > 0.0 or args.causal_machine_state_loss_coeff > 0.0
+    has_profile_teacher_artifact = bool(str(args.causal_machine_profile_json or "").strip())
+    if has_profile_teacher_artifact and not args.causal_machine_allow_offline_teacher:
+        raise ValueError(
+            "CAUSAL_MACHINE_PROFILE_JSON is an offline teacher artifact. "
+            "Set CAUSAL_MACHINE_ALLOW_OFFLINE_TEACHER=1 to opt into that path explicitly."
+        )
+    if uses_offline_teacher and not args.causal_machine_allow_offline_teacher:
+        raise ValueError(
+            "CAUSAL_MACHINE_TEACHER_LOSS_COEFF and CAUSAL_MACHINE_STATE_LOSS_COEFF "
+            "require CAUSAL_MACHINE_ALLOW_OFFLINE_TEACHER=1."
+        )
+    if uses_offline_teacher and not has_profile_teacher_artifact:
+        raise ValueError(
+            "Offline causal-machine teacher losses require CAUSAL_MACHINE_PROFILE_JSON."
+        )
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -6823,8 +13852,10 @@ def load_causal_machine_profile(profile_json_path: str) -> dict[str, object]:
 def main() -> None:
     global BOS_ID, zeropower_via_newtonschulz5
 
+    process_started_at = time.perf_counter()
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    validate_causal_machine_objective_config(args)
     configure_runtime_export(args)
     if args.enable_torch_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
@@ -6893,6 +13924,9 @@ def main() -> None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
 
+    def end_to_end_wallclock_ms() -> float:
+        return 1000.0 * (time.perf_counter() - process_started_at)
+
     log0(code, console=False)
 
     # -----------------------------
@@ -6947,7 +13981,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    budget_started_at = time.perf_counter()
+    budget_started_at = process_started_at
 
     base_model = GPT(
         vocab_size=args.vocab_size,
@@ -7051,6 +14085,10 @@ def main() -> None:
     ema_state_updated = False
     if not args.use_cuda_graphs:
         cuda_graph_disable_reason = "disabled"
+    elif distributed:
+        cuda_graph_disable_reason = "distributed_full_step_unsupported"
+    elif muon_optimizers:
+        cuda_graph_disable_reason = "muon_full_step_unsupported"
     else:
         cuda_graph_disable_reason = "eligible"
     cuda_graph_eligible = cuda_graph_disable_reason == "eligible"
@@ -7105,16 +14143,21 @@ def main() -> None:
         if base_model.final_norm.cond_proj is not None:
             other_matrix_params.append(base_model.final_norm.cond_proj.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    optimizer_muon_attn: torch.optim.Optimizer | None = None
+    optimizer_muon_mlp: torch.optim.Optimizer | None = None
+    optimizer_muon_other: torch.optim.Optimizer | None = None
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.token_weight_decay,
         fused=True,
+        capturable=bool(args.use_cuda_graphs and not distributed),
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
     muon_optimizers: list[torch.optim.Optimizer] = []
-    if attn_matrix_params:
+    graph_capturable = bool(args.use_cuda_graphs and not distributed)
+    if args.use_muon and attn_matrix_params:
         optimizer_muon_attn = Muon(
             attn_matrix_params,
             lr=args.matrix_lr,
@@ -7123,12 +14166,13 @@ def main() -> None:
             backend_steps_light=args.muon_backend_steps_light,
             backend_refresh_interval=args.muon_backend_refresh_interval,
             weight_decay=args.muon_weight_decay,
+            capturable=graph_capturable,
         )
         for group in optimizer_muon_attn.param_groups:
             group["base_lr"] = args.matrix_lr
         muon_optimizers.append(optimizer_muon_attn)
         optimizers.append(optimizer_muon_attn)
-    if mlp_matrix_params:
+    if args.use_muon and mlp_matrix_params:
         mlp_matrix_lr = args.matrix_lr * args.mlp_matrix_lr_mult
         optimizer_muon_mlp = Muon(
             mlp_matrix_params,
@@ -7138,12 +14182,13 @@ def main() -> None:
             backend_steps_light=args.muon_backend_steps_light,
             backend_refresh_interval=args.muon_backend_refresh_interval,
             weight_decay=args.muon_weight_decay,
+            capturable=graph_capturable,
         )
         for group in optimizer_muon_mlp.param_groups:
             group["base_lr"] = mlp_matrix_lr
         muon_optimizers.append(optimizer_muon_mlp)
         optimizers.append(optimizer_muon_mlp)
-    if other_matrix_params:
+    if args.use_muon and other_matrix_params:
         optimizer_muon_other = Muon(
             other_matrix_params,
             lr=args.matrix_lr,
@@ -7152,16 +14197,49 @@ def main() -> None:
             backend_steps_light=args.muon_backend_steps_light,
             backend_refresh_interval=args.muon_backend_refresh_interval,
             weight_decay=args.muon_weight_decay,
+            capturable=graph_capturable,
         )
         for group in optimizer_muon_other.param_groups:
             group["base_lr"] = args.matrix_lr
         muon_optimizers.append(optimizer_muon_other)
         optimizers.append(optimizer_muon_other)
+    if not args.use_muon and attn_matrix_params:
+        optimizer_attn_matrix = torch.optim.Adam(
+            [{"params": attn_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.muon_weight_decay,
+            fused=True,
+            capturable=graph_capturable,
+        )
+        optimizers.append(optimizer_attn_matrix)
+    if not args.use_muon and mlp_matrix_params:
+        mlp_matrix_lr = args.matrix_lr * args.mlp_matrix_lr_mult
+        optimizer_mlp_matrix = torch.optim.Adam(
+            [{"params": mlp_matrix_params, "lr": mlp_matrix_lr, "base_lr": mlp_matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.muon_weight_decay,
+            fused=True,
+            capturable=graph_capturable,
+        )
+        optimizers.append(optimizer_mlp_matrix)
+    if not args.use_muon and other_matrix_params:
+        optimizer_other_matrix = torch.optim.Adam(
+            [{"params": other_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.muon_weight_decay,
+            fused=True,
+            capturable=graph_capturable,
+        )
+        optimizers.append(optimizer_other_matrix)
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
+        capturable=graph_capturable,
     )
     optimizers.append(optimizer_scalar)
     if base_model.lm_head is not None:
@@ -7171,11 +14249,16 @@ def main() -> None:
             eps=args.adam_eps,
             weight_decay=args.head_weight_decay,
             fused=True,
+            capturable=graph_capturable,
         )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(
+        f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
+        f"cuda_graph_full_step:{int((not distributed) and not muon_optimizers and args.use_cuda_graphs)}"
+    )
     positional_mode = "rope_only"
     log0(f"positional_mode:{positional_mode} train_seq_len:{args.train_seq_len} iterations:{args.iterations}")
 
@@ -7197,6 +14280,43 @@ def main() -> None:
     def zero_grad_all(set_to_none: bool = True) -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=set_to_none)
+
+    muon_graph_capture_ready = all(opt.prepare_cuda_graph_capture() for opt in muon_optimizers) if muon_optimizers else False
+    graph_full_step_supported = (not distributed) and (not muon_optimizers or muon_graph_capture_ready)
+    graph_step_optimizers = list(optimizers) if graph_full_step_supported else [opt for opt in optimizers if not isinstance(opt, Muon)]
+
+    def _prepare_graphable_optimizers() -> None:
+        if not graph_full_step_supported:
+            return
+        for opt in graph_step_optimizers:
+            if isinstance(opt, Muon):
+                continue
+            for group in opt.param_groups:
+                lr_value = group.get("lr", 0.0)
+                if isinstance(lr_value, Tensor):
+                    continue
+                lr_tensor = torch.tensor(float(lr_value), device=device, dtype=torch.float32)
+                group["lr_tensor"] = lr_tensor
+                group["lr"] = lr_tensor
+
+    def _set_group_lr(group: dict[str, object], value: float) -> None:
+        lr_tensor = group.get("lr_tensor")
+        if isinstance(lr_tensor, Tensor):
+            lr_tensor.fill_(float(value))
+            group["lr"] = lr_tensor
+        else:
+            group["lr"] = float(value)
+
+    def _set_group_scalar(group: dict[str, object], name: str, value: float) -> None:
+        tensor_value = group.get(f"{name}_tensor")
+        if isinstance(tensor_value, Tensor):
+            tensor_value.fill_(float(value))
+            if name in group:
+                group[name] = tensor_value
+        else:
+            group[name] = float(value)
+
+    _prepare_graphable_optimizers()
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -7286,32 +14406,63 @@ def main() -> None:
         return loss
 
     def build_train_cuda_graph(
-        sample_x: Tensor,
-        sample_y: Tensor,
-        sample_loss_mask: Tensor | None,
+        sample_batches: Sequence[tuple[Tensor, Tensor, Tensor | None]],
+        *,
+        ema_active: bool,
     ) -> dict[str, object]:
-        # Keep long-lived buffers stable so replay can swap in new batch contents
-        # without changing addresses captured into the graph.
-        static_x = torch.empty_like(sample_x)
-        static_y = torch.empty_like(sample_y)
-        static_loss_mask = torch.empty_like(sample_loss_mask) if sample_loss_mask is not None else None
+        if not sample_batches:
+            raise ValueError("build_train_cuda_graph requires at least one microbatch")
+        sample_x = sample_batches[0][0]
+        graph_runtime = get_structured_scan_graph_runtime(
+            name="train_step",
+            device=device,
+            shape_bucket=_structured_scan_shape_bucket(*sample_x.shape, quantum=32),
+        )
+        static_batches: list[tuple[Tensor, Tensor, Tensor | None]] = []
+        for micro_step, (sample_x, sample_y, sample_loss_mask) in enumerate(sample_batches):
+            static_x = graph_runtime.reserve_like(f"train_x_{micro_step}", sample_x)
+            static_y = graph_runtime.reserve_like(f"train_y_{micro_step}", sample_y)
+            static_loss_mask = (
+                graph_runtime.reserve_like(f"train_loss_mask_{micro_step}", sample_loss_mask)
+                if sample_loss_mask is not None
+                else None
+            )
+            static_x.copy_(sample_x, non_blocking=True)
+            static_y.copy_(sample_y, non_blocking=True)
+            if static_loss_mask is not None and sample_loss_mask is not None:
+                static_loss_mask.copy_(sample_loss_mask, non_blocking=True)
+            static_batches.append((static_x, static_y, static_loss_mask))
         static_loss = torch.zeros((), device=device, dtype=torch.float32)
-        static_x.copy_(sample_x, non_blocking=True)
-        static_y.copy_(sample_y, non_blocking=True)
-        if static_loss_mask is not None and sample_loss_mask is not None:
-            static_loss_mask.copy_(sample_loss_mask, non_blocking=True)
-        zero_grad_all()
+        static_grad_norm = torch.zeros((), device=device, dtype=torch.float32)
+        zero_grad_all(set_to_none=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured_loss = compute_training_loss(static_x, static_y, static_loss_mask)
-            static_loss.copy_(captured_loss.detach().to(dtype=static_loss.dtype))
-            (captured_loss * grad_scale).backward()
+            total_loss = torch.zeros((), device=device, dtype=torch.float32)
+            for static_x, static_y, static_loss_mask in static_batches:
+                captured_loss = compute_training_loss(static_x, static_y, static_loss_mask)
+                total_loss.add_(captured_loss.detach().to(dtype=torch.float32))
+                (captured_loss * grad_scale).backward()
+            total_loss.div_(float(len(static_batches)))
+            static_loss.copy_(total_loss)
+            if args.grad_clip_norm > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+                static_grad_norm.copy_(grad_norm.detach().to(dtype=static_grad_norm.dtype))
+            for opt in graph_step_optimizers:
+                opt.step()
+            if ema_active and ema_state is not None:
+                update_ema_state(ema_state, base_model, args.ema_decay)
+            for opt in graph_step_optimizers:
+                opt.zero_grad(set_to_none=False)
+        graph_runtime.capture_count += 1
         return {
             "graph": graph,
-            "static_x": static_x,
-            "static_y": static_y,
-            "static_loss_mask": static_loss_mask,
+            "static_batches": static_batches,
             "static_loss": static_loss,
+            "static_grad_norm": static_grad_norm,
+            "graph_runtime": graph_runtime,
+            "ema_active": bool(ema_active),
+            "captures_full_step": True,
+            "num_microbatches": int(len(static_batches)),
         }
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
@@ -7335,7 +14486,7 @@ def main() -> None:
             for opt in optimizers:
                 scaled_lr = token_scale if opt is optimizer_tok else warmup_scale
                 for group in opt.param_groups:
-                    group["lr"] = group["base_lr"] * scaled_lr
+                    _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -7412,11 +14563,20 @@ def main() -> None:
     best_val_train_tokens = 0
     best_bootstrap_val_bpb = math.inf
     regression_bad_validations = 0
-    scale = lr_mul(0, training_time_ms)
+    scale = lr_mul(0, end_to_end_wallclock_ms())
     cuda_graph_runner: dict[str, object] | None = None
     cuda_graph_runner_fake_quant_bits: int | None = None
+    cuda_graph_retry_step = max(args.cuda_graph_warmup_steps, 0)
+    graph_captures_grad_clip = args.grad_clip_norm > 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    optimizer_step_time_ms_total = 0.0
+    muon_step_time_ms_total = 0.0
+    muon_cuda_time_ms_total = 0.0
+    muon_fallback_time_ms_total = 0.0
+    muon_cuda_tensor_count_total = 0
+    muon_fallback_tensor_count_total = 0
+    muon_cuda_failure_count_total = 0
 
     step = 0
     while True:
@@ -7449,10 +14609,11 @@ def main() -> None:
             )
             if bootstrap_active and math.isfinite(float(val_bpb)):
                 best_bootstrap_val_bpb = min(best_bootstrap_val_bpb, float(val_bpb))
+            wallclock_ms = end_to_end_wallclock_ms()
             log0(
                 f"step:{step}/{args.iterations} "
                 f"val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"wallclock:{wallclock_ms:.0f}ms step_avg:{wallclock_ms / max(step, 1):.2f}ms"
             )
             raw_final_val_loss = val_loss
             raw_final_val_bpb = val_bpb
@@ -7486,73 +14647,23 @@ def main() -> None:
                     stop_after_step = int(step)
             else:
                 regression_bad_validations = 0
-            # Validation allocates a much larger working set than replayed training.
-            # Drop the captured graph and cached allocator blocks so the next training
-            # step rebuilds the graph from a clean pool instead of accumulating
-            # fragmented segments across train/eval transitions.
-            cuda_graph_runner = None
-            cuda_graph_runner_fake_quant_bits = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Keep the captured graph resident across validation so the training
+            # path does not pay repeated recapture and cache-flush costs.
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
             break
 
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        current_train_step = step
+        elapsed_ms = end_to_end_wallclock_ms()
         scale = lr_mul(step, elapsed_ms)
         fake_quant_bits = args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms, scale) else 0
         base_model.set_fake_quant(fake_quant_bits)
-        graph_step_active = cuda_graph_eligible and step >= max(args.cuda_graph_warmup_steps, 0)
+        graph_step_active = cuda_graph_eligible and step >= max(args.cuda_graph_warmup_steps, 0) and step >= cuda_graph_retry_step
         if cuda_graph_runner is not None and cuda_graph_runner_fake_quant_bits != fake_quant_bits:
             cuda_graph_runner = None
             cuda_graph_runner_fake_quant_bits = None
-        zero_grad_all(set_to_none=not (graph_step_active and cuda_graph_runner is not None))
-        train_loss = torch.zeros((), device=device)
-        last_x = None
-        last_y = None
-        last_loss_mask = None
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y, loss_mask = next_train_microbatch()
-            last_x = x
-            last_y = y
-            last_loss_mask = loss_mask
-            loss_value: Tensor | None = None
-            used_cuda_graph = False
-            if graph_step_active:
-                if cuda_graph_runner is None:
-                    try:
-                        cuda_graph_runner = build_train_cuda_graph(x, y, loss_mask)
-                        cuda_graph_runner_fake_quant_bits = fake_quant_bits
-                        used_cuda_graph = True
-                        loss_value = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-                    except Exception as exc:
-                        cuda_graph_eligible = False
-                        cuda_graph_disable_reason = f"capture_failed:{type(exc).__name__}"
-                        cuda_graph_runner = None
-                        cuda_graph_runner_fake_quant_bits = None
-                        zero_grad_all()
-                else:
-                    static_x = cuda_graph_runner["static_x"]
-                    static_y = cuda_graph_runner["static_y"]
-                    static_loss_mask = cuda_graph_runner["static_loss_mask"]
-                    static_x.copy_(x, non_blocking=True)
-                    static_y.copy_(y, non_blocking=True)
-                    if static_loss_mask is not None and loss_mask is not None:
-                        static_loss_mask.copy_(loss_mask, non_blocking=True)
-                    cuda_graph_runner["graph"].replay()
-                    used_cuda_graph = True
-                    loss_value = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-            if not used_cuda_graph:
-                loss = compute_training_loss(x, y, loss_mask)
-                loss_value = loss.detach()
-                (loss * grad_scale).backward()
-            train_loss += loss_value
-        train_loss /= grad_accum_steps
-
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for opt in muon_optimizers:
@@ -7572,35 +14683,112 @@ def main() -> None:
             elif opt is optimizer_muon_mlp:
                 scaled_lr *= mlp_lr_scale
             for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scaled_lr
+                _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
                 if opt is optimizer_muon_attn or opt is optimizer_muon_mlp:
                     group["weight_decay"] = args.muon_weight_decay * muon_wd_scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all(set_to_none=not (graph_step_active and cuda_graph_runner is not None))
-        if ema_state is not None and step + 1 >= args.ema_start_step:
-            update_ema_state(ema_state, base_model, args.ema_decay)
-            ema_state_updated = True
+        step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
+        used_cuda_graph = False
+        train_loss = torch.zeros((), device=device)
+        ema_active = ema_state is not None and step + 1 >= args.ema_start_step
+        graph_runner_invalid = (
+            cuda_graph_runner is None
+            or bool(cuda_graph_runner.get("ema_active", False)) != bool(ema_active)
+            or int(cuda_graph_runner.get("num_microbatches", 0)) != len(step_batches)
+        )
+        if graph_step_active:
+            if graph_runner_invalid:
+                try:
+                    cuda_graph_runner = build_train_cuda_graph(step_batches, ema_active=ema_active)
+                    cuda_graph_runner_fake_quant_bits = fake_quant_bits
+                    cuda_graph_retry_step = step
+                    used_cuda_graph = True
+                    train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
+                    ema_state_updated = ema_state_updated or ema_active
+                except Exception as exc:
+                    cuda_graph_disable_reason = f"capture_failed:{type(exc).__name__}"
+                    cuda_graph_retry_step = step + max(args.val_loss_every, 16, 1)
+                    cuda_graph_runner = None
+                    cuda_graph_runner_fake_quant_bits = None
+                    zero_grad_all()
+            else:
+                static_batches = cuda_graph_runner["static_batches"]
+                for (x, y, loss_mask), (static_x, static_y, static_loss_mask) in zip(step_batches, static_batches, strict=True):
+                    static_x.copy_(x, non_blocking=True)
+                    static_y.copy_(y, non_blocking=True)
+                    if static_loss_mask is not None and loss_mask is not None:
+                        static_loss_mask.copy_(loss_mask, non_blocking=True)
+                cuda_graph_runner["graph"].replay()
+                used_cuda_graph = True
+                train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
+                ema_state_updated = ema_state_updated or ema_active
+
+        if not used_cuda_graph:
+            zero_grad_all(set_to_none=True)
+            for micro_step, (x, y, loss_mask) in enumerate(step_batches):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                loss = compute_training_loss(x, y, loss_mask)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
+
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer_step_started_at = time.perf_counter()
+            for opt in optimizers:
+                opt.step()
+            optimizer_step_time_ms = (time.perf_counter() - optimizer_step_started_at) * 1000.0
+            optimizer_step_time_ms_total += optimizer_step_time_ms
+            if PROFILE_MUON_STEP:
+                for opt in muon_optimizers:
+                    stats = getattr(opt, "last_step_stats", None)
+                    if not isinstance(stats, dict):
+                        continue
+                    muon_step_time_ms_total += float(stats.get("total_ms", 0.0))
+                    muon_cuda_time_ms_total += float(stats.get("cuda_ms", 0.0))
+                    muon_fallback_time_ms_total += float(stats.get("fallback_ms", 0.0))
+                    muon_cuda_tensor_count_total += int(stats.get("cuda_tensor_count", 0))
+                    muon_fallback_tensor_count_total += int(stats.get("fallback_tensor_count", 0))
+                    muon_cuda_failure_count_total += int(stats.get("cuda_failure_count", 0))
+            zero_grad_all(set_to_none=True)
+            if ema_active:
+                update_ema_state(ema_state, base_model, args.ema_decay)  # type: ignore[arg-type]
+                ema_state_updated = True
 
         train_loss_value = float(train_loss.item())
 
         step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        approx_wallclock_ms = end_to_end_wallclock_ms()
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            muon_log_suffix = ""
+            if PROFILE_MUON_STEP:
+                muon_tensor_total = muon_cuda_tensor_count_total + muon_fallback_tensor_count_total
+                muon_fallback_frac = (
+                    float(muon_fallback_tensor_count_total) / float(muon_tensor_total)
+                    if muon_tensor_total > 0
+                    else 0.0
+                )
+                muon_log_suffix = (
+                    f" opt_step_avg:{optimizer_step_time_ms_total / step:.2f}ms"
+                    f" muon_avg:{muon_step_time_ms_total / step:.2f}ms"
+                    f" muon_cuda_avg:{muon_cuda_time_ms_total / step:.2f}ms"
+                    f" muon_fallback_avg:{muon_fallback_time_ms_total / step:.2f}ms"
+                    f" muon_fallback_frac:{muon_fallback_frac:.3f}"
+                    f" muon_cuda_failures:{muon_cuda_failure_count_total}"
+                )
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"wallclock:{approx_wallclock_ms:.0f}ms step_avg:{approx_wallclock_ms / step:.2f}ms"
+                f"{muon_log_suffix}"
             )
 
         # Needed to sync whether we've reached the wallclock cap.
-        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        reached_cap = max_wallclock_ms is not None and approx_wallclock_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
@@ -7718,6 +14906,12 @@ def main() -> None:
             max_seqs=args.final_eval_max_seqs,
         )
     torch.cuda.synchronize()
+    final_wallclock_ms = end_to_end_wallclock_ms()
+    if max_wallclock_ms is not None and final_wallclock_ms > max_wallclock_ms:
+        raise RuntimeError(
+            f"End-to-end wallclock budget exceeded: final_wallclock_ms={final_wallclock_ms:.0f} "
+            f"> max_wallclock_ms={max_wallclock_ms:.0f}. Reduce startup, training, or finalization work."
+        )
 
     if distributed:
         dist.destroy_process_group()
