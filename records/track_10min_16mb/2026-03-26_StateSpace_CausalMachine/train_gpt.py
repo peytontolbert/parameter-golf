@@ -102,6 +102,16 @@ _MUON_CUDA = None
 _MUON_CUDA_ERROR: Exception | None = None
 
 
+def _torch_dynamo_disable_if_available(fn: Callable[..., Any]) -> Callable[..., Any]:
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is None:
+        return fn
+    disable = getattr(dynamo, "disable", None)
+    if disable is None:
+        return fn
+    return disable(fn)
+
+
 def _parse_cuda_arch_list(raw: str) -> list[str]:
     archs: list[str] = []
     for item in raw.replace(";", ",").split(","):
@@ -173,6 +183,42 @@ def _load_causal_machine_scan_cuda_extension(source_dir: Path, build_dir: Path):
     )
 
 
+def _extension_candidate_build_dirs(source_dir: Path, build_subdir: str) -> list[Path]:
+    dirs: list[Path] = []
+
+    def add_candidate(path: Path) -> None:
+        resolved = path.resolve()
+        if resolved not in dirs:
+            dirs.append(resolved)
+
+    add_candidate(source_dir / build_subdir)
+
+    repo_root = None
+    relative_source_dir = None
+    for parent in source_dir.parents:
+        if parent.name == "records":
+            repo_root = parent.parent
+            relative_source_dir = source_dir.relative_to(repo_root)
+            break
+    if relative_source_dir is not None:
+        cwd = Path.cwd().resolve()
+        for base in (
+            cwd,
+            cwd.parent,
+            Path("/data/parametergolf"),
+            Path(os.environ.get("PARAMETER_GOLF_ROOT", "")).resolve() if os.environ.get("PARAMETER_GOLF_ROOT") else None,
+        ):
+            if base is None:
+                continue
+            try:
+                add_candidate(base / relative_source_dir / build_subdir)
+            except Exception:
+                continue
+
+    return dirs
+
+
+@_torch_dynamo_disable_if_available
 def _load_existing_cuda_extension_module(
     module_name: str,
     build_dir: Path,
@@ -200,6 +246,7 @@ def _load_existing_cuda_extension_module(
         return None
 
 
+@_torch_dynamo_disable_if_available
 def _stale_prebuilt_cuda_extension_sources(module_path: Path, source_paths: Sequence[Path]) -> tuple[Path, ...]:
     if not module_path.exists():
         return ()
@@ -215,23 +262,28 @@ def _stale_prebuilt_cuda_extension_sources(module_path: Path, source_paths: Sequ
     return tuple(stale)
 
 
+@_torch_dynamo_disable_if_available
 def _load_prebuilt_cuda_extension_or_none(
     module_name: str,
     display_name: str,
-    build_dir: Path,
+    build_dirs: Sequence[Path],
     source_paths: Sequence[Path],
 ):
-    existing = _load_existing_cuda_extension_module(module_name, build_dir, source_paths)
-    if existing is not None:
-        return existing
+    checked_paths: list[Path] = []
+    for build_dir in build_dirs:
+        existing = _load_existing_cuda_extension_module(module_name, build_dir, source_paths)
+        if existing is not None:
+            return existing
+        checked_paths.append(build_dir / f"{module_name}.so")
     if not _require_prebuilt_cuda_extensions():
         return None
-    module_path = build_dir / f"{module_name}.so"
+    module_path = checked_paths[0]
     stale_sources = _stale_prebuilt_cuda_extension_sources(module_path, source_paths)
-    if not module_path.exists():
+    if not any(path.exists() for path in checked_paths):
+        checked = ", ".join(str(path) for path in checked_paths)
         raise RuntimeError(
             f"{display_name} requires a prebuilt CUDA extension in competition mode; "
-            f"missing {module_path}. Prebuild it before starting the timed run."
+            f"missing one of: {checked}. Prebuild it before starting the timed run."
         )
     if stale_sources:
         stale_names = ", ".join(path.name for path in stale_sources)
@@ -282,12 +334,13 @@ def load_causal_machine_scan_cuda():
     if _CAUSAL_MACHINE_SCAN_CUDA_ERROR is not None:
         raise RuntimeError("causal_machine_scan_cuda is unavailable") from _CAUSAL_MACHINE_SCAN_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
-    build_dir = source_dir / "build"
+    build_dirs = _extension_candidate_build_dirs(source_dir, "build")
+    build_dir = build_dirs[0]
     build_dir.mkdir(parents=True, exist_ok=True)
     existing = _load_prebuilt_cuda_extension_or_none(
         "causal_machine_scan_cuda_ext",
         "causal_machine_scan_cuda",
-        build_dir,
+        build_dirs,
         (
             source_dir / "causal_machine_scan.cpp",
             source_dir / "causal_machine_scan_kernel.cu",
@@ -360,12 +413,13 @@ def load_causal_machine_latent_scan_cuda():
     if _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR is not None:
         raise RuntimeError("causal_machine_latent_scan_cuda is unavailable") from _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
-    build_dir = source_dir / "build"
+    build_dirs = _extension_candidate_build_dirs(source_dir, "build")
+    build_dir = build_dirs[0]
     build_dir.mkdir(parents=True, exist_ok=True)
     existing = _load_prebuilt_cuda_extension_or_none(
         "causal_machine_latent_scan_cuda_ext",
         "causal_machine_latent_scan_cuda",
-        build_dir,
+        build_dirs,
         (
             source_dir / "causal_machine_latent_scan.cpp",
             source_dir / "causal_machine_latent_scan_kernel.cu",
@@ -438,12 +492,13 @@ def load_muon_cuda():
     if _MUON_CUDA_ERROR is not None:
         raise RuntimeError("muon_cuda is unavailable") from _MUON_CUDA_ERROR
     source_dir = Path(__file__).resolve().parent / "cuda_ext"
-    build_dir = source_dir / "build" / "muon_cuda"
+    build_dirs = _extension_candidate_build_dirs(source_dir, "build/muon_cuda")
+    build_dir = build_dirs[0]
     build_dir.mkdir(parents=True, exist_ok=True)
     existing = _load_prebuilt_cuda_extension_or_none(
         "muon_cuda_ext",
         "muon_cuda",
-        build_dir,
+        build_dirs,
         (
             source_dir / "muon.cpp",
             source_dir / "muon_kernel.cu",
@@ -14462,6 +14517,16 @@ def main() -> None:
     # -----------------------------
 
     budget_started_at = process_started_at
+
+    if USE_CAUSAL_MACHINE_CUDA_SCAN:
+        load_causal_machine_scan_cuda()
+        log0("cuda_ext:preloaded causal_machine_scan_cuda", console=False)
+    if USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN:
+        load_causal_machine_latent_scan_cuda()
+        log0("cuda_ext:preloaded causal_machine_latent_scan_cuda", console=False)
+    if args.use_muon and USE_MUON_CUDA:
+        load_muon_cuda()
+        log0("cuda_ext:preloaded muon_cuda", console=False)
 
     base_model = GPT(
         vocab_size=args.vocab_size,
