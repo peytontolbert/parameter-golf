@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <dlfcn.h>
 #include <limits>
 #include <mutex>
 #include <type_traits>
@@ -38,6 +39,30 @@ constexpr int kAsyncTilePipelineStages = 2;
 constexpr int kSm90AsyncTilePipelineStages = 3;
 constexpr int kTensorCoreTile = 16;
 using HopperStageBarrier = cuda::barrier<cuda::thread_scope_block>;
+namespace cde = cuda::device::experimental;
+
+using CuTensorMapEncodeTiledFn = CUresult (CUDAAPI*)(
+    CUtensorMap*,
+    CUtensorMapDataType,
+    cuuint32_t,
+    void*,
+    const cuuint64_t*,
+    const cuuint64_t*,
+    const cuuint32_t*,
+    const cuuint32_t*,
+    CUtensorMapInterleave,
+    CUtensorMapSwizzle,
+    CUtensorMapL2promotion,
+    CUtensorMapFloatOOBfill);
+
+struct DeviceTensorMapDescriptor {
+    torch::Tensor storage;
+    const CUtensorMap* device_ptr = nullptr;
+
+    explicit operator bool() const {
+        return device_ptr != nullptr;
+    }
+};
 
 __device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
     float* __restrict__ dst0,
@@ -52,6 +77,25 @@ __device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
     int rows1,
     int cols1,
     int dst1_stride);
+
+template <typename T>
+__device__ __forceinline__ bool can_use_sm90_bulk_matrix_slice_async(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int src_stride,
+    int rows,
+    int cols,
+    int dst_stride);
+
+template <typename T>
+__device__ __forceinline__ void enqueue_sm90_bulk_matrix_slice_async(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int src_stride,
+    int rows,
+    int cols,
+    int dst_stride,
+    HopperStageBarrier& hopper_barrier);
 
 static_assert(kMaxNumStates % kWarpSize == 0, "small-state kernels assume warp-aligned block sizes");
 static_assert(kMaxTiledBlockThreads % kWarpSize == 0, "tiled kernels assume warp-aligned block sizes");
@@ -562,6 +606,10 @@ size_t forward_tiled_packed_shared_bytes(int num_states, int tile_size, int spli
         + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
     return bytes;
 }
 
@@ -576,6 +624,10 @@ size_t forward_tiled_packed_shared_bytes_sm90(int num_states, int tile_size, int
         + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
     return bytes;
 }
 
@@ -617,8 +669,8 @@ size_t backward_tiled_shared_bytes_sm90(int num_states, int split_size, int tile
         (3 * num_states)
         + staged_rank_chunk
         + tile_size
-        + (static_cast<int>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1))
-        + (static_cast<int>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(num_states, 1))
+        + (async_tile_pipeline_stages<true>() * staged_rank_chunk * std::max(tile_size, 1))
+        + (async_tile_pipeline_stages<true>() * staged_rank_chunk * std::max(num_states, 1))
         + num_warps
         + 4
     ) * sizeof(float);
@@ -644,7 +696,7 @@ size_t backward_tiled_packed_shared_bytes_sm90(int num_states, int split_size, i
     size_t bytes = static_cast<size_t>(
         (3 * num_states) + staged_rank_chunk + tile_size + (staged_rank_chunk * std::max(tile_size, 1)) + num_warps + 4
     ) * sizeof(float);
-    bytes += static_cast<size_t>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
     return bytes;
 }
 
@@ -867,6 +919,197 @@ bool can_use_wmma(int device_index) {
 
 bool can_use_tma(int device_index) {
     return cached_capability_major(device_index) >= 9;
+}
+
+CuTensorMapEncodeTiledFn load_cu_tensor_map_encode_tiled() {
+    static std::mutex mutex;
+    static bool initialized = false;
+    static CuTensorMapEncodeTiledFn fn = nullptr;
+    static void* libcuda_handle = nullptr;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized) {
+        libcuda_handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (libcuda_handle == nullptr) {
+            libcuda_handle = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+        }
+        if (libcuda_handle != nullptr) {
+            fn = reinterpret_cast<CuTensorMapEncodeTiledFn>(
+                dlsym(libcuda_handle, "cuTensorMapEncodeTiled"));
+        }
+        initialized = true;
+    }
+    return fn;
+}
+
+bool can_encode_tma_2d_tensor(
+    const torch::Tensor& tensor,
+    int64_t fast_dim,
+    int64_t slow_dim,
+    int64_t slow_stride_bytes,
+    int64_t box_fast_dim,
+    int64_t box_slow_dim) {
+    if (!tensor.defined() || !tensor.is_cuda()) {
+        return false;
+    }
+    if (fast_dim <= 0 || slow_dim <= 0 || box_fast_dim <= 0 || box_slow_dim <= 0) {
+        return false;
+    }
+    if (fast_dim > std::numeric_limits<uint32_t>::max()
+        || slow_dim > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    if (box_fast_dim > 256 || box_slow_dim > 256) {
+        return false;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(tensor.data_ptr());
+    if ((address & 0xfu) != 0) {
+        return false;
+    }
+    if ((slow_stride_bytes % 16) != 0) {
+        return false;
+    }
+    if (((box_fast_dim * static_cast<int64_t>(sizeof(float))) % 16) != 0) {
+        return false;
+    }
+    return true;
+}
+
+CUtensorMap* aligned_tensor_map_device_ptr(const torch::Tensor& storage) {
+    auto raw = reinterpret_cast<std::uintptr_t>(storage.data_ptr<uint8_t>());
+    raw = (raw + 63u) & ~std::uintptr_t(63u);
+    return reinterpret_cast<CUtensorMap*>(raw);
+}
+
+DeviceTensorMapDescriptor encode_tma_descriptor_2d_float(
+    const torch::Tensor& reference_tensor,
+    void* global_address,
+    int64_t fast_dim,
+    int64_t slow_dim,
+    int64_t slow_stride_bytes,
+    int64_t box_fast_dim,
+    int64_t box_slow_dim,
+    cudaStream_t stream) {
+    DeviceTensorMapDescriptor result;
+    if (!can_encode_tma_2d_tensor(
+            reference_tensor,
+            fast_dim,
+            slow_dim,
+            slow_stride_bytes,
+            box_fast_dim,
+            box_slow_dim)) {
+        return result;
+    }
+    auto encode = load_cu_tensor_map_encode_tiled();
+    if (encode == nullptr) {
+        return result;
+    }
+    alignas(64) CUtensorMap host_tensor_map{};
+    const cuuint64_t global_dim[2] = {
+        static_cast<cuuint64_t>(fast_dim),
+        static_cast<cuuint64_t>(slow_dim),
+    };
+    const cuuint64_t global_stride[1] = {
+        static_cast<cuuint64_t>(slow_stride_bytes),
+    };
+    const cuuint32_t box_dim[2] = {
+        static_cast<cuuint32_t>(box_fast_dim),
+        static_cast<cuuint32_t>(box_slow_dim),
+    };
+    const cuuint32_t element_stride[2] = {1u, 1u};
+    const CUresult encode_result = encode(
+        &host_tensor_map,
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+        2,
+        global_address,
+        global_dim,
+        global_stride,
+        box_dim,
+        element_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (encode_result != CUDA_SUCCESS) {
+        return result;
+    }
+    result.storage = torch::empty(
+        {static_cast<int64_t>(sizeof(CUtensorMap) + 63)},
+        reference_tensor.options().dtype(torch::kUInt8));
+    result.device_ptr = aligned_tensor_map_device_ptr(result.storage);
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        const_cast<CUtensorMap*>(result.device_ptr),
+        &host_tensor_map,
+        sizeof(CUtensorMap),
+        cudaMemcpyHostToDevice,
+        stream));
+    return result;
+}
+
+template <typename packed_t>
+DeviceTensorMapDescriptor encode_tma_descriptor_2d_packed(
+    const torch::Tensor& reference_tensor,
+    void* global_address,
+    int64_t fast_dim,
+    int64_t slow_dim,
+    int64_t slow_stride_bytes,
+    int64_t box_fast_dim,
+    int64_t box_slow_dim,
+    cudaStream_t stream) {
+    static_assert(sizeof(packed_t) == 1, "packed tensor maps currently assume byte-sized storage");
+    DeviceTensorMapDescriptor result;
+    if (!can_encode_tma_2d_tensor(
+            reference_tensor,
+            fast_dim,
+            slow_dim,
+            slow_stride_bytes,
+            box_fast_dim,
+            box_slow_dim)) {
+        return result;
+    }
+    auto encode = load_cu_tensor_map_encode_tiled();
+    if (encode == nullptr) {
+        return result;
+    }
+    alignas(64) CUtensorMap host_tensor_map{};
+    const cuuint64_t global_dim[2] = {
+        static_cast<cuuint64_t>(fast_dim),
+        static_cast<cuuint64_t>(slow_dim),
+    };
+    const cuuint64_t global_stride[1] = {
+        static_cast<cuuint64_t>(slow_stride_bytes),
+    };
+    const cuuint32_t box_dim[2] = {
+        static_cast<cuuint32_t>(box_fast_dim),
+        static_cast<cuuint32_t>(box_slow_dim),
+    };
+    const cuuint32_t element_stride[2] = {1u, 1u};
+    const CUresult encode_result = encode(
+        &host_tensor_map,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        2,
+        global_address,
+        global_dim,
+        global_stride,
+        box_dim,
+        element_stride,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (encode_result != CUDA_SUCCESS) {
+        return result;
+    }
+    result.storage = torch::empty(
+        {static_cast<int64_t>(sizeof(CUtensorMap) + 63)},
+        reference_tensor.options().dtype(torch::kUInt8));
+    result.device_ptr = aligned_tensor_map_device_ptr(result.storage);
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        const_cast<CUtensorMap*>(result.device_ptr),
+        &host_tensor_map,
+        sizeof(CUtensorMap),
+        cudaMemcpyHostToDevice,
+        stream));
+    return result;
 }
 
 bool can_use_wgmma(int device_index) {
@@ -2797,7 +3040,26 @@ __device__ __forceinline__ void enqueue_float_matrix_slice_async(
     int src_stride,
     int rows,
     int cols,
-    int dst_stride) {
+    int dst_stride,
+    HopperStageBarrier* hopper_barrier = nullptr) {
+    if (hopper_barrier != nullptr
+        && can_use_sm90_bulk_matrix_slice_async(
+            dst,
+            src,
+            src_stride,
+            rows,
+            cols,
+            dst_stride)) {
+        enqueue_sm90_bulk_matrix_slice_async(
+            dst,
+            src,
+            src_stride,
+            rows,
+            cols,
+            dst_stride,
+            *hopper_barrier);
+        return;
+    }
 #if __CUDA_ARCH__ >= 800
     if (rows > 0 && cols > 0) {
         pipe.producer_acquire();
@@ -2891,6 +3153,179 @@ __device__ __forceinline__ void enqueue_sm90_bulk_matrix_slice_async(
     (void)rows;
     (void)cols;
     (void)dst_stride;
+    (void)hopper_barrier;
+#endif
+}
+
+__device__ __forceinline__ bool can_use_sm90_tma_float_tile_async(
+    const CUtensorMap* source_tensor_map,
+    const CUtensorMap* dest_tensor_map,
+    int active_rank,
+    int active_states,
+    int staged_rank_chunk,
+    int tile_size) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    return source_tensor_map != nullptr
+        && dest_tensor_map != nullptr
+        && active_rank == staged_rank_chunk
+        && active_states == tile_size;
+#else
+    (void)source_tensor_map;
+    (void)dest_tensor_map;
+    (void)active_rank;
+    (void)active_states;
+    (void)staged_rank_chunk;
+    (void)tile_size;
+    return false;
+#endif
+}
+
+__device__ __forceinline__ bool can_use_sm90_tma_float_matrix_slice_async(
+    const CUtensorMap* tensor_map,
+    int active_fast_dim,
+    int active_slow_dim,
+    int box_fast_dim,
+    int box_slow_dim) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    return tensor_map != nullptr
+        && active_fast_dim == box_fast_dim
+        && active_slow_dim == box_slow_dim;
+#else
+    (void)tensor_map;
+    (void)active_fast_dim;
+    (void)active_slow_dim;
+    (void)box_fast_dim;
+    (void)box_slow_dim;
+    return false;
+#endif
+}
+
+__device__ __forceinline__ void enqueue_sm90_tma_float_matrix_slice_async(
+    float* __restrict__ shared_tile,
+    const CUtensorMap* tensor_map,
+    int fast_dim_offset,
+    int slow_dim_offset,
+    int tx_rows,
+    int tx_cols,
+    HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    if (threadIdx.x == 0) {
+        const ptrdiff_t total_tx_bytes = static_cast<ptrdiff_t>(
+            static_cast<int64_t>(tx_rows) * tx_cols * sizeof(float));
+        cuda::device::barrier_expect_tx(hopper_barrier, total_tx_bytes);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            shared_tile,
+            tensor_map,
+            fast_dim_offset,
+            slow_dim_offset,
+            hopper_barrier);
+    }
+#else
+    (void)shared_tile;
+    (void)tensor_map;
+    (void)fast_dim_offset;
+    (void)slow_dim_offset;
+    (void)tx_rows;
+    (void)tx_cols;
+    (void)hopper_barrier;
+#endif
+}
+
+template <typename packed_t>
+__device__ __forceinline__ bool can_use_sm90_tma_packed_matrix_slice_async(
+    const CUtensorMap* tensor_map,
+    int active_fast_dim,
+    int active_slow_dim,
+    int box_fast_dim,
+    int box_slow_dim) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    return tensor_map != nullptr
+        && sizeof(packed_t) == 1
+        && active_fast_dim == box_fast_dim
+        && active_slow_dim == box_slow_dim;
+#else
+    (void)tensor_map;
+    (void)active_fast_dim;
+    (void)active_slow_dim;
+    (void)box_fast_dim;
+    (void)box_slow_dim;
+    return false;
+#endif
+}
+
+template <typename packed_t>
+__device__ __forceinline__ void enqueue_sm90_tma_packed_matrix_slice_async(
+    packed_t* __restrict__ shared_tile,
+    const CUtensorMap* tensor_map,
+    int fast_dim_offset,
+    int slow_dim_offset,
+    int tx_rows,
+    int tx_cols,
+    HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    static_assert(sizeof(packed_t) == 1, "packed TMA staging assumes byte-sized packed storage");
+    if (threadIdx.x == 0) {
+        const ptrdiff_t total_tx_bytes = static_cast<ptrdiff_t>(
+            static_cast<int64_t>(tx_rows) * tx_cols * sizeof(packed_t));
+        cuda::device::barrier_expect_tx(hopper_barrier, total_tx_bytes);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            shared_tile,
+            tensor_map,
+            fast_dim_offset,
+            slow_dim_offset,
+            hopper_barrier);
+    }
+#else
+    (void)shared_tile;
+    (void)tensor_map;
+    (void)fast_dim_offset;
+    (void)slow_dim_offset;
+    (void)tx_rows;
+    (void)tx_cols;
+    (void)hopper_barrier;
+#endif
+}
+
+__device__ __forceinline__ void enqueue_sm90_tma_float_tile_pair_async(
+    float* __restrict__ dest_tile_shared,
+    float* __restrict__ source_tile_shared,
+    const CUtensorMap* source_tensor_map,
+    const CUtensorMap* dest_tensor_map,
+    int state_start,
+    int rank_start,
+    int num_states,
+    int staged_rank_chunk,
+    int tile_size,
+    HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    if (threadIdx.x == 0) {
+        const ptrdiff_t total_tx_bytes = static_cast<ptrdiff_t>(
+            (static_cast<int64_t>(staged_rank_chunk) * tile_size
+             + static_cast<int64_t>(num_states) * staged_rank_chunk) * sizeof(float));
+        cuda::device::barrier_expect_tx(hopper_barrier, total_tx_bytes);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            dest_tile_shared,
+            dest_tensor_map,
+            state_start,
+            rank_start,
+            hopper_barrier);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            source_tile_shared,
+            source_tensor_map,
+            rank_start,
+            0,
+            hopper_barrier);
+    }
+#else
+    (void)dest_tile_shared;
+    (void)source_tile_shared;
+    (void)source_tensor_map;
+    (void)dest_tensor_map;
+    (void)state_start;
+    (void)rank_start;
+    (void)num_states;
+    (void)staged_rank_chunk;
+    (void)tile_size;
     (void)hopper_barrier;
 #endif
 }
@@ -7500,6 +7935,8 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const scalar_t* __restrict__ local_logits,
     const float* __restrict__ transition_source_probs,
     const float* __restrict__ transition_dest_probs,
+    const CUtensorMap* __restrict__ transition_source_tensor_map,
+    const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
     float transition_gate,
@@ -7523,7 +7960,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
     __shared__ int current_batch;
-    __shared__ HopperStageBarrier hopper_stage_barrier;
+    __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
@@ -7551,11 +7988,11 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     auto tile_pipe = cuda::make_pipeline();
     HopperStageBarrier* hopper_barrier = nullptr;
     if constexpr (Sm90Path) {
+        hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
         if (tid == 0) {
-            init(&hopper_stage_barrier, 1);
+            init(hopper_barrier, 1);
         }
         __syncthreads();
-        hopper_barrier = &hopper_stage_barrier;
     }
     const bool use_tensor_core_math =
         tensor_core_math_enabled_for_scalar<scalar_t>()
@@ -7622,21 +8059,45 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             const int rank_start = next_tile_to_launch * staged_rank_chunk;
                             const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
                             const int stage_slot = next_tile_to_launch % pipeline_stages;
-                            enqueue_float_matrix_pair_slice_async(
-                                tile_pipe,
-                                dest_tile_shared + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size,
-                                transition_dest_probs + static_cast<int64_t>(rank_start) * num_states + state_start,
-                                num_states,
-                                active_rank,
-                                active_states,
-                                static_cast<int>(tile_size),
-                                source_tile_shared + static_cast<int64_t>(stage_slot) * num_states * staged_rank_chunk,
-                                transition_source_probs + rank_start,
-                                transition_rank,
-                                num_states,
-                                active_rank,
-                                staged_rank_chunk,
-                                hopper_barrier);
+                            float* staged_dest_tile = dest_tile_shared
+                                + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size;
+                            float* staged_source_tile = source_tile_shared
+                                + static_cast<int64_t>(stage_slot) * num_states * staged_rank_chunk;
+                            if (can_use_sm90_tma_float_tile_async(
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    active_rank,
+                                    active_states,
+                                    staged_rank_chunk,
+                                    tile_size)) {
+                                enqueue_sm90_tma_float_tile_pair_async(
+                                    staged_dest_tile,
+                                    staged_source_tile,
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    tile_size,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_pair_slice_async(
+                                    tile_pipe,
+                                    staged_dest_tile,
+                                    transition_dest_probs + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                    num_states,
+                                    active_rank,
+                                    active_states,
+                                    static_cast<int>(tile_size),
+                                    staged_source_tile,
+                                    transition_source_probs + rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    active_rank,
+                                    staged_rank_chunk,
+                                    hopper_barrier);
+                            }
                         }
                         if (initial_prefetch > 0) {
                             wait_for_async_tile(tile_pipe, hopper_barrier);
@@ -7650,21 +8111,45 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
                                 const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
                                 const int next_stage = next_tile_to_launch % pipeline_stages;
-                                enqueue_float_matrix_pair_slice_async(
-                                    tile_pipe,
-                                    dest_tile_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
-                                    transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
-                                    num_states,
-                                    next_active_rank,
-                                    active_states,
-                                    static_cast<int>(tile_size),
-                                    source_tile_shared + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk,
-                                    transition_source_probs + next_rank_start,
-                                    transition_rank,
-                                    num_states,
-                                    next_active_rank,
-                                    staged_rank_chunk,
-                                    hopper_barrier);
+                                float* staged_dest_tile = dest_tile_shared
+                                    + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size;
+                                float* staged_source_tile = source_tile_shared
+                                    + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk;
+                                if (can_use_sm90_tma_float_tile_async(
+                                        transition_source_tensor_map,
+                                        transition_dest_tensor_map,
+                                        next_active_rank,
+                                        active_states,
+                                        staged_rank_chunk,
+                                        tile_size)) {
+                                    enqueue_sm90_tma_float_tile_pair_async(
+                                        staged_dest_tile,
+                                        staged_source_tile,
+                                        transition_source_tensor_map,
+                                        transition_dest_tensor_map,
+                                        state_start,
+                                        next_rank_start,
+                                        num_states,
+                                        staged_rank_chunk,
+                                        tile_size,
+                                        *hopper_barrier);
+                                } else {
+                                    enqueue_float_matrix_pair_slice_async(
+                                        tile_pipe,
+                                        staged_dest_tile,
+                                        transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                        num_states,
+                                        next_active_rank,
+                                        active_states,
+                                        static_cast<int>(tile_size),
+                                        staged_source_tile,
+                                        transition_source_probs + next_rank_start,
+                                        transition_rank,
+                                        num_states,
+                                        next_active_rank,
+                                        staged_rank_chunk,
+                                        hopper_barrier);
+                                }
                                 ++next_tile_to_launch;
                             }
                             const float* current_source_tile = source_tile_shared
@@ -8140,6 +8625,8 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     const scalar_t* __restrict__ grad_final_belief,
     const float* __restrict__ transition_source_probs,
     const float* __restrict__ transition_dest_probs,
+    const CUtensorMap* __restrict__ transition_source_tensor_map,
+    const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
@@ -8176,7 +8663,9 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int staged_rank_chunk = max(1, min(split_size, Sm90Path ? kSm90AsyncTileRankChunk : kAsyncTileRankChunk));
+    const int pipeline_stages = async_tile_pipeline_stages<Sm90Path>();
     __shared__ int current_batch;
+    __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const int block_slot = static_cast<int>(blockIdx.x);
     float* latent_cache = latent_cache_staging + static_cast<int64_t>(block_slot) * transition_rank;
     float* grad_latent_accum = grad_latent_accum_staging
@@ -8199,10 +8688,18 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     float* scratch = grad_mix_tile + tile_size;
     float* dest_tile_shared = scratch + num_warps;
     float* source_tile_shared = dest_tile_shared
-        + static_cast<int64_t>(kAsyncTilePipelineStages) * staged_rank_chunk * tile_size;
+        + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size;
     auto tile_pipe = cuda::make_pipeline();
+    HopperStageBarrier* hopper_barrier = nullptr;
+    if constexpr (Sm90Path) {
+        hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
+        if (tid == 0) {
+            init(hopper_barrier, 1);
+        }
+        __syncthreads();
+    }
     char* tensor_core_workspace_raw = reinterpret_cast<char*>(
-        source_tile_shared + static_cast<int64_t>(kAsyncTilePipelineStages) * num_states * staged_rank_chunk);
+        source_tile_shared + static_cast<int64_t>(pipeline_stages) * num_states * staged_rank_chunk);
     std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
     tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
     char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
@@ -8269,34 +8766,81 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                 __syncthreads();
 
                 if (transition_rank > 0) {
-                    int current_rank_start = 0;
-                    int current_active_rank = min(staged_rank_chunk, transition_rank);
-                    int current_stage = 0;
-                    enqueue_float_matrix_slice_async(
-                        tile_pipe,
-                        source_tile_shared,
-                        transition_source_probs,
-                        transition_rank,
-                        num_states,
-                        current_active_rank,
-                        staged_rank_chunk);
-                    wait_for_async_tile(tile_pipe);
-                    __syncthreads();
-                    while (current_rank_start < transition_rank) {
-                        const int next_rank_start = current_rank_start + current_active_rank;
-                        const int next_active_rank = next_rank_start < transition_rank
-                            ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                            : 0;
-                        const int next_stage = current_stage ^ 1;
-                        if (next_active_rank > 0) {
+                    const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                    int next_tile_to_launch = 0;
+                    const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                    for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                        const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                        const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                        const int stage_slot = next_tile_to_launch % pipeline_stages;
+                        float* staged_source_tile = source_tile_shared
+                            + static_cast<int64_t>(stage_slot) * num_states * staged_rank_chunk;
+                        if (can_use_sm90_tma_float_matrix_slice_async(
+                                transition_source_tensor_map,
+                                active_rank,
+                                num_states,
+                                staged_rank_chunk,
+                                num_states)) {
+                            enqueue_sm90_tma_float_matrix_slice_async(
+                                staged_source_tile,
+                                transition_source_tensor_map,
+                                rank_start,
+                                0,
+                                num_states,
+                                staged_rank_chunk,
+                                *hopper_barrier);
+                        } else {
                             enqueue_float_matrix_slice_async(
                                 tile_pipe,
-                                source_tile_shared + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk,
-                                transition_source_probs + next_rank_start,
+                                staged_source_tile,
+                                transition_source_probs + rank_start,
                                 transition_rank,
                                 num_states,
-                                next_active_rank,
-                                staged_rank_chunk);
+                                active_rank,
+                                staged_rank_chunk,
+                                hopper_barrier);
+                        }
+                    }
+                    if (initial_prefetch > 0) {
+                        wait_for_async_tile(tile_pipe, hopper_barrier);
+                        __syncthreads();
+                    }
+                    for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                        const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                        const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                        const int current_stage = rank_tile_idx % pipeline_stages;
+                        if (next_tile_to_launch < total_rank_tiles) {
+                            const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                            const int next_stage = next_tile_to_launch % pipeline_stages;
+                            float* staged_source_tile = source_tile_shared
+                                + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk;
+                            if (can_use_sm90_tma_float_matrix_slice_async(
+                                    transition_source_tensor_map,
+                                    next_active_rank,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    num_states)) {
+                                enqueue_sm90_tma_float_matrix_slice_async(
+                                    staged_source_tile,
+                                    transition_source_tensor_map,
+                                    next_rank_start,
+                                    0,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_slice_async(
+                                    tile_pipe,
+                                    staged_source_tile,
+                                    transition_source_probs + next_rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    next_active_rank,
+                                    staged_rank_chunk,
+                                    hopper_barrier);
+                            }
+                            ++next_tile_to_launch;
                         }
                         const float* current_source_tile = source_tile_shared
                             + static_cast<int64_t>(current_stage) * num_states * staged_rank_chunk;
@@ -8344,13 +8888,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 grad_latent_accum[current_rank_start + r] = 0.0f;
                             }
                         }
-                        if (next_active_rank > 0) {
-                            wait_for_async_tile(tile_pipe);
+                        if (rank_tile_idx + 1 < total_rank_tiles) {
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
                         }
                         __syncthreads();
-                        current_rank_start = next_rank_start;
-                        current_active_rank = next_active_rank;
-                        current_stage = next_stage;
                     }
                 }
 
@@ -8362,34 +8903,81 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                     __syncthreads();
 
                     if (transition_rank > 0) {
-                        int current_rank_start = 0;
-                        int current_active_rank = min(staged_rank_chunk, transition_rank);
-                        int current_stage = 0;
-                        enqueue_float_matrix_slice_async(
-                            tile_pipe,
-                            dest_tile_shared,
-                            transition_dest_probs + state_start,
-                            num_states,
-                            current_active_rank,
-                            active_states,
-                            static_cast<int>(tile_size));
-                        wait_for_async_tile(tile_pipe);
-                        __syncthreads();
-                        while (current_rank_start < transition_rank) {
-                            const int next_rank_start = current_rank_start + current_active_rank;
-                            const int next_active_rank = next_rank_start < transition_rank
-                                ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                                : 0;
-                            const int next_stage = current_stage ^ 1;
-                            if (next_active_rank > 0) {
+                        const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                        int next_tile_to_launch = 0;
+                        const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                        for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                            const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                            const int stage_slot = next_tile_to_launch % pipeline_stages;
+                            float* staged_dest_tile = dest_tile_shared
+                                + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size;
+                            if (can_use_sm90_tma_float_matrix_slice_async(
+                                    transition_dest_tensor_map,
+                                    active_states,
+                                    active_rank,
+                                    tile_size,
+                                    staged_rank_chunk)) {
+                                enqueue_sm90_tma_float_matrix_slice_async(
+                                    staged_dest_tile,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    active_rank,
+                                    active_states,
+                                    *hopper_barrier);
+                            } else {
                                 enqueue_float_matrix_slice_async(
                                     tile_pipe,
-                                    dest_tile_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
-                                    transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                    staged_dest_tile,
+                                    transition_dest_probs + static_cast<int64_t>(rank_start) * num_states + state_start,
                                     num_states,
-                                    next_active_rank,
+                                    active_rank,
                                     active_states,
-                                    static_cast<int>(tile_size));
+                                    static_cast<int>(tile_size),
+                                    hopper_barrier);
+                            }
+                        }
+                        if (initial_prefetch > 0) {
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
+                            __syncthreads();
+                        }
+                        for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                            const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                            const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                            const int current_stage = rank_tile_idx % pipeline_stages;
+                            if (next_tile_to_launch < total_rank_tiles) {
+                                const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                                const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                                const int next_stage = next_tile_to_launch % pipeline_stages;
+                                float* staged_dest_tile = dest_tile_shared
+                                    + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size;
+                                if (can_use_sm90_tma_float_matrix_slice_async(
+                                        transition_dest_tensor_map,
+                                        active_states,
+                                        next_active_rank,
+                                        tile_size,
+                                        staged_rank_chunk)) {
+                                    enqueue_sm90_tma_float_matrix_slice_async(
+                                        staged_dest_tile,
+                                        transition_dest_tensor_map,
+                                        state_start,
+                                        next_rank_start,
+                                        next_active_rank,
+                                        active_states,
+                                        *hopper_barrier);
+                                } else {
+                                    enqueue_float_matrix_slice_async(
+                                        tile_pipe,
+                                        staged_dest_tile,
+                                        transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                        num_states,
+                                        next_active_rank,
+                                        active_states,
+                                        static_cast<int>(tile_size),
+                                        hopper_barrier);
+                                }
+                                ++next_tile_to_launch;
                             }
                             for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                 latent[r] = latent_cache[current_rank_start + r];
@@ -8432,13 +9020,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                         current_active_rank);
                                 }
                             }
-                            if (next_active_rank > 0) {
-                                wait_for_async_tile(tile_pipe);
+                            if (rank_tile_idx + 1 < total_rank_tiles) {
+                                wait_for_async_tile(tile_pipe, hopper_barrier);
                             }
                             __syncthreads();
-                            current_rank_start = next_rank_start;
-                            current_active_rank = next_active_rank;
-                            current_stage = next_stage;
                         }
                     }
 
@@ -8483,34 +9068,81 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                     __syncthreads();
 
                     if (transition_rank > 0) {
-                        int current_rank_start = 0;
-                        int current_active_rank = min(staged_rank_chunk, transition_rank);
-                        int current_stage = 0;
-                        enqueue_float_matrix_slice_async(
-                            tile_pipe,
-                            dest_tile_shared,
-                            transition_dest_probs + state_start,
-                            num_states,
-                            current_active_rank,
-                            active_states,
-                            static_cast<int>(tile_size));
-                        wait_for_async_tile(tile_pipe);
-                        __syncthreads();
-                        while (current_rank_start < transition_rank) {
-                            const int next_rank_start = current_rank_start + current_active_rank;
-                            const int next_active_rank = next_rank_start < transition_rank
-                                ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                                : 0;
-                            const int next_stage = current_stage ^ 1;
-                            if (next_active_rank > 0) {
+                        const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                        int next_tile_to_launch = 0;
+                        const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                        for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                            const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                            const int stage_slot = next_tile_to_launch % pipeline_stages;
+                            float* staged_dest_tile = dest_tile_shared
+                                + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size;
+                            if (can_use_sm90_tma_float_matrix_slice_async(
+                                    transition_dest_tensor_map,
+                                    active_states,
+                                    active_rank,
+                                    tile_size,
+                                    staged_rank_chunk)) {
+                                enqueue_sm90_tma_float_matrix_slice_async(
+                                    staged_dest_tile,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    active_rank,
+                                    active_states,
+                                    *hopper_barrier);
+                            } else {
                                 enqueue_float_matrix_slice_async(
                                     tile_pipe,
-                                    dest_tile_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
-                                    transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                    staged_dest_tile,
+                                    transition_dest_probs + static_cast<int64_t>(rank_start) * num_states + state_start,
                                     num_states,
-                                    next_active_rank,
+                                    active_rank,
                                     active_states,
-                                    static_cast<int>(tile_size));
+                                    static_cast<int>(tile_size),
+                                    hopper_barrier);
+                            }
+                        }
+                        if (initial_prefetch > 0) {
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
+                            __syncthreads();
+                        }
+                        for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                            const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                            const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                            const int current_stage = rank_tile_idx % pipeline_stages;
+                            if (next_tile_to_launch < total_rank_tiles) {
+                                const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                                const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                                const int next_stage = next_tile_to_launch % pipeline_stages;
+                                float* staged_dest_tile = dest_tile_shared
+                                    + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size;
+                                if (can_use_sm90_tma_float_matrix_slice_async(
+                                        transition_dest_tensor_map,
+                                        active_states,
+                                        next_active_rank,
+                                        tile_size,
+                                        staged_rank_chunk)) {
+                                    enqueue_sm90_tma_float_matrix_slice_async(
+                                        staged_dest_tile,
+                                        transition_dest_tensor_map,
+                                        state_start,
+                                        next_rank_start,
+                                        next_active_rank,
+                                        active_states,
+                                        *hopper_barrier);
+                                } else {
+                                    enqueue_float_matrix_slice_async(
+                                        tile_pipe,
+                                        staged_dest_tile,
+                                        transition_dest_probs + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                        num_states,
+                                        next_active_rank,
+                                        active_states,
+                                        static_cast<int>(tile_size),
+                                        hopper_barrier);
+                                }
+                                ++next_tile_to_launch;
                             }
                             for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                 latent[r] = latent_cache[current_rank_start + r];
@@ -8577,47 +9209,91 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                     grad_latent_accum[r_idx] += grad_latent_value;
                                 }
                             }
-                            if (next_active_rank > 0) {
-                                wait_for_async_tile(tile_pipe);
+                            if (rank_tile_idx + 1 < total_rank_tiles) {
+                                wait_for_async_tile(tile_pipe, hopper_barrier);
                             }
                             __syncthreads();
-                            current_rank_start = next_rank_start;
-                            current_active_rank = next_active_rank;
-                            current_stage = next_stage;
                         }
                     }
                 }
 
                 __syncthreads();
                 if (transition_rank > 0) {
-                    int current_rank_start = 0;
-                    int current_active_rank = min(staged_rank_chunk, transition_rank);
-                    int current_stage = 0;
-                    enqueue_float_matrix_slice_async(
-                        tile_pipe,
-                        source_tile_shared,
-                        transition_source_probs,
-                        transition_rank,
-                        num_states,
-                        current_active_rank,
-                        staged_rank_chunk);
-                    wait_for_async_tile(tile_pipe);
-                    __syncthreads();
-                    while (current_rank_start < transition_rank) {
-                        const int next_rank_start = current_rank_start + current_active_rank;
-                        const int next_active_rank = next_rank_start < transition_rank
-                            ? min(staged_rank_chunk, transition_rank - next_rank_start)
-                            : 0;
-                        const int next_stage = current_stage ^ 1;
-                        if (next_active_rank > 0) {
+                    const int total_rank_tiles = (transition_rank + staged_rank_chunk - 1) / staged_rank_chunk;
+                    int next_tile_to_launch = 0;
+                    const int initial_prefetch = min(pipeline_stages, total_rank_tiles);
+                    for (; next_tile_to_launch < initial_prefetch; ++next_tile_to_launch) {
+                        const int rank_start = next_tile_to_launch * staged_rank_chunk;
+                        const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                        const int stage_slot = next_tile_to_launch % pipeline_stages;
+                        float* staged_source_tile = source_tile_shared
+                            + static_cast<int64_t>(stage_slot) * num_states * staged_rank_chunk;
+                        if (can_use_sm90_tma_float_matrix_slice_async(
+                                transition_source_tensor_map,
+                                active_rank,
+                                num_states,
+                                staged_rank_chunk,
+                                num_states)) {
+                            enqueue_sm90_tma_float_matrix_slice_async(
+                                staged_source_tile,
+                                transition_source_tensor_map,
+                                rank_start,
+                                0,
+                                num_states,
+                                staged_rank_chunk,
+                                *hopper_barrier);
+                        } else {
                             enqueue_float_matrix_slice_async(
                                 tile_pipe,
-                                source_tile_shared + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk,
-                                transition_source_probs + next_rank_start,
+                                staged_source_tile,
+                                transition_source_probs + rank_start,
                                 transition_rank,
                                 num_states,
-                                next_active_rank,
-                                staged_rank_chunk);
+                                active_rank,
+                                staged_rank_chunk,
+                                hopper_barrier);
+                        }
+                    }
+                    if (initial_prefetch > 0) {
+                        wait_for_async_tile(tile_pipe, hopper_barrier);
+                        __syncthreads();
+                    }
+                    for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
+                        const int current_rank_start = rank_tile_idx * staged_rank_chunk;
+                        const int current_active_rank = min(staged_rank_chunk, transition_rank - current_rank_start);
+                        const int current_stage = rank_tile_idx % pipeline_stages;
+                        if (next_tile_to_launch < total_rank_tiles) {
+                            const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
+                            const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
+                            const int next_stage = next_tile_to_launch % pipeline_stages;
+                            float* staged_source_tile = source_tile_shared
+                                + static_cast<int64_t>(next_stage) * num_states * staged_rank_chunk;
+                            if (can_use_sm90_tma_float_matrix_slice_async(
+                                    transition_source_tensor_map,
+                                    next_active_rank,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    num_states)) {
+                                enqueue_sm90_tma_float_matrix_slice_async(
+                                    staged_source_tile,
+                                    transition_source_tensor_map,
+                                    next_rank_start,
+                                    0,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_slice_async(
+                                    tile_pipe,
+                                    staged_source_tile,
+                                    transition_source_probs + next_rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    next_active_rank,
+                                    staged_rank_chunk,
+                                    hopper_barrier);
+                            }
+                            ++next_tile_to_launch;
                         }
                         for (int r = tid; r < current_active_rank; r += blockDim.x) {
                             latent[r] = grad_latent_accum[current_rank_start + r];
@@ -8678,13 +9354,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 next_carry[src] += carry_contrib;
                             }
                         }
-                        if (next_active_rank > 0) {
-                            wait_for_async_tile(tile_pipe);
+                        if (rank_tile_idx + 1 < total_rank_tiles) {
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
                         }
                         __syncthreads();
-                        current_rank_start = next_rank_start;
-                        current_active_rank = next_active_rank;
-                        current_stage = next_stage;
                     }
                 }
 
@@ -8743,6 +9416,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const packed_t* __restrict__ transition_source_packed,
     const float* __restrict__ transition_source_scales,
     const packed_t* __restrict__ transition_dest_packed,
+    const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const float* __restrict__ transition_dest_scales,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
@@ -8767,7 +9441,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
     __shared__ int current_batch;
-    __shared__ HopperStageBarrier hopper_stage_barrier;
+    __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
@@ -8783,15 +9457,30 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     float* dest_tile_shared = tile_stats + 2;
     packed_t* dest_tile_packed_shared = reinterpret_cast<packed_t*>(
         dest_tile_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
+    char* tensor_core_workspace_raw = reinterpret_cast<char*>(
+        dest_tile_packed_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
+    std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
+    tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
+    char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
+    using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
+    tensor_core_input_t* tensor_core_lhs = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
+    float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
     auto tile_pipe = cuda::make_pipeline();
     HopperStageBarrier* hopper_barrier = nullptr;
     if constexpr (Sm90Path) {
+        hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
         if (tid == 0) {
-            init(&hopper_stage_barrier, 1);
+            init(hopper_barrier, 1);
         }
         __syncthreads();
-        hopper_barrier = &hopper_stage_barrier;
     }
+    const bool use_tensor_core_math =
+        tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
     const bool use_global_score_cache = native_score_filtering_enabled(score_threshold, score_topk, num_states);
 
     while (true) {
@@ -8850,15 +9539,33 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             const int rank_start = next_tile_to_launch * staged_rank_chunk;
                             const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
                             const int stage_slot = next_tile_to_launch % pipeline_stages;
-                            enqueue_packed_matrix_slice_async(
-                                tile_pipe,
-                                dest_tile_packed_shared + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size,
-                                transition_dest_packed + static_cast<int64_t>(rank_start) * num_states + state_start,
-                                num_states,
-                                active_rank,
-                                active_states,
-                                tile_size,
-                                hopper_barrier);
+                            packed_t* staged_dest_tile = dest_tile_packed_shared
+                                + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size;
+                            if (can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
+                                    transition_dest_tensor_map,
+                                    active_states,
+                                    active_rank,
+                                    tile_size,
+                                    staged_rank_chunk)) {
+                                enqueue_sm90_tma_packed_matrix_slice_async(
+                                    staged_dest_tile,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    active_states,
+                                    active_rank,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_packed_matrix_slice_async(
+                                    tile_pipe,
+                                    staged_dest_tile,
+                                    transition_dest_packed + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                    num_states,
+                                    active_rank,
+                                    active_states,
+                                    tile_size,
+                                    hopper_barrier);
+                            }
                         }
                         if (initial_prefetch > 0) {
                             wait_for_async_tile(tile_pipe, hopper_barrier);
@@ -8872,25 +9579,86 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 const int next_rank_start = next_tile_to_launch * staged_rank_chunk;
                                 const int next_active_rank = min(staged_rank_chunk, transition_rank - next_rank_start);
                                 const int next_stage = next_tile_to_launch % pipeline_stages;
-                                enqueue_packed_matrix_slice_async(
-                                    tile_pipe,
-                                    dest_tile_packed_shared + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size,
-                                    transition_dest_packed + static_cast<int64_t>(next_rank_start) * num_states + state_start,
-                                    num_states,
-                                    next_active_rank,
-                                    active_states,
-                                    tile_size,
-                                    hopper_barrier);
+                                packed_t* staged_dest_tile = dest_tile_packed_shared
+                                    + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size;
+                                if (can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
+                                        transition_dest_tensor_map,
+                                        active_states,
+                                        next_active_rank,
+                                        tile_size,
+                                        staged_rank_chunk)) {
+                                    enqueue_sm90_tma_packed_matrix_slice_async(
+                                        staged_dest_tile,
+                                        transition_dest_tensor_map,
+                                        state_start,
+                                        next_rank_start,
+                                        active_states,
+                                        next_active_rank,
+                                        *hopper_barrier);
+                                } else {
+                                    enqueue_packed_matrix_slice_async(
+                                        tile_pipe,
+                                        staged_dest_tile,
+                                        transition_dest_packed + static_cast<int64_t>(next_rank_start) * num_states + state_start,
+                                        num_states,
+                                        next_active_rank,
+                                        active_states,
+                                        tile_size,
+                                        hopper_barrier);
+                                }
                                 ++next_tile_to_launch;
                             }
-                            for (int r = tid; r < current_active_rank; r += blockDim.x) {
-                                latent[r] = packed_column_dot_lowp<packed_t, Format>(
-                                    prev_prob,
-                                    transition_source_packed,
-                                    transition_source_scales,
-                                    num_states,
-                                    transition_rank,
-                                    current_rank_start + r);
+                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    latent[r] = 0.0f;
+                                }
+                                __syncthreads();
+                                for (int src_start = 0; src_start < num_states; src_start += kTensorCoreTile) {
+                                    const int active_src = min(kTensorCoreTile, num_states - src_start);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_src == kTensorCoreTile) {
+                                        load_packed_matrix_tile_rowmajor_16x16<packed_t, Format>(
+                                            transition_source_packed,
+                                            transition_source_scales,
+                                            transition_rank,
+                                            src_start,
+                                            current_rank_start,
+                                            active_src,
+                                            current_active_rank,
+                                            tensor_core_matrix);
+                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                            prev_prob + src_start,
+                                            tensor_core_matrix,
+                                            kTensorCoreTile,
+                                            tensor_core_lhs,
+                                            tensor_core_rhs,
+                                            tensor_core_accum,
+                                            latent);
+                                    } else
+#endif
+                                    {
+                                        for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                            latent[r] += packed_column_dot_lowp<packed_t, Format>(
+                                                prev_prob + src_start,
+                                                transition_source_packed + static_cast<int64_t>(src_start) * transition_rank + current_rank_start + r,
+                                                transition_source_scales + src_start,
+                                                active_src,
+                                                transition_rank,
+                                                0);
+                                        }
+                                        __syncthreads();
+                                    }
+                                }
+                            } else {
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    latent[r] = packed_column_dot_lowp<packed_t, Format>(
+                                        prev_prob,
+                                        transition_source_packed,
+                                        transition_source_scales,
+                                        num_states,
+                                        transition_rank,
+                                        current_rank_start + r);
+                                }
                             }
                             const packed_t* current_packed_tile = dest_tile_packed_shared
                                 + static_cast<int64_t>(current_stage) * staged_rank_chunk * tile_size;
@@ -8914,12 +9682,40 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 }
                             }
                             __syncthreads();
-                            for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {
-                                score_cache[state_start + dst_local] += lowp_dot_rhs_strided(
-                                    latent,
-                                    dest_tile_shared + dst_local,
-                                    tile_size,
-                                    current_active_rank);
+                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                            latent,
+                                            dest_tile_shared + dst_subtile,
+                                            tile_size,
+                                            tensor_core_lhs,
+                                            tensor_core_rhs,
+                                            tensor_core_accum,
+                                            score_cache + state_start + dst_subtile);
+                                    } else
+#endif
+                                    {
+                                        for (int dst_local = dst_subtile + tid; dst_local < dst_subtile + active_dst; dst_local += blockDim.x) {
+                                            score_cache[state_start + dst_local] += lowp_dot_rhs_strided(
+                                                latent,
+                                                dest_tile_shared + dst_local,
+                                                tile_size,
+                                                current_active_rank);
+                                        }
+                                        __syncthreads();
+                                    }
+                                }
+                            } else {
+                                for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {
+                                    score_cache[state_start + dst_local] += lowp_dot_rhs_strided(
+                                        latent,
+                                        dest_tile_shared + dst_local,
+                                        tile_size,
+                                        current_active_rank);
+                                }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
                                 wait_for_async_tile(tile_pipe, hopper_barrier);
@@ -11478,6 +12274,31 @@ void launch_forward_tiled_chunk(
         stream,
         launch_config.device_index,
         {&transition_source_probs, &transition_dest_probs});
+    DeviceTensorMapDescriptor source_tensor_map_desc;
+    DeviceTensorMapDescriptor dest_tensor_map_desc;
+    if (sm90_path && can_use_tma(local_logits.get_device())) {
+        const int staged_rank_chunk = max(
+            1,
+            min(static_cast<int>(split_size), kSm90AsyncTileRankChunk));
+        source_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_source_probs,
+            transition_source_probs.data_ptr<float>(),
+            transition_rank,
+            num_states,
+            static_cast<int64_t>(transition_rank) * sizeof(float),
+            staged_rank_chunk,
+            num_states,
+            stream);
+        dest_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_dest_probs,
+            transition_dest_probs.data_ptr<float>(),
+            num_states,
+            transition_rank,
+            static_cast<int64_t>(num_states) * sizeof(float),
+            static_cast<int>(tile_size),
+            staged_rank_chunk,
+            stream);
+    }
     if (sm90_path) {
         causal_machine_forward_tiled_chunk_kernel<scalar_t, true><<<
             launch_config.grid,
@@ -11487,6 +12308,8 @@ void launch_forward_tiled_chunk(
                 local_logits.data_ptr<scalar_t>(),
                 transition_source_probs.data_ptr<float>(),
                 transition_dest_probs.data_ptr<float>(),
+                source_tensor_map_desc.device_ptr,
+                dest_tensor_map_desc.device_ptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 static_cast<float>(transition_gate),
@@ -11517,6 +12340,8 @@ void launch_forward_tiled_chunk(
                 local_logits.data_ptr<scalar_t>(),
                 transition_source_probs.data_ptr<float>(),
                 transition_dest_probs.data_ptr<float>(),
+                nullptr,
+                nullptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 static_cast<float>(transition_gate),
@@ -11882,6 +12707,21 @@ void launch_forward_tiled_chunk_packed(
         stream,
         launch_config.device_index,
         {&transition_source_packed, &transition_dest_packed, &transition_source_scales, &transition_dest_scales});
+    DeviceTensorMapDescriptor dest_tensor_map_desc;
+    if (sm90_path && can_use_tma(local_logits.get_device())) {
+        const int staged_rank_chunk = max(
+            1,
+            min(static_cast<int>(split_size), kSm90AsyncTileRankChunk));
+        dest_tensor_map_desc = encode_tma_descriptor_2d_packed<packed_t>(
+            transition_dest_packed,
+            transition_dest_packed.data_ptr<packed_t>(),
+            num_states,
+            transition_rank,
+            static_cast<int64_t>(num_states) * sizeof(packed_t),
+            static_cast<int>(tile_size),
+            staged_rank_chunk,
+            stream);
+    }
     if (sm90_path) {
         causal_machine_forward_tiled_chunk_packed_kernel<scalar_t, packed_t, Format, true><<<
             launch_config.grid,
@@ -11892,6 +12732,7 @@ void launch_forward_tiled_chunk_packed(
                 transition_source_packed.data_ptr<packed_t>(),
                 transition_source_scales.data_ptr<float>(),
                 transition_dest_packed.data_ptr<packed_t>(),
+                dest_tensor_map_desc.device_ptr,
                 transition_dest_scales.data_ptr<float>(),
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
@@ -11924,6 +12765,7 @@ void launch_forward_tiled_chunk_packed(
                 transition_source_packed.data_ptr<packed_t>(),
                 transition_source_scales.data_ptr<float>(),
                 transition_dest_packed.data_ptr<packed_t>(),
+                nullptr,
                 transition_dest_scales.data_ptr<float>(),
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
@@ -12031,6 +12873,31 @@ void launch_backward_tiled_chunk(
         stream,
         launch_config.device_index,
         {&transition_source_probs, &transition_dest_probs});
+    DeviceTensorMapDescriptor source_tensor_map_desc;
+    DeviceTensorMapDescriptor dest_tensor_map_desc;
+    if (sm90_path && can_use_tma(beliefs.get_device())) {
+        const int staged_rank_chunk = max(
+            1,
+            min(static_cast<int>(split_size), kSm90AsyncTileRankChunk));
+        source_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_source_probs,
+            transition_source_probs.data_ptr<float>(),
+            transition_rank,
+            num_states,
+            static_cast<int64_t>(transition_rank) * sizeof(float),
+            staged_rank_chunk,
+            num_states,
+            stream);
+        dest_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_dest_probs,
+            transition_dest_probs.data_ptr<float>(),
+            num_states,
+            transition_rank,
+            static_cast<int64_t>(num_states) * sizeof(float),
+            static_cast<int>(tile_size),
+            staged_rank_chunk,
+            stream);
+    }
     if (sm90_path) {
         causal_machine_backward_tiled_chunk_kernel<scalar_t, true><<<
             launch_config.grid,
@@ -12041,6 +12908,8 @@ void launch_backward_tiled_chunk(
                 grad_final_belief.data_ptr<scalar_t>(),
                 transition_source_probs.data_ptr<float>(),
                 transition_dest_probs.data_ptr<float>(),
+                source_tensor_map_desc.device_ptr,
+                dest_tensor_map_desc.device_ptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
@@ -12083,6 +12952,8 @@ void launch_backward_tiled_chunk(
                 grad_final_belief.data_ptr<scalar_t>(),
                 transition_source_probs.data_ptr<float>(),
                 transition_dest_probs.data_ptr<float>(),
+                nullptr,
+                nullptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
@@ -13414,17 +14285,11 @@ bool causal_machine_scan_can_use_wmma_cuda(int64_t device_index) {
 }
 
 bool causal_machine_scan_can_use_tma_cuda(int64_t device_index) {
-    (void)device_index;
-    // Hopper-class hardware support exists architecturally, but the structured
-    // scan kernels do not yet implement a real TMA path.
-    return false;
+    return can_use_tma(static_cast<int>(device_index));
 }
 
 bool causal_machine_scan_can_use_wgmma_cuda(int64_t device_index) {
-    (void)device_index;
-    // Hopper-class hardware support exists architecturally, but the structured
-    // scan kernels do not yet implement a real WGMMA path.
-    return false;
+    return can_use_wgmma(static_cast<int>(device_index));
 }
 
 std::vector<int64_t> causal_machine_scan_describe_tiled_forward_runtime_cuda(
