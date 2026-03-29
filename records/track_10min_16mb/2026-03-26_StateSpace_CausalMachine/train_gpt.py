@@ -7085,6 +7085,7 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "overtone_embed_init": True,
     "resid_mix_phase_init": True,
     "matrix_lr": 0.0623,
+    "other_matrix_lr_mult": 0.5,
     "scalar_lr": 0.035,
     "tied_embed_lr": 0.004,
     "force_fp16_tied_embed_export": True,
@@ -7481,6 +7482,9 @@ class Hyperparameters:
     token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", str(float(LOCAL_PROXY_RECIPE_COMMON["token_weight_decay"]))))
     matrix_lr = float(os.environ.get("MATRIX_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["matrix_lr"]))))
     mlp_matrix_lr_mult = float(os.environ.get("MLP_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["mlp_matrix_lr_mult"]))))
+    other_matrix_lr_mult = float(
+        os.environ.get("OTHER_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["other_matrix_lr_mult"])))
+    )
     scalar_lr = float(os.environ.get("SCALAR_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["scalar_lr"]))))
     use_muon = bool(int(os.environ.get("USE_MUON", "1")))
     muon_cuda_graph_mode = os.environ.get("MUON_CUDA_GRAPH_MODE", "auto").strip().lower()
@@ -7495,6 +7499,7 @@ class Hyperparameters:
     early_phase_steps = int(os.environ.get("EARLY_PHASE_STEPS", "0"))
     early_muon_attn_lr_scale = float(os.environ.get("EARLY_MUON_ATTN_LR_SCALE", "1.0"))
     early_muon_mlp_lr_scale = float(os.environ.get("EARLY_MUON_MLP_LR_SCALE", "1.0"))
+    early_muon_other_lr_scale = float(os.environ.get("EARLY_MUON_OTHER_LR_SCALE", "1.0"))
     early_muon_wd_scale = float(os.environ.get("EARLY_MUON_WD_SCALE", "1.0"))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
@@ -7530,6 +7535,7 @@ class Hyperparameters:
             "tied_embed_warmup_mult": "TIED_EMBED_WARMUP_MULT",
             "tied_embed_warmup_steps": "TIED_EMBED_WARMUP_STEPS",
             "matrix_lr": "MATRIX_LR",
+            "other_matrix_lr_mult": "OTHER_MATRIX_LR_MULT",
             "scalar_lr": "SCALAR_LR",
             "use_muon": "USE_MUON",
             "muon_cuda_graph_mode": "MUON_CUDA_GRAPH_MODE",
@@ -7541,6 +7547,7 @@ class Hyperparameters:
             "early_phase_steps": "EARLY_PHASE_STEPS",
             "early_muon_attn_lr_scale": "EARLY_MUON_ATTN_LR_SCALE",
             "early_muon_mlp_lr_scale": "EARLY_MUON_MLP_LR_SCALE",
+            "early_muon_other_lr_scale": "EARLY_MUON_OTHER_LR_SCALE",
             "early_muon_wd_scale": "EARLY_MUON_WD_SCALE",
             "warmdown_iters": "WARMDOWN_ITERS",
             "grad_clip_norm": "GRAD_CLIP_NORM",
@@ -7663,6 +7670,9 @@ class Hyperparameters:
                 "muon_momentum_warmup_start": 0.80,
                 "muon_momentum_warmup_steps": 250,
                 "muon_weight_decay": 0.03,
+                "other_matrix_lr_mult": 0.5,
+                "early_phase_steps": 600,
+                "early_muon_other_lr_scale": 0.5,
             },
             "graph_first": {
                 "use_muon": False,
@@ -14907,9 +14917,10 @@ def main() -> None:
         muon_optimizers.append(optimizer_muon_mlp)
         optimizers.append(optimizer_muon_mlp)
     if args.use_muon and other_matrix_params:
+        other_matrix_lr = args.matrix_lr * args.other_matrix_lr_mult
         optimizer_muon_other = Muon(
             other_matrix_params,
-            lr=args.matrix_lr,
+            lr=other_matrix_lr,
             momentum=args.muon_momentum,
             backend_steps=args.muon_backend_steps,
             backend_steps_light=args.muon_backend_steps_light,
@@ -14918,7 +14929,7 @@ def main() -> None:
             capturable=graph_capturable,
         )
         for group in optimizer_muon_other.param_groups:
-            group["base_lr"] = args.matrix_lr
+            group["base_lr"] = other_matrix_lr
         muon_optimizers.append(optimizer_muon_other)
         optimizers.append(optimizer_muon_other)
     if not args.use_muon and attn_matrix_params:
@@ -15414,6 +15425,7 @@ def main() -> None:
         early_frac = early_phase_frac(step)
         attn_lr_scale = 1.0 + early_frac * (args.early_muon_attn_lr_scale - 1.0)
         mlp_lr_scale = 1.0 + early_frac * (args.early_muon_mlp_lr_scale - 1.0)
+        other_lr_scale = 1.0 + early_frac * (args.early_muon_other_lr_scale - 1.0)
         muon_wd_scale = 1.0 + early_frac * (args.early_muon_wd_scale - 1.0)
 
         token_scale = scale * tied_embed_lr_mul(step)
@@ -15423,9 +15435,11 @@ def main() -> None:
                 scaled_lr *= attn_lr_scale
             elif opt is optimizer_muon_mlp:
                 scaled_lr *= mlp_lr_scale
+            elif opt is optimizer_muon_other:
+                scaled_lr *= other_lr_scale
             for group in opt.param_groups:
                 _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
-                if opt is optimizer_muon_attn or opt is optimizer_muon_mlp:
+                if opt is optimizer_muon_attn or opt is optimizer_muon_mlp or opt is optimizer_muon_other:
                     _set_group_scalar(group, "weight_decay", args.muon_weight_decay * muon_wd_scale)
 
         step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
