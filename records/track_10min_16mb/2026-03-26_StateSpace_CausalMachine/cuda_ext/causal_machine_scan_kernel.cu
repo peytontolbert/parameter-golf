@@ -4,6 +4,7 @@
 
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda/barrier>
 #include <cuda_fp8.h>
 #include <mma.h>
 #include <cuda/pipeline>
@@ -36,6 +37,21 @@ constexpr int kMaxTiledBlockThreads = 256;
 constexpr int kAsyncTilePipelineStages = 2;
 constexpr int kSm90AsyncTilePipelineStages = 3;
 constexpr int kTensorCoreTile = 16;
+using HopperStageBarrier = cuda::barrier<cuda::thread_scope_block>;
+
+__device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
+    float* __restrict__ dst0,
+    const float* __restrict__ src0,
+    int src0_stride,
+    int rows0,
+    int cols0,
+    int dst0_stride,
+    float* __restrict__ dst1,
+    const float* __restrict__ src1,
+    int src1_stride,
+    int rows1,
+    int cols1,
+    int dst1_stride);
 
 static_assert(kMaxNumStates % kWarpSize == 0, "small-state kernels assume warp-aligned block sizes");
 static_assert(kMaxTiledBlockThreads % kWarpSize == 0, "tiled kernels assume warp-aligned block sizes");
@@ -1466,6 +1482,20 @@ __device__ __forceinline__ void copy_to_shared_async_or_sync(
     const T* __restrict__ global_src,
     int total_values);
 
+__device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
+    float* __restrict__ dst0,
+    const float* __restrict__ src0,
+    int src0_stride,
+    int rows0,
+    int cols0,
+    int dst0_stride,
+    float* __restrict__ dst1,
+    const float* __restrict__ src1,
+    int src1_stride,
+    int rows1,
+    int cols1,
+    int dst1_stride);
+
 __device__ __forceinline__ float fast_exp(float value);
 __device__ __forceinline__ float fast_log(float value);
 __device__ __forceinline__ float block_log_softmax_norm_128(float value, float* shared, float& exp_value, float& inv_sum);
@@ -2787,8 +2817,86 @@ __device__ __forceinline__ void enqueue_float_matrix_slice_async(
 #endif
 }
 
+template <typename T>
+__device__ __forceinline__ bool can_use_sm90_bulk_copy(
+    const T* __restrict__ dst,
+    const T* __restrict__ src,
+    int count) {
+#if __CUDA_ARCH__ >= 900
+    const size_t bytes = static_cast<size_t>(max(count, 0)) * sizeof(T);
+    return bytes >= 16
+        && (bytes % 16) == 0
+        && (((reinterpret_cast<std::uintptr_t>(dst) | reinterpret_cast<std::uintptr_t>(src)) & 0xfu) == 0);
+#else
+    (void)dst;
+    (void)src;
+    (void)count;
+    return false;
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ bool can_use_sm90_bulk_matrix_slice_async(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int src_stride,
+    int rows,
+    int cols,
+    int dst_stride) {
+#if __CUDA_ARCH__ >= 900
+    if (rows <= 0 || cols <= 0) {
+        return true;
+    }
+    for (int row = 0; row < rows; ++row) {
+        const T* src_row = src + static_cast<int64_t>(row) * src_stride;
+        T* dst_row = dst + static_cast<int64_t>(row) * dst_stride;
+        if (!can_use_sm90_bulk_copy(dst_row, src_row, cols)) {
+            return false;
+        }
+    }
+    return true;
+#else
+    (void)dst;
+    (void)src;
+    (void)src_stride;
+    (void)rows;
+    (void)cols;
+    (void)dst_stride;
+    return false;
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ void enqueue_sm90_bulk_matrix_slice_async(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int src_stride,
+    int rows,
+    int cols,
+    int dst_stride,
+    HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900
+    if (threadIdx.x == 0) {
+        const auto shape = cuda::aligned_size_t<16>(static_cast<size_t>(cols) * sizeof(T));
+        for (int row = 0; row < rows; ++row) {
+            const T* src_row = src + static_cast<int64_t>(row) * src_stride;
+            T* dst_row = dst + static_cast<int64_t>(row) * dst_stride;
+            cuda::memcpy_async(dst_row, src_row, shape, hopper_barrier);
+        }
+    }
+#else
+    (void)dst;
+    (void)src;
+    (void)src_stride;
+    (void)rows;
+    (void)cols;
+    (void)dst_stride;
+    (void)hopper_barrier;
+#endif
+}
+
 template <typename Pipe>
-__device__ __forceinline__ void enqueue_float_matrix_pair_slice_async(
+__device__ __forceinline__ void enqueue_float_matrix_pair_slice_async_pipeline(
     Pipe& pipe,
     float* __restrict__ dst0,
     const float* __restrict__ src0,
@@ -2830,7 +2938,79 @@ __device__ __forceinline__ void enqueue_float_matrix_pair_slice_async(
 }
 
 template <typename Pipe>
-__device__ __forceinline__ void wait_for_async_tile(Pipe& pipe) {
+__device__ __forceinline__ void enqueue_float_matrix_pair_slice_async(
+    Pipe& pipe,
+    float* __restrict__ dst0,
+    const float* __restrict__ src0,
+    int src0_stride,
+    int rows0,
+    int cols0,
+    int dst0_stride,
+    float* __restrict__ dst1,
+    const float* __restrict__ src1,
+    int src1_stride,
+    int rows1,
+    int cols1,
+    int dst1_stride,
+    HopperStageBarrier* hopper_barrier = nullptr) {
+    if (hopper_barrier != nullptr
+        && can_use_sm90_bulk_matrix_slice_async(
+            dst0,
+            src0,
+            src0_stride,
+            rows0,
+            cols0,
+            dst0_stride)
+        && can_use_sm90_bulk_matrix_slice_async(
+            dst1,
+            src1,
+            src1_stride,
+            rows1,
+            cols1,
+            dst1_stride)) {
+        enqueue_sm90_bulk_matrix_slice_async(
+            dst0,
+            src0,
+            src0_stride,
+            rows0,
+            cols0,
+            dst0_stride,
+            *hopper_barrier);
+        enqueue_sm90_bulk_matrix_slice_async(
+            dst1,
+            src1,
+            src1_stride,
+            rows1,
+            cols1,
+            dst1_stride,
+            *hopper_barrier);
+        return;
+    }
+    enqueue_float_matrix_pair_slice_async_pipeline(
+        pipe,
+        dst0,
+        src0,
+        src0_stride,
+        rows0,
+        cols0,
+        dst0_stride,
+        dst1,
+        src1,
+        src1_stride,
+        rows1,
+        cols1,
+        dst1_stride);
+}
+
+template <typename Pipe>
+__device__ __forceinline__ void wait_for_async_tile(Pipe& pipe, HopperStageBarrier* hopper_barrier = nullptr) {
+    if (hopper_barrier != nullptr) {
+        if (threadIdx.x == 0) {
+            hopper_barrier->arrive_and_wait();
+        }
+        __syncthreads();
+        return;
+    }
 #if __CUDA_ARCH__ >= 800
     pipe.consumer_wait();
     pipe.consumer_release();
@@ -2907,7 +3087,7 @@ __device__ __forceinline__ void enqueue_packed_segment_async_uncommitted(
 }
 
 template <typename Pipe, typename packed_t>
-__device__ __forceinline__ void enqueue_packed_matrix_slice_async(
+__device__ __forceinline__ void enqueue_packed_matrix_slice_async_pipeline(
     Pipe& pipe,
     packed_t* __restrict__ dst,
     const packed_t* __restrict__ src,
@@ -2932,6 +3112,37 @@ __device__ __forceinline__ void enqueue_packed_matrix_slice_async(
         pipe.producer_commit();
     }
 #endif
+}
+
+template <typename Pipe, typename packed_t>
+__device__ __forceinline__ void enqueue_packed_matrix_slice_async(
+    Pipe& pipe,
+    packed_t* __restrict__ dst,
+    const packed_t* __restrict__ src,
+    int src_stride,
+    int rows,
+    int cols,
+    int dst_stride,
+    HopperStageBarrier* hopper_barrier = nullptr) {
+    if (hopper_barrier != nullptr && can_use_sm90_bulk_matrix_slice_async(dst, src, src_stride, rows, cols, dst_stride)) {
+        enqueue_sm90_bulk_matrix_slice_async(
+            dst,
+            src,
+            src_stride,
+            rows,
+            cols,
+            dst_stride,
+            *hopper_barrier);
+        return;
+    }
+    enqueue_packed_matrix_slice_async_pipeline(
+        pipe,
+        dst,
+        src,
+        src_stride,
+        rows,
+        cols,
+        dst_stride);
 }
 
 template <typename scalar_t>
@@ -7312,6 +7523,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
     __shared__ int current_batch;
+    __shared__ HopperStageBarrier hopper_stage_barrier;
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
@@ -7337,6 +7549,14 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
     float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
     auto tile_pipe = cuda::make_pipeline();
+    HopperStageBarrier* hopper_barrier = nullptr;
+    if constexpr (Sm90Path) {
+        if (tid == 0) {
+            init(&hopper_stage_barrier, 1);
+        }
+        __syncthreads();
+        hopper_barrier = &hopper_stage_barrier;
+    }
     const bool use_tensor_core_math =
         tensor_core_math_enabled_for_scalar<scalar_t>()
         && (transition_rank >= kTensorCoreTile)
@@ -7415,10 +7635,11 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 transition_rank,
                                 num_states,
                                 active_rank,
-                                staged_rank_chunk);
+                                staged_rank_chunk,
+                                hopper_barrier);
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe);
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
                             __syncthreads();
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
@@ -7442,7 +7663,8 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     transition_rank,
                                     num_states,
                                     next_active_rank,
-                                    staged_rank_chunk);
+                                    staged_rank_chunk,
+                                    hopper_barrier);
                                 ++next_tile_to_launch;
                             }
                             const float* current_source_tile = source_tile_shared
@@ -7525,7 +7747,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe);
+                                wait_for_async_tile(tile_pipe, hopper_barrier);
                             }
                             __syncthreads();
                         }
@@ -8545,6 +8767,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
     __shared__ int current_batch;
+    __shared__ HopperStageBarrier hopper_stage_barrier;
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int block_slot = static_cast<int>(blockIdx.x);
@@ -8561,6 +8784,14 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     packed_t* dest_tile_packed_shared = reinterpret_cast<packed_t*>(
         dest_tile_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
     auto tile_pipe = cuda::make_pipeline();
+    HopperStageBarrier* hopper_barrier = nullptr;
+    if constexpr (Sm90Path) {
+        if (tid == 0) {
+            init(&hopper_stage_barrier, 1);
+        }
+        __syncthreads();
+        hopper_barrier = &hopper_stage_barrier;
+    }
     const bool use_global_score_cache = native_score_filtering_enabled(score_threshold, score_topk, num_states);
 
     while (true) {
@@ -8626,10 +8857,11 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 num_states,
                                 active_rank,
                                 active_states,
-                                tile_size);
+                                tile_size,
+                                hopper_barrier);
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe);
+                            wait_for_async_tile(tile_pipe, hopper_barrier);
                             __syncthreads();
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
@@ -8647,7 +8879,8 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     num_states,
                                     next_active_rank,
                                     active_states,
-                                    tile_size);
+                                    tile_size,
+                                    hopper_barrier);
                                 ++next_tile_to_launch;
                             }
                             for (int r = tid; r < current_active_rank; r += blockDim.x) {
@@ -8689,7 +8922,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     current_active_rank);
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe);
+                                wait_for_async_tile(tile_pipe, hopper_barrier);
                             }
                             __syncthreads();
                         }

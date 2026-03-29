@@ -7207,6 +7207,12 @@ class Hyperparameters:
     eval_policy = os.environ.get("EVAL_POLICY", "").strip().lower()
     runtime_policy = os.environ.get("RUNTIME_POLICY", "compiled").strip().lower()
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    wallclock_finalization_reserve_ms = float(
+        os.environ.get("WALLCLOCK_FINALIZATION_RESERVE_MS", "30000" if competition_mode else "0")
+    )
+    wallclock_validation_reserve_ms = float(
+        os.environ.get("WALLCLOCK_VALIDATION_RESERVE_MS", "120000" if competition_mode else "0")
+    )
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     rope_dims = int(os.environ.get("ROPE_DIMS", "16"))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -7323,6 +7329,8 @@ class Hyperparameters:
     export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
     export_zstd_level = int(os.environ.get("EXPORT_ZSTD_LEVEL", "22"))
     export_high_precision_bits = int(os.environ.get("EXPORT_HIGH_PRECISION_BITS", "8"))
+    save_raw_debug_model = bool(int(os.environ.get("SAVE_RAW_DEBUG_MODEL", "0" if competition_mode else "1")))
+    run_final_quant_eval = bool(int(os.environ.get("RUN_FINAL_QUANT_EVAL", "0" if competition_mode else "1")))
     export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "300000"))
     export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "4"))
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
@@ -15086,6 +15094,19 @@ def main() -> None:
     )
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    finalization_reserve_ms = max(float(args.wallclock_finalization_reserve_ms), 0.0)
+    validation_reserve_floor_ms = max(float(args.wallclock_validation_reserve_ms), 0.0)
+
+    def remaining_wallclock_ms() -> float:
+        if max_wallclock_ms is None:
+            return math.inf
+        return max(max_wallclock_ms - end_to_end_wallclock_ms(), 0.0)
+
+    def validation_reserve_ms(last_validation_time_ms: float) -> float:
+        if max_wallclock_ms is None:
+            return 0.0
+        measured_reserve = last_validation_time_ms * 1.25 if last_validation_time_ms > 0.0 else 0.0
+        return max(validation_reserve_floor_ms, measured_reserve)
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         scale = 1.0
@@ -15344,6 +15365,7 @@ def main() -> None:
     muon_cuda_tensor_count_total = 0
     muon_fallback_tensor_count_total = 0
     muon_cuda_failure_count_total = 0
+    last_validation_time_ms = 0.0
 
     step = 0
     while True:
@@ -15353,12 +15375,21 @@ def main() -> None:
             step < max(int(args.objective_bootstrap_steps), 0)
             or train_tokens_seen < max(int(args.objective_bootstrap_tokens), 0)
         )
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        scheduled_validation = args.val_loss_every > 0 and step % args.val_loss_every == 0
+        force_terminal_validation = last_step and stop_after_step is None
+        should_validate = force_terminal_validation or (scheduled_validation and not last_step)
+        if should_validate and max_wallclock_ms is not None:
+            reserve_needed_ms = finalization_reserve_ms + validation_reserve_ms(last_validation_time_ms)
+            if remaining_wallclock_ms() <= reserve_needed_ms:
+                should_validate = False
+                if stop_after_step is None:
+                    stop_after_step = step
         if should_validate:
             current_train_step = step
             base_model.set_training_step(current_train_step)
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            validation_started_at = time.perf_counter()
             validation_max_seqs = args.val_max_seqs
             val_loss, val_bpb, _val_mode, _val_bits_per_token, _val_tokens_per_byte, _val_bytes_per_token = run_validation(
                 args,
@@ -15374,6 +15405,7 @@ def main() -> None:
                 is_boundary_token_lut,
                 max_seqs=validation_max_seqs,
             )
+            last_validation_time_ms = (time.perf_counter() - validation_started_at) * 1000.0
             if bootstrap_active and math.isfinite(float(val_bpb)):
                 best_bootstrap_val_bpb = min(best_bootstrap_val_bpb, float(val_bpb))
             wallclock_ms = end_to_end_wallclock_ms()
@@ -15558,7 +15590,10 @@ def main() -> None:
             )
 
         # Needed to sync whether we've reached the wallclock cap.
-        reached_cap = max_wallclock_ms is not None and approx_wallclock_ms >= max_wallclock_ms
+        reached_cap = (
+            max_wallclock_ms is not None
+            and approx_wallclock_ms >= max(max_wallclock_ms - finalization_reserve_ms, 0.0)
+        )
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
@@ -15575,7 +15610,7 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    if master_process:
+    if master_process and args.save_raw_debug_model:
         torch.save(base_model.state_dict(), raw_model_path)
         model_bytes = os.path.getsize(raw_model_path)
         code_bytes = len(code.encode("utf-8"))
@@ -15639,43 +15674,40 @@ def main() -> None:
         base_model.load_state_dict(dequantize_state_dict_mixed_precision(quant_state), strict=True)
     else:
         base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    final_eval_is_exact = True
-    if uses_sliding_eval(args):
-        final_eval_is_exact = args.final_eval_max_seqs <= 0
-        q_val_loss, q_val_bpb, _, _, _ = eval_val_sliding(
-            args,
-            base_model,
-            rank,
-            world_size,
-            device,
-            val_tokens_eval,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            seq_len_override=eval_seq_len,
-            stride=args.eval_stride,
-            batch_seqs=args.eval_batch_seqs,
-            max_seqs=args.final_eval_max_seqs,
-        )
-    else:
-        final_eval_is_exact = args.final_eval_max_seqs <= 0
-        q_val_loss, q_val_bpb = eval_val(
-            args,
-            model,
-            rank,
-            world_size,
-            device,
-            grad_accum_steps,
-            val_tokens_eval,
-            base_bytes_lut,
-            has_leading_space_lut,
-            is_boundary_token_lut,
-            seq_len_override=eval_seq_len,
-            max_seqs=args.final_eval_max_seqs,
-        )
-    torch.cuda.synchronize()
+    if args.run_final_quant_eval:
+        torch.cuda.synchronize()
+        if uses_sliding_eval(args):
+            _q_val_loss, _q_val_bpb, _, _, _ = eval_val_sliding(
+                args,
+                base_model,
+                rank,
+                world_size,
+                device,
+                val_tokens_eval,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+                seq_len_override=eval_seq_len,
+                stride=args.eval_stride,
+                batch_seqs=args.eval_batch_seqs,
+                max_seqs=args.final_eval_max_seqs,
+            )
+        else:
+            _q_val_loss, _q_val_bpb = eval_val(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens_eval,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+                seq_len_override=eval_seq_len,
+                max_seqs=args.final_eval_max_seqs,
+            )
+        torch.cuda.synchronize()
     final_wallclock_ms = end_to_end_wallclock_ms()
     if max_wallclock_ms is not None and final_wallclock_ms > max_wallclock_ms:
         raise RuntimeError(
