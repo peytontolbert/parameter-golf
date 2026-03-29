@@ -35,6 +35,9 @@ enum class MuonSquareBackend : int {
     kHybrid = 3,
 };
 
+struct MuonLtSquarePlan;
+std::shared_ptr<MuonLtSquarePlan> get_muon_cublaslt_square_plan(int device_index, int64_t batch, int64_t dim);
+
 inline bool muon_family_transposes(int64_t family_code) {
     return family_code == kMuonFamilyTall;
 }
@@ -565,6 +568,7 @@ void fused_prepare_muon_batch(
 
 void fused_prepare_muon_batch_capturable(
     const std::vector<torch::Tensor>& grads,
+    const torch::Tensor& grad_ptrs,
     torch::Tensor momentum_batch,
     torch::Tensor effective_batch,
     const torch::Tensor& momentum,
@@ -579,7 +583,6 @@ void fused_prepare_muon_batch_capturable(
     TORCH_CHECK(momentum.numel() == 1, "fused_prepare_muon_batch_capturable expects scalar momentum tensor");
     const int64_t rows = grads.front().size(0);
     const int64_t cols = grads.front().size(1);
-    auto ptrs = make_device_pointer_tensor(grads);
     const int threads = muon_family_threads(family_code);
     const int64_t total = bucket_size * rows * cols;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
@@ -591,7 +594,7 @@ void fused_prepare_muon_batch_capturable(
         "fused_prepare_muon_batch_capturable_kernel",
         [&] {
             fused_prepare_muon_batch_capturable_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
-                ptrs.data_ptr<int64_t>(),
+                grad_ptrs.data_ptr<int64_t>(),
                 momentum_batch.data_ptr<float>(),
                 effective_batch.data_ptr<float>(),
                 momentum.data_ptr<float>(),
@@ -693,6 +696,7 @@ void apply_projected_updates(
 
 void apply_projected_updates_capturable(
     const std::vector<torch::Tensor>& params,
+    const torch::Tensor& param_ptrs,
     const torch::Tensor& projected_batch,
     const torch::Tensor& lr,
     const torch::Tensor& weight_decay,
@@ -709,7 +713,6 @@ void apply_projected_updates_capturable(
     TORCH_CHECK(weight_decay.numel() == 1, "apply_projected_updates_capturable expects scalar weight_decay tensor");
     const int64_t rows = params.front().size(0);
     const int64_t cols = params.front().size(1);
-    auto ptrs = make_device_pointer_tensor(params);
     const int threads = muon_family_threads(family_code);
     const int64_t total = bucket_size * rows * cols;
     const int blocks = static_cast<int>((total + threads - 1) / threads);
@@ -730,7 +733,7 @@ void apply_projected_updates_capturable(
                 [&] {
                     using projected_t = scalar_t;
                     apply_projected_updates_capturable_kernel<param_t, projected_t><<<blocks, threads, 0, stream>>>(
-                        ptrs.data_ptr<int64_t>(),
+                        param_ptrs.data_ptr<int64_t>(),
                         projected_batch.data_ptr<projected_t>(),
                         lr.data_ptr<float>(),
                         weight_decay.data_ptr<float>(),
@@ -922,6 +925,17 @@ torch::Tensor batched_newton_schulz(
 
 }  // namespace
 
+int64_t muon_describe_square_backend_cuda(const torch::Tensor& x) {
+    return static_cast<int64_t>(select_muon_square_backend(x));
+}
+
+void muon_prewarm_square_backend_cuda(const torch::Tensor& x) {
+    const MuonSquareBackend backend = select_muon_square_backend(x);
+    if (backend != MuonSquareBackend::kCublas) {
+        (void)get_muon_cublaslt_square_plan(x.get_device(), x.size(0), x.size(1));
+    }
+}
+
 std::vector<torch::Tensor> muon_grouped_step_cuda(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
@@ -1073,6 +1087,8 @@ void muon_grouped_step_family_workspace_cuda(
 void muon_grouped_step_family_workspace_capturable_cuda(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
     torch::Tensor effective_batch,
     torch::Tensor momentum_batch,
     torch::Tensor norms,
@@ -1089,13 +1105,14 @@ void muon_grouped_step_family_workspace_capturable_cuda(
     double eps) {
     const auto bucket_size = static_cast<int64_t>(params.size());
     TORCH_CHECK(bucket_size > 0, "muon_grouped_step_family_workspace_capturable_cuda requires a non-empty bucket");
-    fused_prepare_muon_batch_capturable(grads, momentum_batch, effective_batch, momentum, nesterov, family_code);
+    fused_prepare_muon_batch_capturable(grads, grad_ptrs, momentum_batch, effective_batch, momentum, nesterov, family_code);
     normalize_effective_batch(effective_batch, norms, ns_input_batch, eps, family_code);
     batched_newton_schulz_workspace(ns_input_batch, gram_batch, gram_sq_batch, next_x_batch, ns_steps);
     const double aspect_scale = std::sqrt(
         std::max(1.0, static_cast<double>(params.front().size(0)) / std::max(1.0, static_cast<double>(params.front().size(1)))));
     apply_projected_updates_capturable(
         params,
+        param_ptrs,
         ns_input_batch,
         lr,
         weight_decay,

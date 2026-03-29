@@ -97,24 +97,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_cuda(
     int64_t block_size,
     int64_t chunk_size);
 
-std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_fused(
-    torch::Tensor local_logits,
-    torch::Tensor transition_source_logits,
-    torch::Tensor transition_dest_logits,
-    torch::Tensor block_row_ptr,
-    torch::Tensor block_col_idx,
-    torch::Tensor block_dst_idx,
-    torch::Tensor src_row_ptr,
-    torch::Tensor src_nz_idx,
-    torch::Tensor block_mask,
-    torch::Tensor transition_context,
-    torch::Tensor initial_log_belief,
-    torch::Tensor transition_gate,
-    torch::Tensor transition_stay_probs,
-    torch::Tensor seq_lens,
-    int64_t block_size,
-    int64_t chunk_size);
-
 std::vector<torch::Tensor> causal_machine_scan_backward_sparse_cuda(
     torch::Tensor grad_beliefs,
     torch::Tensor grad_final_belief,
@@ -156,28 +138,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_cuda(
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
     double transition_gate,
-    torch::Tensor transition_stay_probs,
-    torch::Tensor seq_lens,
-    int64_t block_size,
-    int64_t chunk_size);
-
-std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_fused(
-    torch::Tensor grad_beliefs,
-    torch::Tensor grad_final_belief,
-    torch::Tensor transition_source_logits,
-    torch::Tensor transition_dest_logits,
-    torch::Tensor block_row_ptr,
-    torch::Tensor block_col_idx,
-    torch::Tensor block_dst_idx,
-    torch::Tensor src_row_ptr,
-    torch::Tensor src_nz_idx,
-    torch::Tensor grouped_src_row_ptr,
-    torch::Tensor grouped_src_block_idx,
-    torch::Tensor block_mask,
-    torch::Tensor transition_context,
-    torch::Tensor initial_log_belief,
-    torch::Tensor beliefs,
-    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -283,6 +243,26 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_cu
     double score_clamp_max = std::numeric_limits<double>::infinity(),
     double score_threshold = -std::numeric_limits<double>::infinity(),
     int64_t score_topk = 0);
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_workspace_cuda(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor filtered_value_cache,
+    double score_clamp_min = -std::numeric_limits<double>::infinity(),
+    double score_clamp_max = std::numeric_limits<double>::infinity(),
+    double score_threshold = -std::numeric_limits<double>::infinity(),
+    int64_t score_topk = 0);
 std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_cuda(
     torch::Tensor local_logits,
     torch::Tensor transition_source_packed,
@@ -298,6 +278,27 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_cuda(
     int64_t chunk_size,
     int64_t tile_size,
     int64_t split_size,
+    double score_clamp_min = -std::numeric_limits<double>::infinity(),
+    double score_clamp_max = std::numeric_limits<double>::infinity(),
+    double score_threshold = -std::numeric_limits<double>::infinity(),
+    int64_t score_topk = 0);
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspace_cuda(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor filtered_value_cache,
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
     double score_clamp_max = std::numeric_limits<double>::infinity(),
     double score_threshold = -std::numeric_limits<double>::infinity(),
@@ -499,6 +500,33 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_c
     double score_clamp_max,
     double score_threshold = -std::numeric_limits<double>::infinity(),
     int64_t score_topk = 0);
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_workspace_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor latent_cache_staging,
+    torch::Tensor grad_latent_accum_staging,
+    torch::Tensor grad_transition_source_probs_staging,
+    torch::Tensor grad_transition_dest_probs_staging,
+    torch::Tensor grad_transition_gate_staging,
+    torch::Tensor grad_transition_stay_staging,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold = -std::numeric_limits<double>::infinity(),
+    int64_t score_topk = 0);
 std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_cuda(
     torch::Tensor grad_beliefs,
     torch::Tensor grad_final_belief,
@@ -516,6 +544,34 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_cuda(
     int64_t chunk_size,
     int64_t tile_size,
     int64_t split_size,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold = -std::numeric_limits<double>::infinity(),
+    int64_t score_topk = 0);
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspace_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    double transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor latent_cache_staging,
+    torch::Tensor grad_latent_accum_staging,
+    torch::Tensor grad_transition_source_probs_staging,
+    torch::Tensor grad_transition_dest_probs_staging,
+    torch::Tensor grad_transition_gate_staging,
+    torch::Tensor grad_transition_stay_staging,
     double score_clamp_min,
     double score_clamp_max,
     double score_threshold = -std::numeric_limits<double>::infinity(),
@@ -725,6 +781,67 @@ namespace {
 constexpr int kSpecializedNumStates = 128;
 constexpr int kMinSpecializedNumStates = 64;
 constexpr int kMidSpecializedNumStates = 96;
+
+std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kernel_workspace(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor transition_mask,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor masked_transition_tile_cache,
+    torch::Tensor filtered_value_cache,
+    torch::Tensor row_sums,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk);
+
+std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_fused(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor block_row_ptr,
+    torch::Tensor block_col_idx,
+    torch::Tensor block_dst_idx,
+    torch::Tensor src_row_ptr,
+    torch::Tensor src_nz_idx,
+    torch::Tensor block_mask,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t block_size,
+    int64_t chunk_size);
+
+std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_fused(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor block_row_ptr,
+    torch::Tensor block_col_idx,
+    torch::Tensor block_dst_idx,
+    torch::Tensor src_row_ptr,
+    torch::Tensor src_nz_idx,
+    torch::Tensor grouped_src_row_ptr,
+    torch::Tensor grouped_src_block_idx,
+    torch::Tensor block_mask,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t block_size,
+    int64_t chunk_size);
 
 bool is_supported_specialized_num_states(int64_t num_states) {
     return num_states > 0 && num_states <= kSpecializedNumStates;
@@ -2832,6 +2949,224 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_bound
         initial_log_belief,
         transition_gate,
         transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        filtered_value_cache,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_workspace(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor filtered_value_cache,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    check_cuda_int32(work_queue_counter, "work_queue_counter");
+    check_cuda_float32(filtered_value_cache, "filtered_value_cache");
+    check_same_cuda_device(work_queue_counter, local_logits, "work_queue_counter");
+    check_same_cuda_device(filtered_value_cache, local_logits, "filtered_value_cache");
+    auto workspace_info = causal_machine_scan_describe_workspace_config(
+        "tiled_forward",
+        local_logits.size(2),
+        transition_source_q.size(1),
+        local_logits.size(0),
+        tile_size,
+        split_size,
+        local_logits.size(1),
+        chunk_size,
+        local_logits.get_device());
+    check_workspace_shape_min(
+        work_queue_counter,
+        workspace_info["work_queue_counter_shape"].cast<std::vector<int64_t>>(),
+        "work_queue_counter");
+    check_workspace_shape_min(
+        filtered_value_cache,
+        workspace_info["filtered_value_cache_shape"].cast<std::vector<int64_t>>(),
+        "filtered_value_cache");
+    return causal_machine_scan_forward_tiled_quantized_kernel_workspace_cuda(
+        local_logits,
+        transition_source_q,
+        transition_source_scales,
+        transition_dest_q,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        transition_gate.item<double>(),
+        transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        filtered_value_cache,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_bound_workspace(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    py::dict workspace,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    auto work_queue_counter = get_workspace_tensor(workspace, "work_queue_counter", torch::kInt32, local_logits);
+    auto filtered_value_cache = get_workspace_tensor(workspace, "filtered_value_cache", torch::kFloat32, local_logits);
+    return causal_machine_scan_forward_tiled_quantized_kernel_workspace(
+        local_logits,
+        transition_source_q,
+        transition_source_scales,
+        transition_dest_q,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        transition_gate,
+        transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        filtered_value_cache,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspace(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor filtered_value_cache,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    check_cuda_int32(work_queue_counter, "work_queue_counter");
+    check_cuda_float32(filtered_value_cache, "filtered_value_cache");
+    check_same_cuda_device(work_queue_counter, local_logits, "work_queue_counter");
+    check_same_cuda_device(filtered_value_cache, local_logits, "filtered_value_cache");
+    auto workspace_info = causal_machine_scan_describe_workspace_config(
+        "tiled_forward",
+        local_logits.size(2),
+        transition_source_packed.size(1),
+        local_logits.size(0),
+        tile_size,
+        split_size,
+        local_logits.size(1),
+        chunk_size,
+        local_logits.get_device());
+    check_workspace_shape_min(
+        work_queue_counter,
+        workspace_info["work_queue_counter_shape"].cast<std::vector<int64_t>>(),
+        "work_queue_counter");
+    check_workspace_shape_min(
+        filtered_value_cache,
+        workspace_info["filtered_value_cache_shape"].cast<std::vector<int64_t>>(),
+        "filtered_value_cache");
+    return causal_machine_scan_forward_tiled_fp8_kernel_workspace_cuda(
+        local_logits,
+        transition_source_packed,
+        transition_source_scales,
+        transition_dest_packed,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        transition_gate.item<double>(),
+        transition_stay_probs,
+        fp8_format,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        filtered_value_cache,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_bound_workspace(
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    py::dict workspace,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    auto work_queue_counter = get_workspace_tensor(workspace, "work_queue_counter", torch::kInt32, local_logits);
+    auto filtered_value_cache = get_workspace_tensor(workspace, "filtered_value_cache", torch::kFloat32, local_logits);
+    return causal_machine_scan_forward_tiled_fp8_kernel_workspace(
+        local_logits,
+        transition_source_packed,
+        transition_source_scales,
+        transition_dest_packed,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        transition_gate,
+        transition_stay_probs,
+        fp8_format,
         seq_lens,
         chunk_size,
         tile_size,
@@ -5175,6 +5510,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
     double score_threshold,
     int64_t score_topk) {
     const auto num_states = beliefs.size(2);
+    const auto gate_value = static_cast<double>(transition_gate.detach().to(torch::kFloat32).item<float>());
     if (num_states <= kSpecializedNumStates) {
         return causal_machine_scan_backward_masked_logits(
             grad_beliefs,
@@ -5184,7 +5520,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
             transition_context,
             initial_log_belief,
             beliefs,
-            transition_gate,
+            gate_value,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -5207,7 +5543,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
             transition_context,
             initial_log_belief,
             beliefs,
-            transition_gate,
+            gate_value,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -5422,6 +5758,264 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_bound
         beliefs,
         transition_gate,
         transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        latent_cache_staging,
+        grad_latent_accum_staging,
+        grad_transition_source_probs_staging,
+        grad_transition_dest_probs_staging,
+        grad_transition_gate_staging,
+        grad_transition_stay_staging,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_workspace(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor latent_cache_staging,
+    torch::Tensor grad_latent_accum_staging,
+    torch::Tensor grad_transition_source_probs_staging,
+    torch::Tensor grad_transition_dest_probs_staging,
+    torch::Tensor grad_transition_gate_staging,
+    torch::Tensor grad_transition_stay_staging,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    check_cuda_int32(work_queue_counter, "work_queue_counter");
+    check_cuda_float32(latent_cache_staging, "latent_cache_staging");
+    check_cuda_float32(grad_latent_accum_staging, "grad_latent_accum_staging");
+    check_cuda_float32(grad_transition_source_probs_staging, "grad_transition_source_probs_staging");
+    check_cuda_float32(grad_transition_dest_probs_staging, "grad_transition_dest_probs_staging");
+    check_cuda_float32(grad_transition_gate_staging, "grad_transition_gate_staging");
+    check_cuda_float32(grad_transition_stay_staging, "grad_transition_stay_staging");
+    check_same_cuda_device(work_queue_counter, beliefs, "work_queue_counter");
+    check_same_cuda_device(latent_cache_staging, beliefs, "latent_cache_staging");
+    check_same_cuda_device(grad_latent_accum_staging, beliefs, "grad_latent_accum_staging");
+    check_same_cuda_device(grad_transition_source_probs_staging, beliefs, "grad_transition_source_probs_staging");
+    check_same_cuda_device(grad_transition_dest_probs_staging, beliefs, "grad_transition_dest_probs_staging");
+    check_same_cuda_device(grad_transition_gate_staging, beliefs, "grad_transition_gate_staging");
+    check_same_cuda_device(grad_transition_stay_staging, beliefs, "grad_transition_stay_staging");
+    return causal_machine_scan_backward_tiled_quantized_kernel_workspace_cuda(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_q,
+        transition_source_scales,
+        transition_dest_q,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate.item<double>(),
+        transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        latent_cache_staging,
+        grad_latent_accum_staging,
+        grad_transition_source_probs_staging,
+        grad_transition_dest_probs_staging,
+        grad_transition_gate_staging,
+        grad_transition_stay_staging,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_bound_workspace(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_q,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_q,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    py::dict workspace,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    auto work_queue_counter = get_workspace_tensor(workspace, "work_queue_counter", torch::kInt32, beliefs);
+    auto latent_cache_staging = get_workspace_tensor(workspace, "latent_cache_staging", torch::kFloat32, beliefs);
+    auto grad_latent_accum_staging = get_workspace_tensor(workspace, "grad_latent_accum_staging", torch::kFloat32, beliefs);
+    auto grad_transition_source_probs_staging = get_workspace_tensor(workspace, "grad_transition_source_probs_staging", torch::kFloat32, beliefs);
+    auto grad_transition_dest_probs_staging = get_workspace_tensor(workspace, "grad_transition_dest_probs_staging", torch::kFloat32, beliefs);
+    auto grad_transition_gate_staging = get_workspace_tensor(workspace, "grad_transition_gate_staging", torch::kFloat32, beliefs);
+    auto grad_transition_stay_staging = get_workspace_tensor(workspace, "grad_transition_stay_staging", torch::kFloat32, beliefs);
+    return causal_machine_scan_backward_tiled_quantized_kernel_workspace(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_q,
+        transition_source_scales,
+        transition_dest_q,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate,
+        transition_stay_probs,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        latent_cache_staging,
+        grad_latent_accum_staging,
+        grad_transition_source_probs_staging,
+        grad_transition_dest_probs_staging,
+        grad_transition_gate_staging,
+        grad_transition_stay_staging,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspace(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    torch::Tensor work_queue_counter,
+    torch::Tensor latent_cache_staging,
+    torch::Tensor grad_latent_accum_staging,
+    torch::Tensor grad_transition_source_probs_staging,
+    torch::Tensor grad_transition_dest_probs_staging,
+    torch::Tensor grad_transition_gate_staging,
+    torch::Tensor grad_transition_stay_staging,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    check_cuda_int32(work_queue_counter, "work_queue_counter");
+    check_cuda_float32(latent_cache_staging, "latent_cache_staging");
+    check_cuda_float32(grad_latent_accum_staging, "grad_latent_accum_staging");
+    check_cuda_float32(grad_transition_source_probs_staging, "grad_transition_source_probs_staging");
+    check_cuda_float32(grad_transition_dest_probs_staging, "grad_transition_dest_probs_staging");
+    check_cuda_float32(grad_transition_gate_staging, "grad_transition_gate_staging");
+    check_cuda_float32(grad_transition_stay_staging, "grad_transition_stay_staging");
+    check_same_cuda_device(work_queue_counter, beliefs, "work_queue_counter");
+    check_same_cuda_device(latent_cache_staging, beliefs, "latent_cache_staging");
+    check_same_cuda_device(grad_latent_accum_staging, beliefs, "grad_latent_accum_staging");
+    check_same_cuda_device(grad_transition_source_probs_staging, beliefs, "grad_transition_source_probs_staging");
+    check_same_cuda_device(grad_transition_dest_probs_staging, beliefs, "grad_transition_dest_probs_staging");
+    check_same_cuda_device(grad_transition_gate_staging, beliefs, "grad_transition_gate_staging");
+    check_same_cuda_device(grad_transition_stay_staging, beliefs, "grad_transition_stay_staging");
+    return causal_machine_scan_backward_tiled_fp8_kernel_workspace_cuda(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_packed,
+        transition_source_scales,
+        transition_dest_packed,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate.item<double>(),
+        transition_stay_probs,
+        fp8_format,
+        seq_lens,
+        chunk_size,
+        tile_size,
+        split_size,
+        work_queue_counter,
+        latent_cache_staging,
+        grad_latent_accum_staging,
+        grad_transition_source_probs_staging,
+        grad_transition_dest_probs_staging,
+        grad_transition_gate_staging,
+        grad_transition_stay_staging,
+        score_clamp_min,
+        score_clamp_max,
+        score_threshold,
+        score_topk);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_bound_workspace(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_packed,
+    torch::Tensor transition_source_scales,
+    torch::Tensor transition_dest_packed,
+    torch::Tensor transition_dest_scales,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t fp8_format,
+    torch::Tensor seq_lens,
+    int64_t chunk_size,
+    int64_t tile_size,
+    int64_t split_size,
+    py::dict workspace,
+    double score_clamp_min,
+    double score_clamp_max,
+    double score_threshold,
+    int64_t score_topk) {
+    auto work_queue_counter = get_workspace_tensor(workspace, "work_queue_counter", torch::kInt32, beliefs);
+    auto latent_cache_staging = get_workspace_tensor(workspace, "latent_cache_staging", torch::kFloat32, beliefs);
+    auto grad_latent_accum_staging = get_workspace_tensor(workspace, "grad_latent_accum_staging", torch::kFloat32, beliefs);
+    auto grad_transition_source_probs_staging = get_workspace_tensor(workspace, "grad_transition_source_probs_staging", torch::kFloat32, beliefs);
+    auto grad_transition_dest_probs_staging = get_workspace_tensor(workspace, "grad_transition_dest_probs_staging", torch::kFloat32, beliefs);
+    auto grad_transition_gate_staging = get_workspace_tensor(workspace, "grad_transition_gate_staging", torch::kFloat32, beliefs);
+    auto grad_transition_stay_staging = get_workspace_tensor(workspace, "grad_transition_stay_staging", torch::kFloat32, beliefs);
+    return causal_machine_scan_backward_tiled_fp8_kernel_workspace(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_packed,
+        transition_source_scales,
+        transition_dest_packed,
+        transition_dest_scales,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate,
+        transition_stay_probs,
+        fp8_format,
         seq_lens,
         chunk_size,
         tile_size,
@@ -5916,6 +6510,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_tiled_logits_kernel", &causal_machine_scan_forward_tiled_logits_kernel, "Causal machine structured scan forward from probabilities with tiled custom CUDA execution");
     m.def("forward_tiled_logits_kernel_workspace", &causal_machine_scan_forward_tiled_logits_kernel_workspace, "Causal machine structured scan forward from probabilities with tiled custom CUDA execution and explicit workspace");
     m.def("forward_tiled_logits_kernel_bound_workspace", &causal_machine_scan_forward_tiled_logits_kernel_bound_workspace, "Causal machine structured scan forward from probabilities with tiled custom CUDA execution and extension-bound workspace");
+    m.def("forward_tiled_quantized_kernel_workspace", &causal_machine_scan_forward_tiled_quantized_kernel_workspace, "Causal machine structured scan forward from quantized probabilities with tiled custom CUDA execution and explicit workspace");
+    m.def("forward_tiled_quantized_kernel_bound_workspace", &causal_machine_scan_forward_tiled_quantized_kernel_bound_workspace, "Causal machine structured scan forward from quantized probabilities with tiled custom CUDA execution and extension-bound workspace");
+    m.def("forward_tiled_fp8_kernel_workspace", &causal_machine_scan_forward_tiled_fp8_kernel_workspace, "Causal machine structured scan forward from FP8 packed probabilities with tiled custom CUDA execution and explicit workspace");
+    m.def("forward_tiled_fp8_kernel_bound_workspace", &causal_machine_scan_forward_tiled_fp8_kernel_bound_workspace, "Causal machine structured scan forward from FP8 packed probabilities with tiled custom CUDA execution and extension-bound workspace");
     m.def("forward_masked_tiled_logits_kernel_workspace", &causal_machine_scan_forward_masked_tiled_logits_kernel_workspace, "Causal machine structured scan forward from masked probabilities with tiled custom CUDA execution and explicit workspace");
     m.def("forward_sparse_logits", &causal_machine_scan_forward_sparse_logits, "Causal machine structured scan forward from logits with block-sparse CUDA execution");
     m.def("forward_sparse_logits_fused", &causal_machine_scan_forward_sparse_logits_fused, "Causal machine structured scan forward from sparse transition logits with fused softmax/materialization in the CUDA extension");
@@ -5928,6 +6526,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_tiled_probs_kernel", &causal_machine_scan_backward_tiled_probs_kernel, "Causal machine structured scan backward from probabilities with tiled custom CUDA execution");
     m.def("backward_tiled_probs_kernel_workspace", &causal_machine_scan_backward_tiled_probs_kernel_workspace, "Causal machine structured scan backward from probabilities with tiled custom CUDA execution and explicit workspace");
     m.def("backward_tiled_probs_kernel_bound_workspace", &causal_machine_scan_backward_tiled_probs_kernel_bound_workspace, "Causal machine structured scan backward from probabilities with tiled custom CUDA execution and extension-bound workspace");
+    m.def("backward_tiled_quantized_kernel_workspace", &causal_machine_scan_backward_tiled_quantized_kernel_workspace, "Causal machine structured scan backward from quantized probabilities with tiled custom CUDA execution and explicit workspace");
+    m.def("backward_tiled_quantized_kernel_bound_workspace", &causal_machine_scan_backward_tiled_quantized_kernel_bound_workspace, "Causal machine structured scan backward from quantized probabilities with tiled custom CUDA execution and extension-bound workspace");
+    m.def("backward_tiled_fp8_kernel_workspace", &causal_machine_scan_backward_tiled_fp8_kernel_workspace, "Causal machine structured scan backward from FP8 packed probabilities with tiled custom CUDA execution and explicit workspace");
+    m.def("backward_tiled_fp8_kernel_bound_workspace", &causal_machine_scan_backward_tiled_fp8_kernel_bound_workspace, "Causal machine structured scan backward from FP8 packed probabilities with tiled custom CUDA execution and extension-bound workspace");
     m.def("backward_masked_logits_workspace", &causal_machine_scan_backward_masked_logits_workspace, "Causal machine structured scan backward from masked logits with explicit workspace");
     m.def("backward_masked_logits_bound_workspace", &causal_machine_scan_backward_masked_logits_bound_workspace, "Causal machine structured scan backward from masked logits with extension-bound workspace");
     m.def("backward_composable_logits", &causal_machine_scan_backward_composable_logits, "Causal machine structured scan backward for composable mode from logits (CUDA)");

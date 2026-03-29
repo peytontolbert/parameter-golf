@@ -817,7 +817,60 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
         workspace_dict = workspace if isinstance(workspace, dict) else None
         ctx.use_packed = bool(use_packed)
         ctx.packed_kind = int(packed_kind)
-        if ctx.use_packed and ctx.packed_kind == _PACKED_TRANSITION_INT8:
+        if (
+            ctx.use_packed
+            and ctx.packed_kind == _PACKED_TRANSITION_INT8
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_quantized_kernel_bound_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_quantized_kernel_bound_workspace(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif (
+            ctx.use_packed
+            and ctx.packed_kind == _PACKED_TRANSITION_INT8
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_quantized_kernel_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_quantized_kernel_workspace(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["filtered_value_cache"],
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif ctx.use_packed and ctx.packed_kind == _PACKED_TRANSITION_INT8:
             beliefs, final_belief = ext.forward_tiled_quantized_kernel(
                 local_logits_in,
                 packed_source_q_in,
@@ -832,6 +885,61 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 int(chunk_size),
                 int(tile_size),
                 int(split_size),
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif (
+            ctx.use_packed
+            and ctx.packed_kind in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_fp8_kernel_bound_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_fp8_kernel_bound_workspace(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                0 if ctx.packed_kind == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict,
+                float(score_clamp_min),
+                float(score_clamp_max),
+                float(score_threshold),
+                int(score_topk),
+            )
+        elif (
+            ctx.use_packed
+            and ctx.packed_kind in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+            and workspace_dict is not None
+            and hasattr(ext, "forward_tiled_fp8_kernel_workspace")
+        ):
+            beliefs, final_belief = ext.forward_tiled_fp8_kernel_workspace(
+                local_logits_in,
+                packed_source_q_in,
+                packed_source_scales_in,
+                packed_dest_q_in,
+                packed_dest_scales_in,
+                transition_context_in,
+                initial_log_belief_f32,
+                transition_gate_f32,
+                transition_stay_probs_f32,
+                0 if ctx.packed_kind == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_in,
+                int(chunk_size),
+                int(tile_size),
+                int(split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["filtered_value_cache"],
                 float(score_clamp_min),
                 float(score_clamp_max),
                 float(score_threshold),
@@ -1004,7 +1112,69 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 seq_lens_saved,
             ) = ctx.saved_tensors
         workspace_dict = getattr(ctx, "workspace", None)
-        if bool(getattr(ctx, "use_packed", False)) and int(getattr(ctx, "packed_kind", -1)) == _PACKED_TRANSITION_INT8:
+        if (
+            bool(getattr(ctx, "use_packed", False))
+            and int(getattr(ctx, "packed_kind", -1)) == _PACKED_TRANSITION_INT8
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_quantized_kernel_bound_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_quantized_kernel_bound_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict,
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif (
+            bool(getattr(ctx, "use_packed", False))
+            and int(getattr(ctx, "packed_kind", -1)) == _PACKED_TRANSITION_INT8
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_quantized_kernel_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_quantized_kernel_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["latent_cache_staging"],
+                workspace_dict["grad_latent_accum_staging"],
+                workspace_dict["grad_transition_source_probs_staging"],
+                workspace_dict["grad_transition_dest_probs_staging"],
+                workspace_dict["grad_transition_gate_staging"],
+                workspace_dict["grad_transition_stay_staging"],
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif bool(getattr(ctx, "use_packed", False)) and int(getattr(ctx, "packed_kind", -1)) == _PACKED_TRANSITION_INT8:
             grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_quantized_kernel(
                 grad_beliefs.contiguous(),
                 grad_final_belief.contiguous(),
@@ -1021,6 +1191,70 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 int(ctx.chunk_size),
                 int(ctx.tile_size),
                 int(ctx.split_size),
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif (
+            bool(getattr(ctx, "use_packed", False))
+            and int(getattr(ctx, "packed_kind", -1)) in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_fp8_kernel_bound_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_fp8_kernel_bound_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                0 if int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict,
+                float(ctx.score_clamp_min),
+                float(ctx.score_clamp_max),
+                float(ctx.score_threshold),
+                int(ctx.score_topk),
+            )
+        elif (
+            bool(getattr(ctx, "use_packed", False))
+            and int(getattr(ctx, "packed_kind", -1)) in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+            and workspace_dict is not None
+            and hasattr(ext, "backward_tiled_fp8_kernel_workspace")
+        ):
+            grad_local, grad_source, grad_dest, grad_context, grad_initial, grad_gate, grad_stay = ext.backward_tiled_fp8_kernel_workspace(
+                grad_beliefs.contiguous(),
+                grad_final_belief.contiguous(),
+                packed_source_q.contiguous(),
+                packed_source_scales.contiguous(),
+                packed_dest_q.contiguous(),
+                packed_dest_scales.contiguous(),
+                transition_context_saved.contiguous(),
+                initial_log_belief_f32.contiguous(),
+                beliefs_saved.contiguous(),
+                transition_gate_f32.detach().float().reshape(()),
+                transition_stay_probs_f32,
+                0 if int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+                seq_lens_saved.contiguous(),
+                int(ctx.chunk_size),
+                int(ctx.tile_size),
+                int(ctx.split_size),
+                workspace_dict["work_queue_counter"],
+                workspace_dict["latent_cache_staging"],
+                workspace_dict["grad_latent_accum_staging"],
+                workspace_dict["grad_transition_source_probs_staging"],
+                workspace_dict["grad_transition_dest_probs_staging"],
+                workspace_dict["grad_transition_gate_staging"],
+                workspace_dict["grad_transition_stay_staging"],
                 float(ctx.score_clamp_min),
                 float(ctx.score_clamp_max),
                 float(ctx.score_threshold),
@@ -3082,6 +3316,59 @@ def causal_machine_scan_tiled_cuda(
             bool(can_use_custom_tiled_backward_kernel),
             workspace_dict,
         )
+    elif (
+        use_packed_tables
+        and int(packed_kind) == _PACKED_TRANSITION_INT8
+        and workspace_dict is not None
+        and hasattr(ext, "forward_tiled_quantized_kernel_bound_workspace")
+    ):
+        beliefs, final_belief = ext.forward_tiled_quantized_kernel_bound_workspace(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            workspace_dict,
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    elif (
+        use_packed_tables
+        and int(packed_kind) == _PACKED_TRANSITION_INT8
+        and workspace_dict is not None
+        and hasattr(ext, "forward_tiled_quantized_kernel_workspace")
+    ):
+        beliefs, final_belief = ext.forward_tiled_quantized_kernel_workspace(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            workspace_dict["work_queue_counter"],
+            workspace_dict["filtered_value_cache"],
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
     elif use_packed_tables and int(packed_kind) == _PACKED_TRANSITION_INT8:
         beliefs, final_belief = ext.forward_tiled_quantized_kernel(
             local_logits.contiguous(),
@@ -3097,6 +3384,61 @@ def causal_machine_scan_tiled_cuda(
             int(chunk_size),
             int(tile_size),
             int(split_size),
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    elif (
+        use_packed_tables
+        and int(packed_kind) in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+        and workspace_dict is not None
+        and hasattr(ext, "forward_tiled_fp8_kernel_bound_workspace")
+    ):
+        beliefs, final_belief = ext.forward_tiled_fp8_kernel_bound_workspace(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            0 if int(packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            workspace_dict,
+            float(score_clamp_min),
+            float(score_clamp_max),
+            float(score_threshold),
+            int(score_topk),
+        )
+    elif (
+        use_packed_tables
+        and int(packed_kind) in {_PACKED_TRANSITION_FP8_E4M3, _PACKED_TRANSITION_FP8_E5M2}
+        and workspace_dict is not None
+        and hasattr(ext, "forward_tiled_fp8_kernel_workspace")
+    ):
+        beliefs, final_belief = ext.forward_tiled_fp8_kernel_workspace(
+            local_logits.contiguous(),
+            packed_source_q.contiguous(),
+            packed_source_scales.contiguous(),
+            packed_dest_q.contiguous(),
+            packed_dest_scales.contiguous(),
+            transition_context.contiguous(),
+            initial_log_belief.contiguous().float(),
+            transition_gate.reshape(()).float(),
+            transition_stay_probs.contiguous().float(),
+            0 if int(packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
+            seq_lens.contiguous() if seq_lens is not None else empty_seq_lens,
+            int(chunk_size),
+            int(tile_size),
+            int(split_size),
+            workspace_dict["work_queue_counter"],
+            workspace_dict["filtered_value_cache"],
             float(score_clamp_min),
             float(score_clamp_max),
             float(score_threshold),
@@ -4000,6 +4342,14 @@ def causal_machine_latent_replace_cuda(
         token_gate,
         pred_scale,
     )
+
+
+def _latent_replace_kernel_family(local_logits: Tensor) -> str:
+    if not (USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and local_logits.is_cuda):
+        return "latent_replace_python"
+    if int(local_logits.size(-1)) == 128:
+        return "latent_replace_step_cache_128" if int(local_logits.size(1)) == 1 else "latent_replace_seq_128"
+    return "latent_replace_generic"
 
 
 def structured_transition_predict_log_belief(
@@ -6619,7 +6969,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 10))
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 2000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 0))
     lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", "0"))
     lr_warmup_init_scale = float(os.environ.get("LR_WARMUP_INIT_SCALE", "0.2"))
@@ -6922,6 +7272,7 @@ class Hyperparameters:
     mlp_matrix_lr_mult = float(os.environ.get("MLP_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["mlp_matrix_lr_mult"]))))
     scalar_lr = float(os.environ.get("SCALAR_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["scalar_lr"]))))
     use_muon = bool(int(os.environ.get("USE_MUON", "1")))
+    muon_cuda_graph_mode = os.environ.get("MUON_CUDA_GRAPH_MODE", "auto").strip().lower()
     head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", str(float(LOCAL_PROXY_RECIPE_COMMON["head_weight_decay"]))))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", "0.03"))
@@ -6940,6 +7291,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.25))
 
     def __init__(self):
+        if self.muon_cuda_graph_mode not in {"auto", "on", "off"}:
+            raise ValueError(
+                f"MUON_CUDA_GRAPH_MODE={self.muon_cuda_graph_mode!r} must be one of: auto, on, off"
+            )
         self._apply_policy_schema()
         self._apply_training_preset()
         self._resolve_attention_config()
@@ -6966,6 +7321,7 @@ class Hyperparameters:
             "matrix_lr": "MATRIX_LR",
             "scalar_lr": "SCALAR_LR",
             "use_muon": "USE_MUON",
+            "muon_cuda_graph_mode": "MUON_CUDA_GRAPH_MODE",
             "muon_momentum": "MUON_MOMENTUM",
             "muon_momentum_warmup_start": "MUON_MOMENTUM_WARMUP_START",
             "muon_momentum_warmup_steps": "MUON_MOMENTUM_WARMUP_STEPS",
@@ -7257,6 +7613,25 @@ def _muon_prefers_cuda_bucket(
     return rows < cols or elements >= 524288
 
 
+def _muon_prefers_cuda_bucket_for_graph_capture(
+    shape: tuple[int, int],
+    *,
+    bucket_size: int,
+) -> bool:
+    if _muon_prefers_cuda_bucket(shape, bucket_size=bucket_size):
+        return True
+    rows, cols = int(shape[0]), int(shape[1])
+    elements = rows * cols
+    bucket_elements = elements * int(bucket_size)
+    if bucket_size < 2:
+        return False
+    if rows == cols:
+        return bucket_size >= 4 and bucket_elements >= 262144
+    if rows > cols:
+        return bucket_elements >= 262144
+    return bucket_elements >= 131072
+
+
 def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
     rows, cols = int(shape[0]), int(shape[1])
     if rows == cols:
@@ -7266,6 +7641,20 @@ def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
     if rows <= 384:
         return 2
     return 3
+
+
+def _make_cuda_pointer_tensor(tensors: list[Tensor], device: torch.device) -> Tensor:
+    ptrs_cpu = torch.tensor([int(t.data_ptr()) for t in tensors], dtype=torch.int64, device="cpu")
+    return ptrs_cpu.to(device=device, dtype=torch.int64, non_blocking=False)
+
+
+def _muon_square_backend_name(code: int) -> str:
+    mapping = {
+        1: "cublas",
+        2: "cublaslt",
+        3: "hybrid",
+    }
+    return mapping.get(int(code), "cublas")
 
 
 class Muon(torch.optim.Optimizer):
@@ -7293,7 +7682,7 @@ class Muon(torch.optim.Optimizer):
                 nesterov=nesterov,
             ),
         )
-        self.last_step_stats: dict[str, float | int | bool] = {}
+        self.last_step_stats: dict[str, Any] = {}
         self._cuda_bucket_workspaces: dict[tuple[int, ...], dict[str, Any]] = {}
         self._cuda_ext: Any | None = None
         self._capturable_requested = bool(capturable)
@@ -7335,6 +7724,12 @@ class Muon(torch.optim.Optimizer):
             self._cuda_ext = None
         return self._cuda_ext
 
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        if self._graph_capture_ready and set_to_none:
+            set_to_none = False
+        super().zero_grad(set_to_none=set_to_none)
+
     def supports_full_step_cuda_graph(self) -> bool:
         return bool(self._graph_capture_ready)
 
@@ -7360,7 +7755,7 @@ class Muon(torch.optim.Optimizer):
                 self._graph_capture_disable_reason = "dynamic_backend_steps"
                 self._static_group_buckets = {}
                 return False
-            bucket_map: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[tuple[Tensor, dict[str, Tensor]]]] = {}
+            bucket_map: dict[tuple[tuple[int, int], torch.dtype, torch.device], list[tuple[Tensor, Tensor, dict[str, Tensor]]]] = {}
             for p in group["params"]:
                 if p.ndim != 2:
                     continue
@@ -7369,32 +7764,39 @@ class Muon(torch.optim.Optimizer):
                 if buf is None:
                     buf = torch.zeros_like(p, dtype=torch.float32 if p.dtype != torch.float32 else p.dtype)
                     state["momentum_buffer"] = buf
+                grad = p.grad
+                if grad is None:
+                    grad = torch.zeros_like(p)
+                    p.grad = grad
                 if (
                     p.device.type != "cuda"
+                    or grad.device.type != "cuda"
                     or not p.is_contiguous()
+                    or not grad.is_contiguous()
                     or not buf.is_contiguous()
                 ):
                     self._graph_capture_disable_reason = "non_cuda_or_noncontiguous_param"
                     self._static_group_buckets = {}
                     return False
                 bucket_key = (tuple(int(v) for v in p.shape), p.dtype, p.device)
-                bucket_map.setdefault(bucket_key, []).append((p, state))
+                bucket_map.setdefault(bucket_key, []).append((p, grad, state))
             group_buckets: list[dict[str, Any]] = []
             for (shape, _dtype, _device), items in bucket_map.items():
-                if not _muon_prefers_cuda_bucket(shape, bucket_size=len(items)):
+                if not _muon_prefers_cuda_bucket_for_graph_capture(shape, bucket_size=len(items)):
                     self._graph_capture_disable_reason = "python_fallback_bucket"
                     self._static_group_buckets = {}
                     return False
                 params_bucket = [item[0] for item in items]
-                states_bucket = [item[1] for item in items]
-                workspace = self._get_cuda_bucket_workspace(
-                    [(param, param, state) for param, state in zip(params_bucket, states_bucket, strict=True)]
-                )
+                grads_bucket = [item[1] for item in items]
+                states_bucket = [item[2] for item in items]
+                workspace = self._get_cuda_bucket_workspace(items)
                 group_buckets.append(
                     {
                         "params": params_bucket,
+                        "grads": grads_bucket,
                         "states": states_bucket,
                         "family_code": int(workspace["family_code"]),
+                        "square_backend": str(workspace.get("square_backend", "")),
                         "workspace": workspace,
                         "shape": tuple(int(v) for v in shape),
                     }
@@ -7420,11 +7822,13 @@ class Muon(torch.optim.Optimizer):
             *(id(param) for param in params_bucket),
         )
         workspace = self._cuda_bucket_workspaces.get(key)
+        grads_bucket = [item[1] for item in bucket_items]
         if workspace is None:
             family_code = _muon_bucket_family_code(shape)
             transpose_input = family_code == 1
             ns_rows = shape[1] if transpose_input else shape[0]
             ns_cols = shape[0] if transpose_input else shape[1]
+            ext = self._load_cuda_ext_or_none()
             effective_batch = torch.empty(
                 (len(bucket_items), shape[0], shape[1]),
                 device=device,
@@ -7452,6 +7856,13 @@ class Muon(torch.optim.Optimizer):
             )
             gram_sq_batch = torch.empty_like(gram_batch)
             next_x_batch = torch.empty_like(ns_input_batch)
+            param_ptrs = _make_cuda_pointer_tensor(params_bucket, device) if self._capturable_requested else None
+            grad_ptrs = _make_cuda_pointer_tensor(grads_bucket, device) if self._capturable_requested else None
+            square_backend = ""
+            if family_code == 0 and ext is not None and hasattr(ext, "describe_square_backend"):
+                square_backend = _muon_square_backend_name(int(ext.describe_square_backend(ns_input_batch)))
+                if hasattr(ext, "prewarm_square_backend"):
+                    ext.prewarm_square_backend(ns_input_batch)
             momentum_views = [momentum_batch[idx] for idx in range(len(bucket_items))]
             for state, view in zip(states_bucket, momentum_views, strict=True):
                 existing = state.get("momentum_buffer")
@@ -7469,10 +7880,44 @@ class Muon(torch.optim.Optimizer):
                 "gram_batch": gram_batch,
                 "gram_sq_batch": gram_sq_batch,
                 "next_x_batch": next_x_batch,
+                "param_ptrs": param_ptrs,
+                "grad_ptrs": grad_ptrs,
+                "grad_tensor_ids": tuple(id(grad) for grad in grads_bucket),
+                "grad_data_ptrs": tuple(int(grad.data_ptr()) for grad in grads_bucket),
+                "square_backend": square_backend,
                 "momentum_views": momentum_views,
             }
             self._cuda_bucket_workspaces[key] = workspace
+        elif self._capturable_requested:
+            grad_tensor_ids = tuple(id(grad) for grad in grads_bucket)
+            grad_data_ptrs = tuple(int(grad.data_ptr()) for grad in grads_bucket)
+            if (
+                workspace.get("grad_tensor_ids") != grad_tensor_ids
+                or workspace.get("grad_data_ptrs") != grad_data_ptrs
+            ):
+                workspace["grad_ptrs"] = _make_cuda_pointer_tensor(grads_bucket, device)
+                workspace["grad_tensor_ids"] = grad_tensor_ids
+                workspace["grad_data_ptrs"] = grad_data_ptrs
         return workspace
+
+    def _record_square_backend_stats(
+        self,
+        stats: dict[str, Any],
+        workspace: dict[str, Any],
+        tensor_count: int,
+        element_count: int,
+        seen_backends: set[str],
+    ) -> None:
+        backend = str(workspace.get("square_backend", ""))
+        if backend not in {"cublas", "cublaslt", "hybrid"}:
+            return
+        seen_backends.add(backend)
+        bucket_key = f"square_backend_{backend}_bucket_count"
+        tensor_key = f"square_backend_{backend}_tensor_count"
+        element_key = f"square_backend_{backend}_element_count"
+        stats[bucket_key] = int(stats.get(bucket_key, 0)) + 1
+        stats[tensor_key] = int(stats.get(tensor_key, 0)) + int(tensor_count)
+        stats[element_key] = int(stats.get(element_key, 0)) + int(element_count)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -7481,7 +7926,7 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        total_stats: dict[str, float | int | bool] = {
+        total_stats: dict[str, Any] = {
             "group_count": 0,
             "tensor_count": 0,
             "bucket_count": 0,
@@ -7494,7 +7939,17 @@ class Muon(torch.optim.Optimizer):
             "total_ms": 0.0,
             "cuda_ms": 0.0,
             "fallback_ms": 0.0,
+            "square_backend_cublas_bucket_count": 0,
+            "square_backend_cublas_tensor_count": 0,
+            "square_backend_cublas_element_count": 0,
+            "square_backend_cublaslt_bucket_count": 0,
+            "square_backend_cublaslt_tensor_count": 0,
+            "square_backend_cublaslt_element_count": 0,
+            "square_backend_hybrid_bucket_count": 0,
+            "square_backend_hybrid_tensor_count": 0,
+            "square_backend_hybrid_element_count": 0,
         }
+        seen_square_backends: set[str] = set()
         step_started_at = time.perf_counter() if PROFILE_MUON_STEP else 0.0
         if self._graph_capture_ready:
             muon_ext = self._load_cuda_ext_or_none()
@@ -7519,16 +7974,16 @@ class Muon(torch.optim.Optimizer):
                     raise RuntimeError("graph-safe Muon step requires tensor-backed lr/momentum/weight_decay")
                 for bucket in self._static_group_buckets.get(group_idx, []):
                     params_bucket = bucket["params"]
-                    grads_bucket = []
-                    for p in params_bucket:
-                        if p.grad is None:
-                            raise RuntimeError("graph-safe Muon step encountered a parameter without grad")
-                        grads_bucket.append(p.grad)
+                    grads_bucket = bucket["grads"]
                     workspace = bucket["workspace"]
+                    if not isinstance(workspace.get("param_ptrs"), Tensor) or not isinstance(workspace.get("grad_ptrs"), Tensor):
+                        raise RuntimeError("graph-safe Muon step requires cached CUDA pointer tensors")
                     bucket_element_count = sum(int(param.numel()) for param in params_bucket)
                     muon_ext.grouped_step_family_workspace_capturable(
                         params_bucket,
                         grads_bucket,
+                        workspace["param_ptrs"],
+                        workspace["grad_ptrs"],
                         workspace["effective_batch"],
                         workspace["momentum_batch"],
                         workspace["norms"],
@@ -7548,8 +8003,16 @@ class Muon(torch.optim.Optimizer):
                     total_stats["tensor_count"] = int(total_stats["tensor_count"]) + len(params_bucket)
                     total_stats["cuda_tensor_count"] = int(total_stats["cuda_tensor_count"]) + len(params_bucket)
                     total_stats["cuda_element_count"] = int(total_stats["cuda_element_count"]) + bucket_element_count
+                    self._record_square_backend_stats(
+                        total_stats,
+                        workspace,
+                        len(params_bucket),
+                        bucket_element_count,
+                        seen_square_backends,
+                    )
             if PROFILE_MUON_STEP:
                 total_stats["total_ms"] = (time.perf_counter() - step_started_at) * 1000.0
+            total_stats["square_backend_modes"] = ",".join(sorted(seen_square_backends)) if seen_square_backends else "none"
             self.last_step_stats = total_stats
             return loss
         for group in self.param_groups:
@@ -7557,12 +8020,19 @@ class Muon(torch.optim.Optimizer):
             if not params:
                 continue
             total_stats["group_count"] = int(total_stats["group_count"]) + 1
-            lr = group["lr"]
-            momentum = group["momentum"]
+            lr_value = self._group_tensor_or_float(group, "lr", 0.0)
+            momentum_value = self._group_tensor_or_float(group, "momentum", 0.0)
+            weight_decay_value = self._group_tensor_or_float(group, "weight_decay", 0.0)
+            lr = float(lr_value.detach().item()) if isinstance(lr_value, Tensor) else float(lr_value)
+            momentum = float(momentum_value.detach().item()) if isinstance(momentum_value, Tensor) else float(momentum_value)
             backend_steps = group["backend_steps"]
             backend_steps_light = group["backend_steps_light"]
             backend_refresh_interval = max(int(group["backend_refresh_interval"]), 1)
-            weight_decay = group["weight_decay"]
+            weight_decay = (
+                float(weight_decay_value.detach().item())
+                if isinstance(weight_decay_value, Tensor)
+                else float(weight_decay_value)
+            )
             nesterov = group["nesterov"]
             step_index = int(group.get("step_index", 0)) + 1
             group["step_index"] = step_index
@@ -7636,6 +8106,13 @@ class Muon(torch.optim.Optimizer):
                     )
                     total_stats["cuda_tensor_count"] = int(total_stats["cuda_tensor_count"]) + len(bucket_items)
                     total_stats["cuda_element_count"] = int(total_stats["cuda_element_count"]) + bucket_element_count
+                    self._record_square_backend_stats(
+                        total_stats,
+                        workspace,
+                        len(bucket_items),
+                        bucket_element_count,
+                        seen_square_backends,
+                    )
                     if PROFILE_MUON_STEP:
                         total_stats["cuda_ms"] = float(total_stats["cuda_ms"]) + (
                             (time.perf_counter() - bucket_started_at) * 1000.0
@@ -7665,6 +8142,7 @@ class Muon(torch.optim.Optimizer):
 
         if PROFILE_MUON_STEP:
             total_stats["total_ms"] = (time.perf_counter() - step_started_at) * 1000.0
+        total_stats["square_backend_modes"] = ",".join(sorted(seen_square_backends)) if seen_square_backends else "none"
         self.last_step_stats = total_stats
         return loss
 
@@ -11683,6 +12161,7 @@ class CausalStateMixer(nn.Module):
             self.last_kernel_info = {
                 "path": "latent_replace",
                 "backend": "cuda" if bool(USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and x.is_cuda and self.latent_rank > 0) else "python",
+                "family": _latent_replace_kernel_family(local_logits),
                 "uses_paged_cache": False,
             }
         else:
@@ -11763,6 +12242,7 @@ class CausalStateMixer(nn.Module):
             self.last_kernel_info = {
                 "path": "latent_replace",
                 "backend": "cuda" if bool(USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and x.is_cuda and self.latent_rank > 0) else "python",
+                "family": _latent_replace_kernel_family(local_logits),
                 "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
                 "paged_cache_write_backend": str(cache.last_paged_write_backend),
             }
@@ -14083,15 +14563,8 @@ def main() -> None:
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     ema_state = init_ema_state(base_model) if args.ema_decay > 0.0 else None
     ema_state_updated = False
-    if not args.use_cuda_graphs:
-        cuda_graph_disable_reason = "disabled"
-    elif distributed:
-        cuda_graph_disable_reason = "distributed_full_step_unsupported"
-    elif muon_optimizers:
-        cuda_graph_disable_reason = "muon_full_step_unsupported"
-    else:
-        cuda_graph_disable_reason = "eligible"
-    cuda_graph_eligible = cuda_graph_disable_reason == "eligible"
+    cuda_graph_disable_reason = "pending_optimizer_setup"
+    cuda_graph_eligible = False
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -14257,7 +14730,9 @@ def main() -> None:
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
-        f"cuda_graph_full_step:{int((not distributed) and not muon_optimizers and args.use_cuda_graphs)}"
+        f"muon_cuda_graph_mode:{args.muon_cuda_graph_mode} "
+        f"cuda_graph_full_step:{int(graph_full_step_supported and args.use_cuda_graphs)} "
+        f"cuda_graph_reason:{cuda_graph_disable_reason}"
     )
     positional_mode = "rope_only"
     log0(f"positional_mode:{positional_mode} train_seq_len:{args.train_seq_len} iterations:{args.iterations}")
@@ -14282,7 +14757,11 @@ def main() -> None:
             opt.zero_grad(set_to_none=set_to_none)
 
     muon_graph_capture_ready = all(opt.prepare_cuda_graph_capture() for opt in muon_optimizers) if muon_optimizers else False
-    graph_full_step_supported = (not distributed) and (not muon_optimizers or muon_graph_capture_ready)
+    muon_graph_capture_forced_off = bool(muon_optimizers) and args.muon_cuda_graph_mode == "off"
+    muon_graph_capture_forced_on = bool(muon_optimizers) and args.muon_cuda_graph_mode == "on"
+    graph_full_step_supported = (not distributed) and (
+        not muon_optimizers or (muon_graph_capture_ready and not muon_graph_capture_forced_off)
+    )
     graph_step_optimizers = list(optimizers) if graph_full_step_supported else [opt for opt in optimizers if not isinstance(opt, Muon)]
 
     def _prepare_graphable_optimizers() -> None:
@@ -14317,6 +14796,23 @@ def main() -> None:
             group[name] = float(value)
 
     _prepare_graphable_optimizers()
+    if not args.use_cuda_graphs:
+        cuda_graph_disable_reason = "disabled"
+    elif distributed:
+        cuda_graph_disable_reason = "distributed_full_step_unsupported"
+    elif muon_graph_capture_forced_off:
+        cuda_graph_disable_reason = "muon_full_step_forced_off"
+    elif muon_graph_capture_forced_on and not muon_graph_capture_ready:
+        muon_reasons = sorted({opt.graph_capture_disable_reason() for opt in muon_optimizers if opt.graph_capture_disable_reason()})
+        suffix = f":{','.join(muon_reasons)}" if muon_reasons else ""
+        cuda_graph_disable_reason = f"muon_full_step_forced_on_but_unsupported{suffix}"
+    elif muon_optimizers and not muon_graph_capture_ready:
+        muon_reasons = sorted({opt.graph_capture_disable_reason() for opt in muon_optimizers if opt.graph_capture_disable_reason()})
+        suffix = f":{','.join(muon_reasons)}" if muon_reasons else ""
+        cuda_graph_disable_reason = f"muon_full_step_unsupported{suffix}"
+    else:
+        cuda_graph_disable_reason = "eligible"
+    cuda_graph_eligible = cuda_graph_disable_reason == "eligible"
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -14668,7 +15164,7 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for opt in muon_optimizers:
             for group in opt.param_groups:
-                group["momentum"] = muon_momentum
+                _set_group_scalar(group, "momentum", muon_momentum)
 
         early_frac = early_phase_frac(step)
         attn_lr_scale = 1.0 + early_frac * (args.early_muon_attn_lr_scale - 1.0)
@@ -14685,7 +15181,7 @@ def main() -> None:
             for group in opt.param_groups:
                 _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
                 if opt is optimizer_muon_attn or opt is optimizer_muon_mlp:
-                    group["weight_decay"] = args.muon_weight_decay * muon_wd_scale
+                    _set_group_scalar(group, "weight_decay", args.muon_weight_decay * muon_wd_scale)
 
         step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
         used_cuda_graph = False

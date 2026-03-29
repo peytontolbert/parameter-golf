@@ -56,6 +56,8 @@ void muon_grouped_step_family_workspace_cuda(
 void muon_grouped_step_family_workspace_capturable_cuda(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
     torch::Tensor effective_batch,
     torch::Tensor momentum_batch,
     torch::Tensor norms,
@@ -70,8 +72,22 @@ void muon_grouped_step_family_workspace_capturable_cuda(
     bool nesterov,
     int64_t ns_steps,
     double eps);
+int64_t muon_describe_square_backend_cuda(const torch::Tensor& x);
+void muon_prewarm_square_backend_cuda(const torch::Tensor& x);
 
 namespace {
+
+void check_pointer_tensor(
+    const torch::Tensor& ptrs,
+    int64_t expected_size,
+    const torch::Device& ref_device,
+    const char* name) {
+    TORCH_CHECK(ptrs.is_cuda(), name, " must be CUDA");
+    TORCH_CHECK(ptrs.device() == ref_device, name, " device mismatch");
+    TORCH_CHECK(ptrs.scalar_type() == torch::kInt64, name, " must be int64");
+    TORCH_CHECK(ptrs.dim() == 1 && ptrs.size(0) == expected_size, name, " shape mismatch");
+    TORCH_CHECK(ptrs.is_contiguous(), name, " must be contiguous");
+}
 
 void check_grouped_inputs(
     const std::vector<torch::Tensor>& params,
@@ -385,6 +401,8 @@ void muon_grouped_step_family_workspace(
 void muon_grouped_step_family_workspace_capturable(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
     torch::Tensor effective_batch,
     torch::Tensor momentum_batch,
     torch::Tensor norms,
@@ -463,6 +481,8 @@ void muon_grouped_step_family_workspace_capturable(
     TORCH_CHECK(gram_batch.scalar_type() == torch::kBFloat16, "gram_batch must be bf16");
     TORCH_CHECK(gram_sq_batch.scalar_type() == torch::kBFloat16, "gram_sq_batch must be bf16");
     TORCH_CHECK(next_x_batch.scalar_type() == torch::kBFloat16, "next_x_batch must be bf16");
+    check_pointer_tensor(param_ptrs, bucket_size, ref_device, "param_ptrs");
+    check_pointer_tensor(grad_ptrs, bucket_size, ref_device, "grad_ptrs");
     TORCH_CHECK(lr.is_cuda() && lr.scalar_type() == torch::kFloat && lr.numel() == 1, "lr must be a CUDA float32 scalar tensor");
     TORCH_CHECK(momentum.is_cuda() && momentum.scalar_type() == torch::kFloat && momentum.numel() == 1, "momentum must be a CUDA float32 scalar tensor");
     TORCH_CHECK(weight_decay.is_cuda() && weight_decay.scalar_type() == torch::kFloat && weight_decay.numel() == 1, "weight_decay must be a CUDA float32 scalar tensor");
@@ -471,6 +491,8 @@ void muon_grouped_step_family_workspace_capturable(
     muon_grouped_step_family_workspace_capturable_cuda(
         std::move(params),
         std::move(grads),
+        std::move(param_ptrs),
+        std::move(grad_ptrs),
         std::move(effective_batch),
         std::move(momentum_batch),
         std::move(norms),
@@ -499,4 +521,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "grouped_step_family_workspace_capturable",
         &muon_grouped_step_family_workspace_capturable,
         "Grouped Muon step with family-specialized workspaces and CUDA scalar tensors (CUDA)");
+    m.def("describe_square_backend", &muon_describe_square_backend_cuda, "Describe Muon square backend selection (CUDA)");
+    m.def("prewarm_square_backend", &muon_prewarm_square_backend_cuda, "Prewarm Muon square backend policy objects (CUDA)");
 }

@@ -3025,6 +3025,70 @@ __global__ __launch_bounds__(kThreads) void latent_replace_forward_kernel(
     }
 }
 
+constexpr int kLatentReplaceExactNumStates = 128;
+constexpr int kLatentReplaceExactThreads = 128;
+
+template <int kBlockThreads>
+__device__ __forceinline__ float latent_replace_block_reduce_sum(float value, float* shared, int tid) {
+    shared[tid] = value;
+    __syncthreads();
+    for (int offset = kBlockThreads / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+template <int kBlockThreads>
+__device__ __forceinline__ float latent_replace_block_reduce_max(float value, float* shared, int tid) {
+    shared[tid] = value;
+    __syncthreads();
+    for (int offset = kBlockThreads / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] = fmaxf(shared[tid], shared[tid + offset]);
+        }
+        __syncthreads();
+    }
+    return shared[0];
+}
+
+template <typename scalar_t>
+__global__ __launch_bounds__(kLatentReplaceExactThreads) void latent_replace_forward_kernel_128(
+    const scalar_t* __restrict__ local_logits,
+    const scalar_t* __restrict__ prior_logits,
+    const scalar_t* __restrict__ transition_context,
+    const scalar_t* __restrict__ token_gate,
+    const scalar_t* __restrict__ pred_scale,
+    int64_t rows,
+    scalar_t* __restrict__ beliefs,
+    scalar_t* __restrict__ prior_log_beliefs) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    constexpr int kNumStates = kLatentReplaceExactNumStates;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t base = row * kNumStates;
+    __shared__ float shared[kLatentReplaceExactThreads];
+    const float gate = load_as_float(token_gate + row);
+    const float scale = fmaxf(load_as_float(pred_scale + row), 1.0e-4f);
+    const float raw_unscaled = load_as_float(prior_logits + base + tid) + load_as_float(transition_context + base + tid);
+    const float raw = raw_unscaled / scale;
+    const float filtered = load_as_float(local_logits + base + tid) + gate * raw;
+    const float row_max_filtered = latent_replace_block_reduce_max<kLatentReplaceExactThreads>(filtered, shared, tid);
+    const float row_max_prior = latent_replace_block_reduce_max<kLatentReplaceExactThreads>(raw, shared, tid);
+    const float filtered_exp = expf(filtered - row_max_filtered);
+    const float prior_exp = expf(raw - row_max_prior);
+    const float filtered_sum = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(filtered_exp, shared, tid);
+    const float prior_sum = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(prior_exp, shared, tid);
+    const float row_logsum_filtered = row_max_filtered + logf(fmaxf(filtered_sum, 1.0e-20f));
+    const float row_logsum_prior = row_max_prior + logf(fmaxf(prior_sum, 1.0e-20f));
+    beliefs[base + tid] = store_from_float<scalar_t>(filtered - row_logsum_filtered);
+    prior_log_beliefs[base + tid] = store_from_float<scalar_t>(raw - row_logsum_prior);
+}
+
 template <typename scalar_t>
 __global__ __launch_bounds__(kThreads) void latent_replace_backward_kernel(
     const scalar_t* __restrict__ grad_beliefs,
@@ -3122,6 +3186,65 @@ __global__ __launch_bounds__(kThreads) void latent_replace_backward_kernel(
     }
 }
 
+template <typename scalar_t>
+__global__ __launch_bounds__(kLatentReplaceExactThreads) void latent_replace_backward_kernel_128(
+    const scalar_t* __restrict__ grad_beliefs,
+    const scalar_t* __restrict__ grad_prior_log_beliefs,
+    const scalar_t* __restrict__ prior_logits,
+    const scalar_t* __restrict__ transition_context,
+    const scalar_t* __restrict__ token_gate,
+    const scalar_t* __restrict__ pred_scale,
+    const scalar_t* __restrict__ beliefs,
+    const scalar_t* __restrict__ prior_log_beliefs,
+    int64_t rows,
+    scalar_t* __restrict__ grad_local_logits,
+    scalar_t* __restrict__ grad_prior_logits,
+    scalar_t* __restrict__ grad_transition_context,
+    scalar_t* __restrict__ grad_token_gate,
+    scalar_t* __restrict__ grad_pred_scale) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    if (row >= rows) {
+        return;
+    }
+    constexpr int kNumStates = kLatentReplaceExactNumStates;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int64_t base = row * kNumStates;
+    __shared__ float shared[kLatentReplaceExactThreads];
+    const float gate = load_as_float(token_gate + row);
+    const float scale = fmaxf(load_as_float(pred_scale + row), 1.0e-4f);
+    const float inv_scale = 1.0f / scale;
+    const float inv_scale_sq = inv_scale * inv_scale;
+    const float row_sum_grad_beliefs = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(
+        load_as_float(grad_beliefs + base + tid),
+        shared,
+        tid);
+    const float row_sum_grad_prior = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(
+        load_as_float(grad_prior_log_beliefs + base + tid),
+        shared,
+        tid);
+    const float belief_log = load_as_float(beliefs + base + tid);
+    const float prior_log = load_as_float(prior_log_beliefs + base + tid);
+    const float grad_belief = load_as_float(grad_beliefs + base + tid);
+    const float grad_prior_log = load_as_float(grad_prior_log_beliefs + base + tid);
+    const float raw_unscaled = load_as_float(prior_logits + base + tid) + load_as_float(transition_context + base + tid);
+    const float raw = raw_unscaled * inv_scale;
+    const float grad_filtered = grad_belief - expf(belief_log) * row_sum_grad_beliefs;
+    const float grad_prior_row = grad_prior_log - expf(prior_log) * row_sum_grad_prior;
+    const float grad_raw = gate * grad_filtered + grad_prior_row;
+    const float grad_unscaled = grad_raw * inv_scale;
+    grad_local_logits[base + tid] = store_from_float<scalar_t>(grad_filtered);
+    grad_prior_logits[base + tid] = store_from_float<scalar_t>(grad_unscaled);
+    grad_transition_context[base + tid] = store_from_float<scalar_t>(grad_unscaled);
+    const float gate_grad = grad_filtered * raw;
+    const float scale_grad = -grad_raw * raw_unscaled * inv_scale_sq;
+    const float row_gate_grad = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(gate_grad, shared, tid);
+    const float row_scale_grad = latent_replace_block_reduce_sum<kLatentReplaceExactThreads>(scale_grad, shared, tid);
+    if (tid == 0) {
+        grad_token_gate[row] = store_from_float<scalar_t>(row_gate_grad);
+        grad_pred_scale[row] = store_from_float<scalar_t>(row_scale_grad);
+    }
+}
+
 std::vector<torch::Tensor> causal_machine_latent_replace_forward_cuda(
     torch::Tensor local_logits,
     torch::Tensor prior_logits,
@@ -3140,18 +3263,31 @@ std::vector<torch::Tensor> causal_machine_latent_replace_forward_cuda(
     const int64_t rows = batch_size * seq_len;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const dim3 grid(static_cast<unsigned int>(rows));
-    const dim3 block(static_cast<unsigned int>(kThreads));
+    const bool use_exact_128 = num_states == kLatentReplaceExactNumStates;
+    const dim3 block(static_cast<unsigned int>(use_exact_128 ? kLatentReplaceExactThreads : kThreads));
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, local_logits.scalar_type(), "latent_replace_forward_cuda", [&] {
-        latent_replace_forward_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            local_logits.data_ptr<scalar_t>(),
-            prior_logits.data_ptr<scalar_t>(),
-            transition_context.data_ptr<scalar_t>(),
-            token_gate.data_ptr<scalar_t>(),
-            pred_scale.data_ptr<scalar_t>(),
-            rows,
-            num_states,
-            beliefs.data_ptr<scalar_t>(),
-            prior_log_beliefs.data_ptr<scalar_t>());
+        if (use_exact_128) {
+            latent_replace_forward_kernel_128<scalar_t><<<grid, block, 0, stream>>>(
+                local_logits.data_ptr<scalar_t>(),
+                prior_logits.data_ptr<scalar_t>(),
+                transition_context.data_ptr<scalar_t>(),
+                token_gate.data_ptr<scalar_t>(),
+                pred_scale.data_ptr<scalar_t>(),
+                rows,
+                beliefs.data_ptr<scalar_t>(),
+                prior_log_beliefs.data_ptr<scalar_t>());
+        } else {
+            latent_replace_forward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                local_logits.data_ptr<scalar_t>(),
+                prior_logits.data_ptr<scalar_t>(),
+                transition_context.data_ptr<scalar_t>(),
+                token_gate.data_ptr<scalar_t>(),
+                pred_scale.data_ptr<scalar_t>(),
+                rows,
+                num_states,
+                beliefs.data_ptr<scalar_t>(),
+                prior_log_beliefs.data_ptr<scalar_t>());
+        }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {beliefs, prior_log_beliefs};
@@ -3186,24 +3322,43 @@ std::vector<torch::Tensor> causal_machine_latent_replace_backward_cuda(
     const int64_t rows = batch_size * seq_len;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const dim3 grid(static_cast<unsigned int>(rows));
-    const dim3 block(static_cast<unsigned int>(kThreads));
+    const bool use_exact_128 = num_states == kLatentReplaceExactNumStates;
+    const dim3 block(static_cast<unsigned int>(use_exact_128 ? kLatentReplaceExactThreads : kThreads));
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, beliefs.scalar_type(), "latent_replace_backward_cuda", [&] {
-        latent_replace_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            grad_beliefs.data_ptr<scalar_t>(),
-            grad_prior_log_beliefs.data_ptr<scalar_t>(),
-            prior_logits.data_ptr<scalar_t>(),
-            transition_context.data_ptr<scalar_t>(),
-            token_gate.data_ptr<scalar_t>(),
-            pred_scale.data_ptr<scalar_t>(),
-            beliefs.data_ptr<scalar_t>(),
-            prior_log_beliefs.data_ptr<scalar_t>(),
-            rows,
-            num_states,
-            grad_local_logits.data_ptr<scalar_t>(),
-            grad_prior_logits.data_ptr<scalar_t>(),
-            grad_transition_context.data_ptr<scalar_t>(),
-            grad_token_gate.data_ptr<scalar_t>(),
-            grad_pred_scale.data_ptr<scalar_t>());
+        if (use_exact_128) {
+            latent_replace_backward_kernel_128<scalar_t><<<grid, block, 0, stream>>>(
+                grad_beliefs.data_ptr<scalar_t>(),
+                grad_prior_log_beliefs.data_ptr<scalar_t>(),
+                prior_logits.data_ptr<scalar_t>(),
+                transition_context.data_ptr<scalar_t>(),
+                token_gate.data_ptr<scalar_t>(),
+                pred_scale.data_ptr<scalar_t>(),
+                beliefs.data_ptr<scalar_t>(),
+                prior_log_beliefs.data_ptr<scalar_t>(),
+                rows,
+                grad_local_logits.data_ptr<scalar_t>(),
+                grad_prior_logits.data_ptr<scalar_t>(),
+                grad_transition_context.data_ptr<scalar_t>(),
+                grad_token_gate.data_ptr<scalar_t>(),
+                grad_pred_scale.data_ptr<scalar_t>());
+        } else {
+            latent_replace_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                grad_beliefs.data_ptr<scalar_t>(),
+                grad_prior_log_beliefs.data_ptr<scalar_t>(),
+                prior_logits.data_ptr<scalar_t>(),
+                transition_context.data_ptr<scalar_t>(),
+                token_gate.data_ptr<scalar_t>(),
+                pred_scale.data_ptr<scalar_t>(),
+                beliefs.data_ptr<scalar_t>(),
+                prior_log_beliefs.data_ptr<scalar_t>(),
+                rows,
+                num_states,
+                grad_local_logits.data_ptr<scalar_t>(),
+                grad_prior_logits.data_ptr<scalar_t>(),
+                grad_transition_context.data_ptr<scalar_t>(),
+                grad_token_gate.data_ptr<scalar_t>(),
+                grad_pred_scale.data_ptr<scalar_t>());
+        }
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {
