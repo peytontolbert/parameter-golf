@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -14,7 +16,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
@@ -26,7 +28,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
@@ -38,7 +40,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_cuda(
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -56,7 +58,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -73,7 +75,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_cuda(
     torch::Tensor block_col_idx,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -91,7 +93,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_cuda(
     torch::Tensor block_mask,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -115,7 +117,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -137,7 +139,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -192,7 +194,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size);
 
@@ -204,7 +206,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size);
@@ -215,7 +217,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -233,7 +235,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_cu
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -251,7 +253,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_wo
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -271,7 +273,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -290,7 +292,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspac
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -309,7 +311,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_works
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -327,7 +329,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_bound
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -344,7 +346,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -360,7 +362,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -383,11 +385,29 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
     double score_clamp_max = std::numeric_limits<double>::infinity());
+
+std::vector<torch::Tensor> causal_machine_scan_backward_workspace_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_probs,
+    torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size,
+    double score_clamp_min,
+    double score_clamp_max,
+    torch::Tensor grad_transition_source_per_batch,
+    torch::Tensor grad_transition_dest_per_batch,
+    torch::Tensor grad_transition_stay_per_batch,
+    torch::Tensor grad_transition_gate_per_batch);
 
 std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
     torch::Tensor grad_beliefs,
@@ -397,11 +417,29 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
     double score_clamp_max = std::numeric_limits<double>::infinity());
+
+std::vector<torch::Tensor> causal_machine_scan_backward_logits_workspace_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size,
+    double score_clamp_min,
+    double score_clamp_max,
+    torch::Tensor grad_transition_source_per_batch,
+    torch::Tensor grad_transition_dest_per_batch,
+    torch::Tensor grad_transition_stay_per_batch,
+    torch::Tensor grad_transition_gate_per_batch);
 
 std::vector<torch::Tensor> causal_machine_scan_backward_composable_logits_cuda(
     torch::Tensor grad_beliefs,
@@ -424,7 +462,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size);
 
@@ -438,7 +476,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size);
@@ -451,7 +489,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -470,7 +508,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -490,7 +528,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_c
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -510,7 +548,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_w
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -537,7 +575,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -558,7 +596,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspa
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -584,7 +622,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_works
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -609,7 +647,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_bound
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -628,7 +666,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace_
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -656,6 +694,7 @@ int64_t causal_machine_scan_forward_masked_tiled_chunk_shared_bytes_cuda(int64_t
 int64_t causal_machine_scan_backward_masked_tiled_chunk_shared_bytes_cuda(int64_t num_states, int64_t tile_size);
 int64_t causal_machine_scan_backward_chunk_shared_bytes_cuda(int64_t num_states, int64_t transition_rank, bool direct_grad_reduce);
 bool causal_machine_scan_can_use_direct_grad_reduce_cuda(int64_t device_index, int64_t num_states, int64_t transition_rank);
+int64_t small_state_direct_staging_worker_blocks(int64_t device_index, int64_t batch_size);
 bool causal_machine_scan_can_use_tiled_forward_kernel_cuda(int64_t device_index, int64_t num_states, int64_t tile_size, int64_t split_size);
 bool causal_machine_scan_can_use_tiled_backward_kernel_cuda(int64_t device_index, int64_t num_states, int64_t tile_size, int64_t split_size);
 bool causal_machine_scan_can_use_masked_tiled_forward_kernel_cuda(int64_t device_index, int64_t num_states, int64_t tile_size);
@@ -741,7 +780,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     double score_clamp_min,
     double score_clamp_max);
 std::vector<torch::Tensor> causal_machine_scan_paged_step_quantized_cuda(
@@ -756,7 +795,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_quantized_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate);
+    torch::Tensor transition_gate);
 std::vector<torch::Tensor> causal_machine_scan_paged_step_fp8_cuda(
     torch::Tensor paged_log_beliefs,
     torch::Tensor paged_latent_states,
@@ -769,7 +808,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_fp8_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     int64_t fp8_format);
 void causal_machine_scan_reorder_paged_cache_cuda(
     torch::Tensor paged_page_table,
@@ -777,6 +816,65 @@ void causal_machine_scan_reorder_paged_cache_cuda(
     torch::Tensor beam_indices);
 
 namespace {
+
+torch::Tensor make_cuda_workspace_tensor(
+    int64_t device_index,
+    at::ScalarType dtype,
+    at::IntArrayRef sizes,
+    bool zero_init = false);
+
+struct DenseBackwardWorkspace {
+    torch::Tensor grad_transition_source_per_batch;
+    torch::Tensor grad_transition_dest_per_batch;
+    torch::Tensor grad_transition_stay_per_batch;
+    torch::Tensor grad_transition_gate_per_batch;
+};
+
+DenseBackwardWorkspace get_dense_backward_workspace(
+    const torch::Tensor& beliefs,
+    int64_t num_states,
+    int64_t transition_rank) {
+    static std::mutex workspace_mutex;
+    static std::unordered_map<std::string, DenseBackwardWorkspace> workspace_cache;
+
+    const int64_t device_index = beliefs.get_device();
+    const int64_t batch_size = beliefs.size(0);
+    const bool direct_small_rank_grad = causal_machine_scan_can_use_direct_grad_reduce_cuda(
+        device_index,
+        num_states,
+        transition_rank);
+    const int64_t staging_blocks = direct_small_rank_grad
+        ? small_state_direct_staging_worker_blocks(device_index, batch_size)
+        : batch_size;
+    const std::string cache_key =
+        std::to_string(device_index) + ":" +
+        std::to_string(num_states) + ":" +
+        std::to_string(transition_rank) + ":" +
+        std::to_string(batch_size) + ":" +
+        (direct_small_rank_grad ? "direct" : "per_batch");
+
+    std::lock_guard<std::mutex> lock(workspace_mutex);
+    auto& workspace = workspace_cache[cache_key];
+    if (!workspace.grad_transition_source_per_batch.defined()) {
+        workspace.grad_transition_source_per_batch = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            {staging_blocks, num_states, transition_rank});
+        workspace.grad_transition_dest_per_batch = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            {staging_blocks, transition_rank, num_states});
+        workspace.grad_transition_stay_per_batch = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            {staging_blocks, num_states});
+        workspace.grad_transition_gate_per_batch = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            {staging_blocks});
+    }
+    return workspace;
+}
 
 constexpr int kSpecializedNumStates = 128;
 constexpr int kMinSpecializedNumStates = 64;
@@ -1008,9 +1106,13 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
         tile_size,
         split_size);
     const int64_t capability_major = causal_machine_scan_cached_capability_major_cuda(device_index);
+    const bool hopper_tma_capable = capability_major >= 9 && causal_machine_scan_can_use_tma_cuda(device_index);
+    const bool hopper_wgmma_capable = capability_major >= 9 && causal_machine_scan_can_use_wgmma_cuda(device_index);
     const bool async_pipeline_forward_supported = custom_forward_kernel_supported && capability_major >= 8;
     const std::string forward_kernel_family = custom_forward_kernel_supported
-        ? (capability_major >= 9 ? "sm90_async_pipeline_tiled_custom" : "sm80_async_pipeline_tiled_custom")
+        ? (capability_major >= 9
+            ? (hopper_tma_capable ? "sm90_tma_async3_tiled_custom" : "sm90_async_pipeline_tiled_custom")
+            : "sm80_async_pipeline_tiled_custom")
         : "split_combine_fallback";
     const bool custom_backward_kernel_smem_supported = causal_machine_scan_can_use_tiled_backward_kernel_cuda(
         device_index,
@@ -1039,11 +1141,13 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     const bool forward_vectorized_io = bool(runtime_value_at(forward_runtime, 5));
     const bool forward_async_copy_path = bool(runtime_value_at(forward_runtime, 6));
     const bool forward_tensor_core_math = bool(runtime_value_at(forward_runtime, 7));
+    const bool forward_wgmma_math = hopper_wgmma_capable && forward_tensor_core_math && block_threads >= 128;
     const int64_t forward_async_pipeline_stages = capability_major >= 9 ? 3 : 2;
     const bool forward_persisting_l2 = bool(runtime_value_at(forward_runtime, 16));
     const bool backward_vectorized_io = bool(runtime_value_at(backward_runtime, 17));
     const bool backward_async_copy_path = bool(runtime_value_at(backward_runtime, 18));
     const bool backward_tensor_core_math = bool(runtime_value_at(backward_runtime, 19));
+    const bool backward_wgmma_math = hopper_wgmma_capable && backward_tensor_core_math && block_threads >= 128;
     const bool backward_persisting_l2 = bool(runtime_value_at(backward_runtime, 22));
     info["num_states"] = num_states;
     info["transition_rank"] = transition_rank;
@@ -1069,6 +1173,10 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     info["async_pipeline_forward_supported"] = forward_async_copy_path;
     info["forward_async_copy_path"] = forward_async_copy_path;
     info["forward_async_pipeline_stages"] = forward_async_pipeline_stages;
+    info["forward_tma_capable"] = hopper_tma_capable;
+    info["forward_tma_specialized"] = hopper_tma_capable && custom_forward_kernel_supported;
+    info["forward_wgmma_capable"] = hopper_wgmma_capable;
+    info["forward_wgmma_kernel_implemented"] = hopper_wgmma_capable;
     info["forward_tensor_core_math_supported"] = forward_tensor_core_math;
     info["forward_active_blocks_per_sm"] = runtime_value_at(forward_runtime, 8);
     info["forward_active_warps_per_sm"] = runtime_value_at(forward_runtime, 9);
@@ -1100,6 +1208,11 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     info["backward_elements_per_load"] = runtime_value_at(backward_runtime, 16);
     info["backward_vectorized_io"] = backward_vectorized_io;
     info["backward_async_copy_path"] = backward_async_copy_path;
+    info["backward_async_pipeline_stages"] = forward_async_pipeline_stages;
+    info["backward_tma_capable"] = hopper_tma_capable;
+    info["backward_tma_specialized"] = hopper_tma_capable && custom_backward_kernel_smem_supported;
+    info["backward_wgmma_capable"] = hopper_wgmma_capable;
+    info["backward_wgmma_kernel_implemented"] = hopper_wgmma_capable;
     info["backward_tensor_core_math_supported"] = backward_tensor_core_math;
     info["backward_persisting_l2_candidate_bytes"] = runtime_value_at(backward_runtime, 20);
     info["backward_persisting_l2_effective_bytes"] = runtime_value_at(backward_runtime, 21);
@@ -1108,20 +1221,43 @@ py::dict causal_machine_scan_describe_tiled_runtime_config(
     info["backward_estimated_sync_points"] = runtime_value_at(backward_runtime, 24);
     info["custom_kernel_supported"] = custom_forward_kernel_supported;
     info["forward_kernel_family"] = forward_tensor_core_math
-        ? (capability_major >= 9 ? "sm90_wmma_async3_tiled_custom" : "sm80_wmma_tiled_custom")
+        ? (capability_major >= 9
+            ? (forward_wgmma_math
+                ? (hopper_tma_capable ? "sm90_tma_wgmma_async3_tiled_custom" : "sm90_wgmma_async3_tiled_custom")
+                : (hopper_tma_capable ? "sm90_tma_wmma_async3_tiled_custom" : "sm90_wmma_async3_tiled_custom"))
+            : "sm80_wmma_tiled_custom")
         : forward_kernel_family;
     info["forward_kernel_reason"] = custom_forward_kernel_supported
         ? (forward_tensor_core_math
-            ? (capability_major >= 9 ? "custom_tiled_async_memcpy_wmma_async3" : "custom_tiled_async_memcpy_wmma")
-            : (forward_async_copy_path ? "custom_tiled_async_memcpy" : "custom_tiled_shared_copy"))
+            ? (capability_major >= 9
+                ? (forward_wgmma_math
+                    ? (hopper_tma_capable ? "custom_tiled_tma_wgmma_async3" : "custom_tiled_async_memcpy_wgmma_async3")
+                    : (hopper_tma_capable ? "custom_tiled_tma_wmma_async3" : "custom_tiled_async_memcpy_wmma_async3"))
+                : "custom_tiled_async_memcpy_wmma")
+            : (forward_async_copy_path
+                ? (hopper_tma_capable ? "custom_tiled_tma_async3" : "custom_tiled_async_memcpy")
+                : "custom_tiled_shared_copy"))
         : "split_combine_fallback";
     info["custom_backward_kernel_smem_supported"] = custom_backward_kernel_smem_supported;
     info["custom_backward_kernel_scheduler_supported"] = custom_backward_kernel_scheduler_supported;
     info["custom_backward_kernel_supported"] = custom_backward_kernel_smem_supported
         && custom_backward_kernel_scheduler_supported;
     info["backward_kernel_family"] = (custom_backward_kernel_smem_supported && backward_tensor_core_math)
-        ? (capability_major >= 9 ? "sm90_wmma_tiled_backward_custom" : "sm80_wmma_tiled_backward_custom")
+        ? (capability_major >= 9
+            ? (backward_wgmma_math
+                ? (hopper_tma_capable ? "sm90_tma_wgmma_tiled_backward_custom" : "sm90_wgmma_tiled_backward_custom")
+                : (hopper_tma_capable ? "sm90_tma_wmma_tiled_backward_custom" : "sm90_wmma_tiled_backward_custom"))
+            : "sm80_wmma_tiled_backward_custom")
         : "persistent_tiled_backward_custom";
+    info["backward_kernel_reason"] = custom_backward_kernel_smem_supported
+        ? (backward_tensor_core_math
+            ? (capability_major >= 9
+                ? (backward_wgmma_math
+                    ? (hopper_tma_capable ? "persistent_tiled_backward_tma_wgmma" : "persistent_tiled_backward_wgmma")
+                    : (hopper_tma_capable ? "persistent_tiled_backward_tma_wmma" : "persistent_tiled_backward_wmma"))
+                : "persistent_tiled_backward_wmma")
+            : (hopper_tma_capable ? "persistent_tiled_backward_tma_async" : "persistent_tiled_backward_async"))
+        : "persistent_tiled_backward_fallback";
     info["uses_persisting_l2_window"] = forward_persisting_l2 || backward_persisting_l2;
     return info;
 }
@@ -1467,6 +1603,8 @@ py::dict causal_machine_scan_describe_masked_tiled_runtime_config(
     const bool custom_kernel_supported = custom_kernel_smem_supported
         && custom_kernel_memory_supported;
     const bool extension_fallback_supported = true;
+    const bool supports_tma = causal_machine_scan_can_use_tma_cuda(device_index);
+    const bool supports_wgmma = causal_machine_scan_can_use_wgmma_cuda(device_index);
     py::dict info;
     info["num_states"] = num_states;
     info["tile_size"] = tile_size;
@@ -1494,6 +1632,8 @@ py::dict causal_machine_scan_describe_masked_tiled_runtime_config(
     info["custom_kernel_memory_supported"] = custom_kernel_memory_supported;
     info["custom_kernel_supported"] = custom_kernel_supported;
     info["extension_fallback_supported"] = extension_fallback_supported;
+    info["supports_tma"] = supports_tma;
+    info["supports_wgmma"] = supports_wgmma;
     info["runtime_supported"] = custom_kernel_supported || extension_fallback_supported;
     info["uses_persisting_l2_window"] = backward
         ? bool(runtime_value_at(backward_runtime, 13))
@@ -1519,7 +1659,13 @@ py::dict causal_machine_scan_describe_masked_tiled_runtime_config(
     info["total_global_mem_bytes"] = backward ? runtime_value_at(backward_runtime, 19) : runtime_value_at(forward_runtime, 19);
     info["backward"] = backward;
     info["kernel_choice_reason"] = custom_kernel_supported
-        ? (backward ? "masked_tiled_custom" : "masked_tiled_custom_forward")
+        ? (backward
+            ? (supports_tma
+                ? (supports_wgmma ? "masked_tiled_tma_wgmma_backward" : "masked_tiled_tma_backward")
+                : (supports_wgmma ? "masked_tiled_wgmma_backward" : "masked_tiled_custom"))
+            : (supports_tma
+                ? (supports_wgmma ? "masked_tiled_tma_wgmma_forward" : "masked_tiled_tma_forward")
+                : (supports_wgmma ? "masked_tiled_wgmma_forward" : "masked_tiled_custom_forward")))
         : "masked_extension_fallback";
     return info;
 }
@@ -1542,6 +1688,8 @@ py::dict causal_machine_scan_describe_device_runtime_config(int64_t device_index
     info["supports_wmma"] = causal_machine_scan_can_use_wmma_cuda(device_index);
     info["supports_tma"] = causal_machine_scan_can_use_tma_cuda(device_index);
     info["supports_wgmma"] = causal_machine_scan_can_use_wgmma_cuda(device_index);
+    info["structured_scan_tma_kernels_implemented"] = true;
+    info["structured_scan_wgmma_kernels_implemented"] = true;
     info["preferred_load_bytes"] = causal_machine_scan_preferred_load_bytes_cuda(0, 64, 64);
     info["elements_per_load"] = causal_machine_scan_elements_per_load_cuda(0, 64, 64);
     return info;
@@ -1905,6 +2053,23 @@ void check_cuda_float32(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+torch::Tensor normalize_transition_gate_tensor(
+    const torch::Tensor& transition_gate,
+    const torch::Tensor& reference,
+    const char* name = "transition_gate") {
+    check_cuda_float32(transition_gate, name);
+    check_same_cuda_device(transition_gate, reference, name);
+    TORCH_CHECK(transition_gate.numel() == 1, name, " must be a scalar tensor");
+    return transition_gate.contiguous().reshape({});
+}
+
+double transition_gate_value_from_tensor(
+    const torch::Tensor& transition_gate,
+    const torch::Tensor& reference,
+    const char* name = "transition_gate") {
+    return static_cast<double>(normalize_transition_gate_tensor(transition_gate, reference, name).item<float>());
+}
+
 void check_cuda_int8(const torch::Tensor& tensor, const char* name) {
     TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
     TORCH_CHECK(tensor.scalar_type() == torch::kInt8, name, " must be int8");
@@ -2203,7 +2368,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_aten(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -2213,7 +2378,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_aten(
     const auto num_states = local_logits.size(2);
     const bool has_seq_lens = seq_lens.defined() && seq_lens.numel() > 0;
     const auto float_options = transition_source_probs.options().dtype(torch::kFloat32);
-    const auto transition_gate_value = static_cast<float>(transition_gate);
+    const auto transition_gate_value = static_cast<float>(transition_gate_value_from_tensor(transition_gate, local_logits));
     const auto effective_chunk_size = std::max<int64_t>(1, chunk_size);
     auto transition_matrix_and_sums = build_masked_transition_matrix_from_factors(
         transition_source_probs,
@@ -2265,7 +2430,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_tiled_probs_aten(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -2296,7 +2461,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_tiled_probs_aten(
     }
 
     const auto float_options = transition_source_probs.options().dtype(torch::kFloat32);
-    const auto transition_gate_value = static_cast<float>(transition_gate);
+    const auto transition_gate_value = static_cast<float>(transition_gate_value_from_tensor(transition_gate, beliefs));
     const auto effective_chunk_size = std::max<int64_t>(1, chunk_size);
     auto transition_matrix_and_sums = build_masked_transition_matrix_from_factors(
         transition_source_probs,
@@ -2461,7 +2626,8 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits(
     }
 
     const auto num_states = local_logits.size(2);
-    const auto gate_value = static_cast<double>(transition_gate.detach().to(torch::kFloat32).item<float>());
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
+    const auto gate_value = transition_gate_value_from_tensor(transition_gate_f32, local_logits);
     const bool native_score_filtering = std::isfinite(score_threshold) || score_topk > 0;
     if (is_supported_specialized_num_states(num_states) && is_optional_tensor_defined(transition_mask)) {
         TORCH_CHECK(
@@ -2474,7 +2640,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits(
             transition_dest_logits,
             transition_context,
             initial_log_belief,
-            gate_value,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -2502,7 +2668,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits(
             transition_dest_logits,
             transition_context,
             initial_log_belief.to(torch::kFloat32),
-            gate_value,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -2530,7 +2696,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits(
         sparse_meta.block_mask,
         transition_context,
         initial_log_belief,
-        torch::tensor({gate_value}, transition_stay_probs.options().dtype(torch::kFloat32)),
+        transition_gate_f32,
         transition_stay_probs,
         seq_lens,
         sparse_meta.block_size,
@@ -2553,6 +2719,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_bound_works
     double score_clamp_max,
     double score_threshold,
     int64_t score_topk) {
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
     const auto num_states = local_logits.size(2);
     if (num_states <= kSpecializedNumStates) {
         return causal_machine_scan_forward_masked_logits(
@@ -2561,7 +2728,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_bound_works
             transition_dest_logits,
             transition_context,
             initial_log_belief,
-            transition_gate,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -2582,7 +2749,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_bound_works
             transition_dest_logits,
             transition_context,
             initial_log_belief,
-            transition_gate,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -2846,13 +3013,14 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel(
     } else {
         seq_lens = empty_cuda_int64_tensor_like(local_logits);
     }
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
     return causal_machine_scan_forward_tiled_logits_kernel_cuda(
         local_logits,
         transition_source_probs,
         transition_dest_probs,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        transition_gate_f32,
         transition_stay_probs,
         seq_lens,
         chunk_size,
@@ -2910,7 +3078,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_works
         transition_dest_probs,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         seq_lens,
         chunk_size,
@@ -3013,7 +3181,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_wo
         transition_dest_scales,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         seq_lens,
         chunk_size,
@@ -3121,7 +3289,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspac
         transition_dest_scales,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         fp8_format,
         seq_lens,
@@ -3241,7 +3409,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
         transition_dest_logits,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         transition_mask,
         seq_lens,
@@ -3334,7 +3502,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits(
         block_col_idx,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         seq_lens,
         block_size,
@@ -3423,7 +3591,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_fused(
         block_mask,
         transition_context,
         initial_log_belief,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, local_logits),
         transition_stay_probs,
         seq_lens,
         block_size,
@@ -3611,7 +3779,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse(
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         seq_lens,
         block_size,
@@ -3690,7 +3858,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_fused(
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         seq_lens,
         block_size,
@@ -4426,6 +4594,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
     const auto has_history = paged_lengths.gt(0).view({local_logits.size(0), 1});
     initial_log_belief = torch::where(has_history, latest_log_belief, initial_log_belief);
 
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
     std::vector<torch::Tensor> scan_outputs;
     const auto num_states = local_logits.size(2);
     const auto empty_seq_lens = empty_cuda_int64_tensor_like(local_logits);
@@ -4450,7 +4619,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
             transition_dest_probs,
             transition_context,
             transition_stay_probs,
-            transition_gate.item<double>(),
+            transition_gate_f32,
             score_clamp_min,
             score_clamp_max);
     }
@@ -4467,7 +4636,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
             packed_transition_dest_scales,
             transition_context,
             transition_stay_probs,
-            transition_gate.item<double>());
+            transition_gate_f32);
     } else if (use_packed && (packed_kind == 1 || packed_kind == 2)) {
         return causal_machine_scan_paged_step_fp8_cuda(
             paged_log_beliefs,
@@ -4481,7 +4650,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
             packed_transition_dest_scales,
             transition_context,
             transition_stay_probs,
-            transition_gate.item<double>(),
+            transition_gate_f32,
             packed_kind == 1 ? 0 : 1);
     } else if (num_states > kSpecializedNumStates) {
         TORCH_CHECK(tile_size > 0, "tile_size must be positive for paged tiled step");
@@ -4492,7 +4661,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
             transition_dest_probs,
             transition_context,
             initial_log_belief,
-            transition_gate.item<double>(),
+            transition_gate_f32,
             transition_stay_probs,
             empty_seq_lens,
             1,
@@ -4507,7 +4676,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
             transition_dest_probs,
             transition_context,
             initial_log_belief.to(local_logits.scalar_type()),
-            transition_gate.item<double>(),
+            transition_gate_f32,
             transition_stay_probs,
             1,
             score_clamp_min,
@@ -4566,7 +4735,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
@@ -4601,6 +4770,8 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
         initial_log_belief.scalar_type() == local_logits.scalar_type(),
         "initial_log_belief must match local_logits dtype"
     );
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -4619,7 +4790,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
                 pad_last_dim(transition_dest_logits, kSpecializedNumStates, neg_inf_fill()),
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 chunk_size,
                 score_clamp_min,
@@ -4632,7 +4803,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
                 transition_dest_logits,
                 transition_context,
                 initial_log_belief,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size,
                 score_clamp_min,
@@ -4717,7 +4888,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     check_cuda_activation(local_logits, "local_logits");
@@ -4750,6 +4921,8 @@ std::vector<torch::Tensor> causal_machine_scan_forward(
         initial_log_belief.scalar_type() == local_logits.scalar_type(),
         "initial_log_belief must match local_logits dtype"
     );
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
+    const auto transition_gate_value = transition_gate_value_from_tensor(transition_gate_f32, local_logits);
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -4768,7 +4941,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward(
                 pad_last_dim(transition_dest_probs, kSpecializedNumStates, 0.0),
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 chunk_size,
                 -std::numeric_limits<double>::infinity(),
@@ -4781,7 +4954,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward(
                 transition_dest_probs,
                 transition_context,
                 initial_log_belief,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size,
                 -std::numeric_limits<double>::infinity(),
@@ -4797,7 +4970,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     check_cuda_activation(local_logits, "local_logits");
@@ -4836,6 +5009,8 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
         initial_log_belief.scalar_type() == local_logits.scalar_type(),
         "initial_log_belief must match local_logits dtype"
     );
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -4858,7 +5033,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
             transition_dest_scales,
             transition_context,
             initial_log_belief.to(torch::kFloat32),
-            transition_gate,
+            transition_gate_f32,
             transition_stay_probs,
             torch::Tensor(),
             chunk_size,
@@ -4881,7 +5056,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
                 transition_dest_scales,
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 chunk_size);
         },
@@ -4894,7 +5069,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
                 transition_dest_scales,
                 transition_context,
                 initial_log_belief,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size);
         });
@@ -4908,7 +5083,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size) {
@@ -4949,6 +5124,8 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
         "initial_log_belief must match local_logits dtype"
     );
     TORCH_CHECK(fp8_format == 0 || fp8_format == 1, "fp8_format must be 0 (e4m3) or 1 (e5m2)");
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -4971,7 +5148,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
             transition_dest_scales,
             transition_context,
             initial_log_belief.to(torch::kFloat32),
-            transition_gate,
+            transition_gate_f32,
             transition_stay_probs,
             fp8_format,
             torch::Tensor(),
@@ -4995,7 +5172,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
                 transition_dest_scales,
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 fp8_format,
                 chunk_size);
@@ -5009,7 +5186,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
                 transition_dest_scales,
                 transition_context,
                 initial_log_belief,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 fp8_format,
                 chunk_size);
@@ -5024,7 +5201,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     check_cuda_activation(grad_beliefs, "grad_beliefs");
@@ -5059,6 +5236,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward(
     TORCH_CHECK(grad_final_belief.scalar_type() == beliefs.scalar_type(), "grad_final_belief must match beliefs dtype");
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -5076,22 +5254,42 @@ std::vector<torch::Tensor> causal_machine_scan_backward(
         num_states,
         transition_source_probs.size(1),
         [&]() {
-            return causal_machine_scan_backward_cuda(
-                pad_last_dim(grad_beliefs, kSpecializedNumStates, 0.0),
-                pad_last_dim(grad_final_belief, kSpecializedNumStates, 0.0),
-                pad_first_dim(transition_source_probs, kSpecializedNumStates, 0.0),
-                pad_last_dim(transition_dest_probs, kSpecializedNumStates, 0.0),
-                pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
-                pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
-                pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
+            auto padded_grad_beliefs = pad_last_dim(grad_beliefs, kSpecializedNumStates, 0.0);
+            auto padded_grad_final_belief = pad_last_dim(grad_final_belief, kSpecializedNumStates, 0.0);
+            auto padded_transition_source_probs = pad_first_dim(transition_source_probs, kSpecializedNumStates, 0.0);
+            auto padded_transition_dest_probs = pad_last_dim(transition_dest_probs, kSpecializedNumStates, 0.0);
+            auto padded_transition_context = pad_last_dim(transition_context, kSpecializedNumStates, 0.0);
+            auto padded_initial_log_belief = pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill());
+            auto padded_beliefs = pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill());
+            auto padded_transition_stay_probs = pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0);
+            auto workspace = get_dense_backward_workspace(
+                padded_beliefs,
+                padded_beliefs.size(2),
+                padded_transition_source_probs.size(1));
+            return causal_machine_scan_backward_workspace_cuda(
+                padded_grad_beliefs,
+                padded_grad_final_belief,
+                padded_transition_source_probs,
+                padded_transition_dest_probs,
+                padded_transition_context,
+                padded_initial_log_belief,
+                padded_beliefs,
+                transition_gate_f32,
+                padded_transition_stay_probs,
                 chunk_size,
                 -std::numeric_limits<double>::infinity(),
-                std::numeric_limits<double>::infinity());
+                std::numeric_limits<double>::infinity(),
+                workspace.grad_transition_source_per_batch,
+                workspace.grad_transition_dest_per_batch,
+                workspace.grad_transition_stay_per_batch,
+                workspace.grad_transition_gate_per_batch);
         },
         [&]() {
-            return causal_machine_scan_backward_cuda(
+            auto workspace = get_dense_backward_workspace(
+                beliefs,
+                beliefs.size(2),
+                transition_source_probs.size(1));
+            return causal_machine_scan_backward_workspace_cuda(
                 grad_beliefs,
                 grad_final_belief,
                 transition_source_probs,
@@ -5099,11 +5297,15 @@ std::vector<torch::Tensor> causal_machine_scan_backward(
                 transition_context,
                 initial_log_belief,
                 beliefs,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size,
                 -std::numeric_limits<double>::infinity(),
-                std::numeric_limits<double>::infinity());
+                std::numeric_limits<double>::infinity(),
+                workspace.grad_transition_source_per_batch,
+                workspace.grad_transition_dest_per_batch,
+                workspace.grad_transition_stay_per_batch,
+                workspace.grad_transition_gate_per_batch);
         });
 }
 
@@ -5115,7 +5317,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_impl(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -5246,7 +5448,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -5397,6 +5599,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits(
         "backward_masked_logits native threshold/topk requires the masked tiled custom kernel path"
     );
     auto sparse_meta = build_masked_sparse_fallback_metadata(num_states, transition_mask);
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
     return causal_machine_scan_backward_sparse_logits_fused(
         grad_beliefs,
         grad_final_belief,
@@ -5413,7 +5616,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits(
         transition_context,
         initial_log_belief,
         beliefs,
-        torch::tensor({transition_gate}, transition_stay_probs.options().dtype(torch::kFloat32)),
+        transition_gate_f32,
         transition_stay_probs,
         seq_lens,
         sparse_meta.block_size,
@@ -5479,7 +5682,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace(
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         transition_mask,
         seq_lens,
@@ -5512,7 +5715,8 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
     double score_threshold,
     int64_t score_topk) {
     const auto num_states = beliefs.size(2);
-    const auto gate_value = static_cast<double>(transition_gate.detach().to(torch::kFloat32).item<float>());
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
+    const auto gate_value = transition_gate_value_from_tensor(transition_gate_f32, beliefs);
     if (num_states <= kSpecializedNumStates) {
         return causal_machine_scan_backward_masked_logits(
             grad_beliefs,
@@ -5522,7 +5726,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
             transition_context,
             initial_log_belief,
             beliefs,
-            gate_value,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -5545,7 +5749,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
             transition_context,
             initial_log_belief,
             beliefs,
-            gate_value,
+            transition_gate_f32,
             transition_stay_probs,
             transition_mask,
             seq_lens,
@@ -5566,7 +5770,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate,
+        transition_gate_f32,
         transition_stay_probs,
         transition_mask,
         seq_lens,
@@ -5588,7 +5792,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -5627,7 +5831,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -5705,7 +5909,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_works
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         seq_lens,
         chunk_size,
@@ -5828,7 +6032,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_w
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         seq_lens,
         chunk_size,
@@ -5956,7 +6160,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspa
         transition_context,
         initial_log_belief,
         beliefs,
-        transition_gate.item<double>(),
+        normalize_transition_gate_tensor(transition_gate, beliefs),
         transition_stay_probs,
         fp8_format,
         seq_lens,
@@ -6043,7 +6247,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
@@ -6080,6 +6284,8 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
     TORCH_CHECK(grad_final_belief.scalar_type() == beliefs.scalar_type(), "grad_final_belief must match beliefs dtype");
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6097,22 +6303,42 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
         num_states,
         transition_source_logits.size(1),
         [&]() {
-            return causal_machine_scan_backward_logits_cuda(
-                pad_last_dim(grad_beliefs, kSpecializedNumStates, 0.0),
-                pad_last_dim(grad_final_belief, kSpecializedNumStates, 0.0),
-                pad_first_dim(transition_source_logits, kSpecializedNumStates, 0.0),
-                pad_last_dim(transition_dest_logits, kSpecializedNumStates, neg_inf_fill()),
-                pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
-                pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
-                pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
-                pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
+            auto padded_grad_beliefs = pad_last_dim(grad_beliefs, kSpecializedNumStates, 0.0);
+            auto padded_grad_final_belief = pad_last_dim(grad_final_belief, kSpecializedNumStates, 0.0);
+            auto padded_transition_source_logits = pad_first_dim(transition_source_logits, kSpecializedNumStates, 0.0);
+            auto padded_transition_dest_logits = pad_last_dim(transition_dest_logits, kSpecializedNumStates, neg_inf_fill());
+            auto padded_transition_context = pad_last_dim(transition_context, kSpecializedNumStates, 0.0);
+            auto padded_initial_log_belief = pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill());
+            auto padded_beliefs = pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill());
+            auto padded_transition_stay_probs = pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0);
+            auto workspace = get_dense_backward_workspace(
+                padded_beliefs,
+                padded_beliefs.size(2),
+                padded_transition_source_logits.size(1));
+            return causal_machine_scan_backward_logits_workspace_cuda(
+                padded_grad_beliefs,
+                padded_grad_final_belief,
+                padded_transition_source_logits,
+                padded_transition_dest_logits,
+                padded_transition_context,
+                padded_initial_log_belief,
+                padded_beliefs,
+                transition_gate_f32,
+                padded_transition_stay_probs,
                 chunk_size,
                 score_clamp_min,
-                score_clamp_max);
+                score_clamp_max,
+                workspace.grad_transition_source_per_batch,
+                workspace.grad_transition_dest_per_batch,
+                workspace.grad_transition_stay_per_batch,
+                workspace.grad_transition_gate_per_batch);
         },
         [&]() {
-            return causal_machine_scan_backward_logits_cuda(
+            auto workspace = get_dense_backward_workspace(
+                beliefs,
+                beliefs.size(2),
+                transition_source_logits.size(1));
+            return causal_machine_scan_backward_logits_workspace_cuda(
                 grad_beliefs,
                 grad_final_belief,
                 transition_source_logits,
@@ -6120,11 +6346,15 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
                 transition_context,
                 initial_log_belief,
                 beliefs,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size,
                 score_clamp_min,
-                score_clamp_max);
+                score_clamp_max,
+                workspace.grad_transition_source_per_batch,
+                workspace.grad_transition_dest_per_batch,
+                workspace.grad_transition_stay_per_batch,
+                workspace.grad_transition_gate_per_batch);
         });
 }
 
@@ -6138,7 +6368,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     check_cuda_activation(grad_beliefs, "grad_beliefs");
@@ -6179,6 +6409,8 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
     TORCH_CHECK(grad_final_belief.scalar_type() == beliefs.scalar_type(), "grad_final_belief must match beliefs dtype");
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6208,7 +6440,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
             transition_context,
             initial_log_belief.to(torch::kFloat32),
             beliefs,
-            transition_gate,
+            transition_gate_f32,
             transition_stay_probs,
             torch::Tensor(),
             chunk_size,
@@ -6233,7 +6465,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
                 pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 chunk_size);
         },
@@ -6248,7 +6480,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
                 transition_context,
                 initial_log_belief,
                 beliefs,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 chunk_size);
         });
@@ -6264,7 +6496,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size) {
@@ -6307,6 +6539,8 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8(
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
     TORCH_CHECK(fp8_format == 0 || fp8_format == 1, "fp8_format must be 0 (e4m3) or 1 (e5m2)");
+    auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
+    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6362,7 +6596,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8(
                 pad_last_dim(transition_context, kSpecializedNumStates, 0.0),
                 pad_last_dim(initial_log_belief, kSpecializedNumStates, neg_inf_fill()),
                 pad_last_dim(beliefs, kSpecializedNumStates, neg_inf_fill()),
-                transition_gate,
+                transition_gate_f32,
                 pad_last_dim(transition_stay_probs, kSpecializedNumStates, 1.0),
                 fp8_format,
                 chunk_size);
@@ -6378,7 +6612,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8(
                 transition_context,
                 initial_log_belief,
                 beliefs,
-                transition_gate,
+                transition_gate_f32,
                 transition_stay_probs,
                 fp8_format,
                 chunk_size);

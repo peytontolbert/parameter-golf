@@ -4,6 +4,7 @@
 
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cub/block/block_scan.cuh>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -29,6 +30,24 @@ constexpr int kChunkScanThreads = 256;
 // under-fills large GPUs on the competition shape. Favor the chunked path for
 // 1024-token runs unless the user explicitly opts back in.
 constexpr int kDefaultSingleKernelMaxSeqLen = 512;
+
+struct AffineScanValue {
+    float mul;
+    float add;
+};
+
+struct AffineScanOp {
+    __device__ __forceinline__ AffineScanValue operator()(AffineScanValue lhs, AffineScanValue rhs) const {
+        return {
+            rhs.mul * lhs.mul,
+            rhs.mul * lhs.add + rhs.add,
+        };
+    }
+};
+
+__device__ __forceinline__ AffineScanValue affine_scan_identity() {
+    return {1.0f, 0.0f};
+}
 
 int latent_launch_threads(int rank_dim) {
     if (rank_dim <= 64) {
@@ -606,10 +625,8 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_ke
         return;
     }
 
-    __shared__ float mul_shared[kChunkScanThreads];
-    __shared__ float add_shared[kChunkScanThreads];
-    __shared__ float mul_tmp[kChunkScanThreads];
-    __shared__ float add_tmp[kChunkScanThreads];
+    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    __shared__ typename BlockScan::TempStorage scan_storage;
 
     __shared__ int current_batch;
     while (true) {
@@ -621,49 +638,23 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_ke
             break;
         }
 
+        AffineScanValue current = affine_scan_identity();
         if (tid < num_chunks) {
             const int idx = (current_batch * num_chunks + tid) * rank_dim + r;
-            mul_shared[tid] = load_as_float(chunk_mul + idx);
-            add_shared[tid] = load_as_float(chunk_add + idx);
-        } else {
-            mul_shared[tid] = 1.0f;
-            add_shared[tid] = 0.0f;
+            current.mul = load_as_float(chunk_mul + idx);
+            current.add = load_as_float(chunk_add + idx);
         }
-        __syncthreads();
 
-        for (int offset = 1; offset < num_chunks; offset <<= 1) {
-            if (tid < num_chunks) {
-                float cur_mul = mul_shared[tid];
-                float cur_add = add_shared[tid];
-                if (tid >= offset) {
-                    const float left_mul = mul_shared[tid - offset];
-                    const float left_add = add_shared[tid - offset];
-                    mul_tmp[tid] = cur_mul * left_mul;
-                    add_tmp[tid] = cur_mul * left_add + cur_add;
-                } else {
-                    mul_tmp[tid] = cur_mul;
-                    add_tmp[tid] = cur_add;
-                }
-            }
-            __syncthreads();
-            if (tid < num_chunks) {
-                mul_shared[tid] = mul_tmp[tid];
-                add_shared[tid] = add_tmp[tid];
-            }
-            __syncthreads();
-        }
+        AffineScanValue prefix = affine_scan_identity();
+        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
+        const AffineScanValue inclusive = AffineScanOp{}(prefix, current);
 
         const float init = load_as_float(initial_state + current_batch * rank_dim + r);
         if (tid < num_chunks) {
-            float prev = init;
-            if (tid > 0) {
-                const float excl_mul = mul_shared[tid - 1];
-                const float excl_add = add_shared[tid - 1];
-                prev = excl_mul * init + excl_add;
-            }
+            const float prev = prefix.mul * init + prefix.add;
             chunk_prev[(current_batch * num_chunks + tid) * rank_dim + r] = store_from_float<work_t>(prev);
             if (tid == num_chunks - 1) {
-                const float final_val = mul_shared[tid] * init + add_shared[tid];
+                const float final_val = inclusive.mul * init + inclusive.add;
                 final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(final_val);
             }
         }
@@ -734,10 +725,8 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_prefix_s
         return;
     }
 
-    __shared__ float mul_shared[kChunkScanThreads];
-    __shared__ float add_shared[kChunkScanThreads];
-    __shared__ float mul_tmp[kChunkScanThreads];
-    __shared__ float add_tmp[kChunkScanThreads];
+    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    __shared__ typename BlockScan::TempStorage scan_storage;
 
     __shared__ int current_batch;
     while (true) {
@@ -751,45 +740,19 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_prefix_s
 
         const int group_start = group_id * kChunkScanThreads;
         const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+        AffineScanValue current = affine_scan_identity();
         if (tid < group_len) {
             const int idx = (current_batch * num_chunks + (group_start + tid)) * rank_dim + r;
-            mul_shared[tid] = load_as_float(chunk_mul + idx);
-            add_shared[tid] = load_as_float(chunk_add + idx);
-        } else {
-            mul_shared[tid] = 1.0f;
-            add_shared[tid] = 0.0f;
+            current.mul = load_as_float(chunk_mul + idx);
+            current.add = load_as_float(chunk_add + idx);
         }
-        __syncthreads();
 
-        for (int offset = 1; offset < group_len; offset <<= 1) {
-            if (tid < group_len) {
-                float cur_mul = mul_shared[tid];
-                float cur_add = add_shared[tid];
-                if (tid >= offset) {
-                    const float left_mul = mul_shared[tid - offset];
-                    const float left_add = add_shared[tid - offset];
-                    mul_tmp[tid] = cur_mul * left_mul;
-                    add_tmp[tid] = cur_mul * left_add + cur_add;
-                } else {
-                    mul_tmp[tid] = cur_mul;
-                    add_tmp[tid] = cur_add;
-                }
-            }
-            __syncthreads();
-            if (tid < group_len) {
-                mul_shared[tid] = mul_tmp[tid];
-                add_shared[tid] = add_tmp[tid];
-            }
-            __syncthreads();
-        }
+        AffineScanValue prefix = affine_scan_identity();
+        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
 
         if (tid < group_len) {
-            float prev = load_as_float(group_prev + ((current_batch * num_groups + group_id) * rank_dim + r));
-            if (tid > 0) {
-                const float excl_mul = mul_shared[tid - 1];
-                const float excl_add = add_shared[tid - 1];
-                prev = excl_mul * prev + excl_add;
-            }
+            const float group_seed = load_as_float(group_prev + ((current_batch * num_groups + group_id) * rank_dim + r));
+            const float prev = prefix.mul * group_seed + prefix.add;
             chunk_prev[(current_batch * num_chunks + (group_start + tid)) * rank_dim + r] = store_from_float<work_t>(prev);
         }
         __syncthreads();
@@ -1062,10 +1025,8 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix
         return;
     }
 
-    __shared__ float mul_shared[kChunkScanThreads];
-    __shared__ float add_shared[kChunkScanThreads];
-    __shared__ float mul_tmp[kChunkScanThreads];
-    __shared__ float add_tmp[kChunkScanThreads];
+    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    __shared__ typename BlockScan::TempStorage scan_storage;
 
     __shared__ int current_batch;
     while (true) {
@@ -1077,48 +1038,21 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix
             break;
         }
 
+        AffineScanValue current = affine_scan_identity();
         if (tid < num_chunks) {
             const int rev = num_chunks - 1 - tid;
             const int idx = (current_batch * num_chunks + rev) * rank_dim + r;
-            mul_shared[tid] = load_as_float(chunk_mul + idx);
-            add_shared[tid] = load_as_float(chunk_add + idx);
-        } else {
-            mul_shared[tid] = 1.0f;
-            add_shared[tid] = 0.0f;
+            current.mul = load_as_float(chunk_mul + idx);
+            current.add = load_as_float(chunk_add + idx);
         }
-        __syncthreads();
 
-        for (int offset = 1; offset < num_chunks; offset <<= 1) {
-            if (tid < num_chunks) {
-                float cur_mul = mul_shared[tid];
-                float cur_add = add_shared[tid];
-                if (tid >= offset) {
-                    const float left_mul = mul_shared[tid - offset];
-                    const float left_add = add_shared[tid - offset];
-                    mul_tmp[tid] = cur_mul * left_mul;
-                    add_tmp[tid] = cur_mul * left_add + cur_add;
-                } else {
-                    mul_tmp[tid] = cur_mul;
-                    add_tmp[tid] = cur_add;
-                }
-            }
-            __syncthreads();
-            if (tid < num_chunks) {
-                mul_shared[tid] = mul_tmp[tid];
-                add_shared[tid] = add_tmp[tid];
-            }
-            __syncthreads();
-        }
+        AffineScanValue prefix = affine_scan_identity();
+        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
 
         const float final_grad = load_as_float(grad_final_state + current_batch * rank_dim + r);
         if (tid < num_chunks) {
             const int rev = num_chunks - 1 - tid;
-            float carry = final_grad;
-            if (tid > 0) {
-                const float excl_mul = mul_shared[tid - 1];
-                const float excl_add = add_shared[tid - 1];
-                carry = excl_mul * final_grad + excl_add;
-            }
+            const float carry = prefix.mul * final_grad + prefix.add;
             chunk_carry[(current_batch * num_chunks + rev) * rank_dim + r] = store_from_float<work_t>(carry);
         }
         __syncthreads();
@@ -1143,10 +1077,8 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_reverse_
         return;
     }
 
-    __shared__ float mul_shared[kChunkScanThreads];
-    __shared__ float add_shared[kChunkScanThreads];
-    __shared__ float mul_tmp[kChunkScanThreads];
-    __shared__ float add_tmp[kChunkScanThreads];
+    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    __shared__ typename BlockScan::TempStorage scan_storage;
 
     __shared__ int current_batch;
     while (true) {
@@ -1160,48 +1092,22 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_reverse_
 
         const int group_start = group_id * kChunkScanThreads;
         const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+        AffineScanValue current = affine_scan_identity();
         if (tid < group_len) {
             const int rev_local = group_len - 1 - tid;
             const int idx = (current_batch * num_chunks + (group_start + rev_local)) * rank_dim + r;
-            mul_shared[tid] = load_as_float(chunk_mul + idx);
-            add_shared[tid] = load_as_float(chunk_add + idx);
-        } else {
-            mul_shared[tid] = 1.0f;
-            add_shared[tid] = 0.0f;
+            current.mul = load_as_float(chunk_mul + idx);
+            current.add = load_as_float(chunk_add + idx);
         }
-        __syncthreads();
 
-        for (int offset = 1; offset < group_len; offset <<= 1) {
-            if (tid < group_len) {
-                float cur_mul = mul_shared[tid];
-                float cur_add = add_shared[tid];
-                if (tid >= offset) {
-                    const float left_mul = mul_shared[tid - offset];
-                    const float left_add = add_shared[tid - offset];
-                    mul_tmp[tid] = cur_mul * left_mul;
-                    add_tmp[tid] = cur_mul * left_add + cur_add;
-                } else {
-                    mul_tmp[tid] = cur_mul;
-                    add_tmp[tid] = cur_add;
-                }
-            }
-            __syncthreads();
-            if (tid < group_len) {
-                mul_shared[tid] = mul_tmp[tid];
-                add_shared[tid] = add_tmp[tid];
-            }
-            __syncthreads();
-        }
+        AffineScanValue prefix = affine_scan_identity();
+        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
 
         if (tid < group_len) {
             const int rev_local = group_len - 1 - tid;
             const int actual_chunk = group_start + rev_local;
-            float carry = load_as_float(group_carry + ((current_batch * num_groups + group_id) * rank_dim + r));
-            if (tid > 0) {
-                const float excl_mul = mul_shared[tid - 1];
-                const float excl_add = add_shared[tid - 1];
-                carry = excl_mul * carry + excl_add;
-            }
+            const float group_seed = load_as_float(group_carry + ((current_batch * num_groups + group_id) * rank_dim + r));
+            const float carry = prefix.mul * group_seed + prefix.add;
             chunk_carry[(current_batch * num_chunks + actual_chunk) * rank_dim + r] = store_from_float<work_t>(carry);
         }
         __syncthreads();

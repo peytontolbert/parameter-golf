@@ -38,6 +38,8 @@ constexpr int kMaxTiledBlockThreads = 256;
 constexpr int kAsyncTilePipelineStages = 2;
 constexpr int kSm90AsyncTilePipelineStages = 3;
 constexpr int kTensorCoreTile = 16;
+constexpr int kWgmmaRows = 64;
+constexpr int kMaxNativeScoreTopK = 32;
 using HopperStageBarrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
@@ -63,6 +65,36 @@ struct DeviceTensorMapDescriptor {
         return device_ptr != nullptr;
     }
 };
+
+union WgmmaDescriptor {
+    __host__ __device__ constexpr WgmmaDescriptor() noexcept : desc_(0) {}
+    uint64_t desc_;
+    struct {
+        uint16_t start_address_ : 14, : 2;
+        uint16_t leading_byte_offset_ : 14, : 2;
+        uint16_t stride_byte_offset_ : 14, : 2;
+        uint8_t : 1, base_offset_ : 3, : 4;
+        uint8_t : 6, layout_type_ : 2;
+    } bitfield;
+
+    __host__ __device__ constexpr operator uint64_t() const noexcept { return desc_; }
+};
+
+template <class PointerType>
+__device__ __forceinline__ WgmmaDescriptor make_wgmma_smem_desc(
+    PointerType smem_ptr,
+    int layout_type,
+    int leading_byte_offset,
+    int stride_byte_offset) {
+    WgmmaDescriptor desc;
+    auto uint_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    desc.bitfield.start_address_ = uint_ptr >> 4;
+    desc.bitfield.layout_type_ = layout_type;
+    desc.bitfield.leading_byte_offset_ = leading_byte_offset >> 4;
+    desc.bitfield.stride_byte_offset_ = stride_byte_offset >> 4;
+    desc.bitfield.base_offset_ = 0;
+    return desc;
+}
 
 __device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
     float* __restrict__ dst0,
@@ -572,8 +604,8 @@ size_t forward_tiled_shared_bytes(int num_states, int tile_size, int split_size,
         + num_warps
         + 4
     ) * sizeof(float);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
-    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
     return bytes;
 }
@@ -589,8 +621,8 @@ size_t forward_tiled_shared_bytes_sm90(int num_states, int tile_size, int split_
         + num_warps
         + 4
     ) * sizeof(float);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
-    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
     return bytes;
 }
@@ -602,11 +634,13 @@ size_t forward_tiled_packed_shared_bytes(int num_states, int tile_size, int spli
         (2 * num_states)
         + staged_rank_chunk
         + (async_tile_pipeline_stages<false>() * staged_rank_chunk * std::max(tile_size, 1))
+        + num_states
         + num_warps
         + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(async_tile_pipeline_stages<false>()) * staged_rank_chunk * std::max(num_states, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
     bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
@@ -620,11 +654,13 @@ size_t forward_tiled_packed_shared_bytes_sm90(int num_states, int tile_size, int
         (2 * num_states)
         + staged_rank_chunk
         + (async_tile_pipeline_stages<true>() * staged_rank_chunk * std::max(tile_size, 1))
+        + num_states
         + num_warps
         + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(num_states, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
     bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
@@ -633,15 +669,32 @@ size_t forward_tiled_packed_shared_bytes_sm90(int num_states, int tile_size, int
 
 size_t forward_masked_tiled_shared_bytes(int num_states, int block_threads) {
     const int num_warps = (block_threads + kWarpSize - 1) / kWarpSize;
-    return static_cast<size_t>((2 * num_states) + num_warps + 4) * sizeof(float);
+    const int staged_rank_chunk = std::max(1, std::min(num_states, kTensorCoreTile));
+    size_t bytes = static_cast<size_t>(
+        (2 * num_states)
+        + num_warps
+        + 2
+        + (staged_rank_chunk * std::max(num_states, 1))
+        + (staged_rank_chunk * std::max(num_states, 1))
+    ) * sizeof(float);
+    bytes += static_cast<size_t>(kMaxNativeScoreTopK) * sizeof(float);
+    bytes += static_cast<size_t>(kMaxNativeScoreTopK) * sizeof(int);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
+    return bytes;
 }
 
 size_t backward_masked_tiled_shared_bytes(int num_states, int tile_size, int block_threads) {
     const int num_warps = (block_threads + kWarpSize - 1) / kWarpSize;
     const int rank_chunk = std::max(1, std::min(tile_size, kMaskedBackwardRankChunk));
-    return static_cast<size_t>(
+    size_t bytes = static_cast<size_t>(
         (5 * num_states) + (rank_chunk * tile_size) + (rank_chunk * num_states) + num_warps + 4
     ) * sizeof(float);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
+    return bytes;
 }
 
 size_t backward_tiled_shared_bytes(int num_states, int split_size, int tile_size, int block_threads) {
@@ -656,8 +709,8 @@ size_t backward_tiled_shared_bytes(int num_states, int split_size, int tile_size
         + num_warps
         + 4
     ) * sizeof(float);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
-    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
     return bytes;
 }
@@ -674,8 +727,8 @@ size_t backward_tiled_shared_bytes_sm90(int num_states, int split_size, int tile
         + num_warps
         + 4
     ) * sizeof(float);
-    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(__half);
-    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(2 * kTensorCoreTile * kTensorCoreTile) * sizeof(float);
     bytes += 31;
     return bytes;
 }
@@ -687,6 +740,10 @@ size_t backward_tiled_packed_shared_bytes(int num_states, int split_size, int ti
         (3 * num_states) + staged_rank_chunk + tile_size + (staged_rank_chunk * std::max(tile_size, 1)) + num_warps + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(kAsyncTilePipelineStages) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
     return bytes;
 }
 
@@ -697,6 +754,10 @@ size_t backward_tiled_packed_shared_bytes_sm90(int num_states, int split_size, i
         (3 * num_states) + staged_rank_chunk + tile_size + (staged_rank_chunk * std::max(tile_size, 1)) + num_warps + 4
     ) * sizeof(float);
     bytes += static_cast<size_t>(async_tile_pipeline_stages<true>()) * staged_rank_chunk * std::max(tile_size, 1) * sizeof(uint8_t);
+    bytes += static_cast<size_t>((kWgmmaRows + (3 * kTensorCoreTile)) * kTensorCoreTile) * sizeof(__half);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += static_cast<size_t>(kTensorCoreTile * kTensorCoreTile) * sizeof(float);
+    bytes += 31;
     return bytes;
 }
 
@@ -1755,7 +1816,7 @@ __device__ __forceinline__ void compute_latent_small_rank_128_from_register(
     float prev_prob_value,
     const float* __restrict__ source_shared,
     float* __restrict__ latent,
-    float* __restrict__ partial_sums,
+    float* __restrict__ scratch,
     int thread_idx);
 
 template <int StaticTransitionRank>
@@ -1763,7 +1824,7 @@ __device__ __forceinline__ void compute_latent_small_rank_128_from_pair_register
     FloatPair prev_prob_value,
     const float* __restrict__ source_shared,
     float* __restrict__ latent,
-    float* __restrict__ partial_sums,
+    float* __restrict__ scratch,
     int thread_idx);
 
 template <typename scalar_t>
@@ -3286,6 +3347,52 @@ __device__ __forceinline__ void enqueue_sm90_tma_packed_matrix_slice_async(
 #endif
 }
 
+template <typename packed_t>
+__device__ __forceinline__ void enqueue_sm90_tma_packed_tile_pair_async(
+    packed_t* __restrict__ dest_tile_shared,
+    packed_t* __restrict__ source_tile_shared,
+    const CUtensorMap* source_tensor_map,
+    const CUtensorMap* dest_tensor_map,
+    int state_start,
+    int rank_start,
+    int num_states,
+    int staged_rank_chunk,
+    int tile_size,
+    HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    static_assert(sizeof(packed_t) == 1, "packed TMA staging assumes byte-sized packed storage");
+    if (threadIdx.x == 0) {
+        const ptrdiff_t total_tx_bytes = static_cast<ptrdiff_t>(
+            (static_cast<int64_t>(staged_rank_chunk) * tile_size
+             + static_cast<int64_t>(num_states) * staged_rank_chunk) * sizeof(packed_t));
+        cuda::device::barrier_expect_tx(hopper_barrier, total_tx_bytes);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            dest_tile_shared,
+            dest_tensor_map,
+            state_start,
+            rank_start,
+            hopper_barrier);
+        cde::cp_async_bulk_tensor_2d_global_to_shared(
+            source_tile_shared,
+            source_tensor_map,
+            rank_start,
+            0,
+            hopper_barrier);
+    }
+#else
+    (void)dest_tile_shared;
+    (void)source_tile_shared;
+    (void)source_tensor_map;
+    (void)dest_tensor_map;
+    (void)state_start;
+    (void)rank_start;
+    (void)num_states;
+    (void)staged_rank_chunk;
+    (void)tile_size;
+    (void)hopper_barrier;
+#endif
+}
+
 __device__ __forceinline__ void enqueue_sm90_tma_float_tile_pair_async(
     float* __restrict__ dest_tile_shared,
     float* __restrict__ source_tile_shared,
@@ -3437,13 +3544,21 @@ __device__ __forceinline__ void enqueue_float_matrix_pair_slice_async(
         dst1_stride);
 }
 
+__device__ __forceinline__ void initialize_async_tile_barrier(HopperStageBarrier& hopper_barrier) {
+#if __CUDA_ARCH__ >= 900
+    if (threadIdx.x == 0) {
+        init(&hopper_barrier, static_cast<ptrdiff_t>(blockDim.x));
+    }
+    __syncthreads();
+#else
+    (void)hopper_barrier;
+#endif
+}
+
 template <typename Pipe>
 __device__ __forceinline__ void wait_for_async_tile(Pipe& pipe, HopperStageBarrier* hopper_barrier = nullptr) {
     if (hopper_barrier != nullptr) {
-        if (threadIdx.x == 0) {
-            hopper_barrier->arrive_and_wait();
-        }
-        __syncthreads();
+        hopper_barrier->wait(hopper_barrier->arrive());
         return;
     }
 #if __CUDA_ARCH__ >= 800
@@ -3452,6 +3567,16 @@ __device__ __forceinline__ void wait_for_async_tile(Pipe& pipe, HopperStageBarri
 #else
     (void)pipe;
 #endif
+}
+
+template <typename Pipe>
+__device__ __forceinline__ void wait_for_async_tile_and_sync(
+    Pipe& pipe,
+    HopperStageBarrier* hopper_barrier = nullptr) {
+    wait_for_async_tile(pipe, hopper_barrier);
+    if (hopper_barrier == nullptr) {
+        __syncthreads();
+    }
 }
 
 __device__ __forceinline__ void copy_float_matrix_pair_to_shared_async_or_sync(
@@ -3653,6 +3778,90 @@ __device__ __forceinline__ bool tensor_core_math_enabled_for_scalar() {
 }
 
 template <typename scalar_t>
+__device__ __forceinline__ bool wgmma_math_enabled_for_scalar() {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    return std::is_same_v<scalar_t, c10::Half> || std::is_same_v<scalar_t, c10::BFloat16>;
+#else
+    return false;
+#endif
+}
+
+__device__ __forceinline__ void warpgroup_arrive() {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void warpgroup_wait() {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    asm volatile("wgmma.wait_group.sync.aligned %0;\n" :: "n"(N) : "memory");
+#endif
+}
+
+__device__ __forceinline__ void warpgroup_commit_batch() {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void warpgroup_fence_operand(float& reg) {
+#if defined(__CUDA_ARCH__)
+    asm volatile("" : "+f"(reg) :: "memory");
+#endif
+}
+
+__device__ __forceinline__ void wgmma_m64n16k16_f32_f16f16_ss(
+    uint64_t desc_a,
+    uint64_t desc_b,
+    float (&accum)[8]) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %10, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7},"
+        " %8,"
+        " %9,"
+        " p, 1, 1, 0, 0;\n"
+        "}\n"
+        : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3]),
+          "+f"(accum[4]), "+f"(accum[5]), "+f"(accum[6]), "+f"(accum[7])
+        : "l"(desc_a), "l"(desc_b), "r"(int32_t(1)));
+#else
+    (void)desc_a;
+    (void)desc_b;
+    (void)accum;
+#endif
+}
+
+__device__ __forceinline__ void wgmma_m64n16k16_f32_bf16bf16_ss(
+    uint64_t desc_a,
+    uint64_t desc_b,
+    float (&accum)[8]) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "setp.ne.b32 p, %10, 0;\n"
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+        "{%0, %1, %2, %3, %4, %5, %6, %7},"
+        " %8,"
+        " %9,"
+        " p, 1, 1, 0, 0;\n"
+        "}\n"
+        : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3]),
+          "+f"(accum[4]), "+f"(accum[5]), "+f"(accum[6]), "+f"(accum[7])
+        : "l"(desc_a), "l"(desc_b), "r"(int32_t(1)));
+#else
+    (void)desc_a;
+    (void)desc_b;
+    (void)accum;
+#endif
+}
+
+template <typename scalar_t>
 struct tensor_core_input_type;
 
 template <>
@@ -3761,6 +3970,109 @@ __device__ __forceinline__ void wmma_matrix_times_replicated_col_vector_16x16(
     __syncthreads();
 }
 #endif
+
+template <typename scalar_t>
+__device__ __forceinline__ void wgmma_replicated_row_times_matrix_64x16x16(
+    const float* __restrict__ vector16,
+    const float* __restrict__ matrix16x16,
+    int matrix_row_stride,
+    tensor_core_input_type_t<scalar_t>* __restrict__ a_shared,
+    tensor_core_input_type_t<scalar_t>* __restrict__ b_shared,
+    float* __restrict__ output_accum16) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    using tc_t = tensor_core_input_type_t<scalar_t>;
+    if (threadIdx.x < 128) {
+        for (int idx = threadIdx.x; idx < kWgmmaRows * kTensorCoreTile; idx += 128) {
+            const int col = idx % kTensorCoreTile;
+            a_shared[idx] = tensor_core_input_from_float<tc_t>(vector16[col]);
+        }
+        for (int idx = threadIdx.x; idx < kTensorCoreTile * kTensorCoreTile; idx += 128) {
+            const int row = idx / kTensorCoreTile;
+            const int col = idx - row * kTensorCoreTile;
+            b_shared[idx] = tensor_core_input_from_float<tc_t>(matrix16x16[row * matrix_row_stride + col]);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 128) {
+        float accum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < 8; ++i) {
+            warpgroup_fence_operand(accum[i]);
+        }
+        warpgroup_arrive();
+        const auto desc_a = make_wgmma_smem_desc(
+            a_shared,
+            1,
+            0,
+            kTensorCoreTile * static_cast<int>(sizeof(tc_t)));
+        const auto desc_b = make_wgmma_smem_desc(
+            b_shared,
+            1,
+            0,
+            kTensorCoreTile * static_cast<int>(sizeof(tc_t)));
+        if constexpr (std::is_same_v<tc_t, __half>) {
+            wgmma_m64n16k16_f32_f16f16_ss(desc_a, desc_b, accum);
+        } else {
+            wgmma_m64n16k16_f32_bf16bf16_ss(desc_a, desc_b, accum);
+        }
+        warpgroup_commit_batch();
+        for (int i = 0; i < 8; ++i) {
+            warpgroup_fence_operand(accum[i]);
+        }
+        warpgroup_wait<0>();
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int row = warp * 16 + (lane & 15);
+        if (row == 0) {
+            const int col_base = (lane >> 4) * 8;
+            for (int i = 0; i < 8; ++i) {
+                output_accum16[col_base + i] += accum[i];
+            }
+        }
+    }
+    __syncthreads();
+#else
+    (void)vector16;
+    (void)matrix16x16;
+    (void)matrix_row_stride;
+    (void)a_shared;
+    (void)b_shared;
+    (void)output_accum16;
+#endif
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void wgmma_matrix_times_replicated_col_vector_16x16(
+    const float* __restrict__ matrix16x16,
+    int matrix_row_stride,
+    const float* __restrict__ vector16,
+    tensor_core_input_type_t<scalar_t>* __restrict__ a_shared,
+    tensor_core_input_type_t<scalar_t>* __restrict__ b_shared,
+    float* __restrict__ matrix_transpose,
+    float* __restrict__ output_accum16) {
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH_FEAT_SM90_ALL)
+    for (int idx = threadIdx.x; idx < kTensorCoreTile * kTensorCoreTile; idx += blockDim.x) {
+        const int row = idx / kTensorCoreTile;
+        const int col = idx - row * kTensorCoreTile;
+        matrix_transpose[col * kTensorCoreTile + row] = matrix16x16[row * matrix_row_stride + col];
+    }
+    __syncthreads();
+    wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+        vector16,
+        matrix_transpose,
+        kTensorCoreTile,
+        a_shared,
+        b_shared,
+        output_accum16);
+#else
+    (void)matrix16x16;
+    (void)matrix_row_stride;
+    (void)vector16;
+    (void)a_shared;
+    (void)b_shared;
+    (void)matrix_transpose;
+    (void)output_accum16;
+#endif
+}
 
 template <PackedTransitionFormat Format>
 __host__ __device__ __forceinline__ float packed_quant_max() {
@@ -3944,7 +4256,22 @@ __device__ __forceinline__ float score_clamp_grad(
     return (value >= clamp_min && value <= clamp_max) ? 1.0f : 0.0f;
 }
 
-constexpr int kMaxNativeScoreTopK = 32;
+__device__ __forceinline__ float load_transition_gate_value(
+    const float* __restrict__ transition_gate_ptr) {
+    return transition_gate_ptr == nullptr ? 0.0f : transition_gate_ptr[0];
+}
+
+inline float transition_gate_scalar_value(const torch::Tensor& transition_gate) {
+    if (!transition_gate.defined() || transition_gate.numel() == 0) {
+        return 0.0f;
+    }
+    return transition_gate.item<float>();
+}
+
+template <typename T, typename = std::enable_if_t<std::is_arithmetic_v<T>>>
+inline float transition_gate_scalar_value(T transition_gate) {
+    return static_cast<float>(transition_gate);
+}
 
 __device__ __forceinline__ bool native_score_filtering_enabled(
     float score_threshold,
@@ -4219,36 +4546,17 @@ __device__ __forceinline__ void compute_latent_small_rank_128(
     const float* __restrict__ prev_prob,
     const float* __restrict__ source_shared,
     float* __restrict__ latent,
-    float* __restrict__ partial_sums,
+    float* __restrict__ scratch,
     int thread_idx) {
     static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
-    const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
-    const int lane = thread_idx & (kWarpSize - 1);
-    const int warp_id = thread_idx / kWarpSize;
     const float prev = prev_prob[thread_idx];
-    float contrib[StaticTransitionRank];
     #pragma unroll
     for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = prev * source_shared[thread_idx * StaticTransitionRank + r];
-    }
-    #pragma unroll
-    for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = warp_reduce_sum(contrib[r]);
-    }
-    if (lane == 0) {
-        #pragma unroll
-        for (int r = 0; r < StaticTransitionRank; ++r) {
-            partial_sums[warp_id * StaticTransitionRank + r] = contrib[r];
+        const float contrib = prev * source_shared[thread_idx * StaticTransitionRank + r];
+        const float total = block_reduce_sum_128(contrib, scratch);
+        if (thread_idx == r) {
+            latent[r] = total;
         }
-    }
-    __syncthreads();
-    if (thread_idx < StaticTransitionRank) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < num_warps; ++w) {
-            total += partial_sums[w * StaticTransitionRank + thread_idx];
-        }
-        latent[thread_idx] = total;
     }
     __syncthreads();
 }
@@ -4258,35 +4566,16 @@ __device__ __forceinline__ void compute_latent_small_rank_128_from_register(
     float prev_prob_value,
     const float* __restrict__ source_shared,
     float* __restrict__ latent,
-    float* __restrict__ partial_sums,
+    float* __restrict__ scratch,
     int thread_idx) {
     static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
-    const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
-    const int lane = thread_idx & (kWarpSize - 1);
-    const int warp_id = thread_idx / kWarpSize;
-    float contrib[StaticTransitionRank];
     #pragma unroll
     for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = prev_prob_value * source_shared[thread_idx * StaticTransitionRank + r];
-    }
-    #pragma unroll
-    for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = warp_reduce_sum(contrib[r]);
-    }
-    if (lane == 0) {
-        #pragma unroll
-        for (int r = 0; r < StaticTransitionRank; ++r) {
-            partial_sums[warp_id * StaticTransitionRank + r] = contrib[r];
+        const float contrib = prev_prob_value * source_shared[thread_idx * StaticTransitionRank + r];
+        const float total = block_reduce_sum_128(contrib, scratch);
+        if (thread_idx == r) {
+            latent[r] = total;
         }
-    }
-    __syncthreads();
-    if (thread_idx < StaticTransitionRank) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < num_warps; ++w) {
-            total += partial_sums[w * StaticTransitionRank + thread_idx];
-        }
-        latent[thread_idx] = total;
     }
     __syncthreads();
 }
@@ -4296,38 +4585,19 @@ __device__ __forceinline__ void compute_latent_small_rank_128_from_pair_register
     FloatPair prev_prob_value,
     const float* __restrict__ source_shared,
     float* __restrict__ latent,
-    float* __restrict__ partial_sums,
+    float* __restrict__ scratch,
     int thread_idx) {
     static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
-    const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
-    const int lane = thread_idx & (kWarpSize - 1);
-    const int warp_id = thread_idx / kWarpSize;
     const int state0 = thread_idx * 2;
     const int state1 = state0 + 1;
-    float contrib[StaticTransitionRank];
     #pragma unroll
     for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = prev_prob_value.x * source_shared[state0 * StaticTransitionRank + r]
+        const float contrib = prev_prob_value.x * source_shared[state0 * StaticTransitionRank + r]
             + prev_prob_value.y * source_shared[state1 * StaticTransitionRank + r];
-    }
-    #pragma unroll
-    for (int r = 0; r < StaticTransitionRank; ++r) {
-        contrib[r] = warp_reduce_sum(contrib[r]);
-    }
-    if (lane == 0) {
-        #pragma unroll
-        for (int r = 0; r < StaticTransitionRank; ++r) {
-            partial_sums[warp_id * StaticTransitionRank + r] = contrib[r];
+        const float total = block_reduce_sum_128(contrib, scratch);
+        if (thread_idx == r) {
+            latent[r] = total;
         }
-    }
-    __syncthreads();
-    if (thread_idx < StaticTransitionRank) {
-        float total = 0.0f;
-        #pragma unroll
-        for (int w = 0; w < num_warps; ++w) {
-            total += partial_sums[w * StaticTransitionRank + thread_idx];
-        }
-        latent[thread_idx] = total;
     }
     __syncthreads();
 }
@@ -7723,14 +7993,16 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_spars
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool Sm90Path = false>
 __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_masked_tiled_chunk_kernel(
     const scalar_t* __restrict__ local_logits,
     const float* __restrict__ transition_source_logits,
     const float* __restrict__ transition_dest_logits,
+    const CUtensorMap* __restrict__ transition_source_tensor_map,
+    const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const bool* __restrict__ transition_mask,
     const float* __restrict__ row_sums,
@@ -7752,19 +8024,51 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_masked
     scalar_t* __restrict__ beliefs,
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     __shared__ int current_batch;
+    __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int chunk_end = min(chunk_start + chunk_len, seq_len);
+    const int staged_rank_chunk = max(1, min(transition_rank, kTensorCoreTile));
     extern __shared__ float shared_mem[];
     float* prev_log = shared_mem;
     float* prev_prob = prev_log + num_states;
     const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
     float* scratch = prev_prob + num_states;
     float* tile_stats = scratch + num_warps;
-    float* topk_values_shared = tile_stats + 2;
+    float* dest_logits_tile = tile_stats + 2;
+    float* source_logits_tile = dest_logits_tile + static_cast<int64_t>(staged_rank_chunk) * tile_size;
+    char* tensor_core_workspace_raw = reinterpret_cast<char*>(
+        source_logits_tile + static_cast<int64_t>(num_states) * staged_rank_chunk);
+    std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
+    tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
+    char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
+    using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
+    float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
+    float* topk_values_shared = tensor_core_matrix + (kTensorCoreTile * kTensorCoreTile);
     int* topk_indices_shared = reinterpret_cast<int*>(topk_values_shared + kMaxNativeScoreTopK);
+    auto tile_pipe = cuda::make_pipeline();
+    HopperStageBarrier* hopper_barrier = nullptr;
+    if constexpr (Sm90Path) {
+        hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
+        initialize_async_tile_barrier(*hopper_barrier);
+    }
     const bool use_global_score_cache = native_score_filtering_enabled(score_threshold, score_topk, num_states);
+    const bool use_tensor_core_math =
+        tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile);
 
     while (true) {
         if (tid == 0) {
@@ -7816,15 +8120,128 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_masked
                     for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
                         const int src = linear / active_states;
                         const int dst_local = linear - (src * active_states);
+                        tile_cache[src * tile_size + dst_local] = 0.0f;
+                    }
+                    __syncthreads();
+                    for (int rank_start = 0; rank_start < transition_rank; rank_start += staged_rank_chunk) {
+                        const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
+                        if constexpr (Sm90Path) {
+                            if (can_use_sm90_tma_float_tile_async(
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    active_rank,
+                                    active_states,
+                                    staged_rank_chunk,
+                                    tile_size)) {
+                                enqueue_sm90_tma_float_tile_pair_async(
+                                    dest_logits_tile,
+                                    source_logits_tile,
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    tile_size,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_pair_slice_async(
+                                    tile_pipe,
+                                    dest_logits_tile,
+                                    transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                    num_states,
+                                    active_rank,
+                                    active_states,
+                                    tile_size,
+                                    source_logits_tile,
+                                    transition_source_logits + rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    active_rank,
+                                    staged_rank_chunk,
+                                    hopper_barrier);
+                            }
+                        } else {
+                            enqueue_float_matrix_pair_slice_async(
+                                tile_pipe,
+                                dest_logits_tile,
+                                transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                num_states,
+                                active_rank,
+                                active_states,
+                                tile_size,
+                                source_logits_tile,
+                                transition_source_logits + rank_start,
+                                transition_rank,
+                                num_states,
+                                active_rank,
+                                staged_rank_chunk,
+                                hopper_barrier);
+                        }
+                        wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                        if ((use_tensor_core_math || use_wgmma_math) && active_rank == kTensorCoreTile) {
+                            for (int src = 0; src < num_states; ++src) {
+                                const float* source_row = source_logits_tile + static_cast<int64_t>(src) * staged_rank_chunk;
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                source_row,
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                source_row,
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile);
+                                        }
+                                    } else
+#endif
+                                    {
+                                        for (int dst_local = dst_subtile + tid; dst_local < dst_subtile + active_dst; dst_local += blockDim.x) {
+                                            float accum = tile_cache[src * tile_size + dst_local];
+                                            for (int r = 0; r < active_rank; ++r) {
+                                                accum += source_row[r]
+                                                    * dest_logits_tile[static_cast<int64_t>(r) * tile_size + dst_local];
+                                            }
+                                            tile_cache[src * tile_size + dst_local] = accum;
+                                        }
+                                        __syncthreads();
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
+                                const int src = linear / active_states;
+                                const int dst_local = linear - (src * active_states);
+                                float accum = tile_cache[src * tile_size + dst_local];
+                                for (int r = 0; r < active_rank; ++r) {
+                                    accum += source_logits_tile[static_cast<int64_t>(src) * staged_rank_chunk + r]
+                                        * dest_logits_tile[static_cast<int64_t>(r) * tile_size + dst_local];
+                                }
+                                tile_cache[src * tile_size + dst_local] = accum;
+                            }
+                            __syncthreads();
+                        }
+                    }
+                    for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
+                        const int src = linear / active_states;
+                        const int dst_local = linear - (src * active_states);
                         const int dst = state_start + dst_local;
-                        tile_cache[src * tile_size + dst_local] = masked_transition_raw_value(
-                            transition_source_logits,
-                            transition_dest_logits,
-                            transition_mask,
-                            num_states,
-                            transition_rank,
-                            src,
-                            dst) / row_sums[src];
+                        float masked_value = 0.0f;
+                        if (transition_mask[src * num_states + dst]) {
+                            masked_value = tile_cache[src * tile_size + dst_local] / row_sums[src];
+                        }
+                        tile_cache[src * tile_size + dst_local] = masked_value;
                     }
                     __syncthreads();
 
@@ -7939,7 +8356,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     float score_clamp_min,
@@ -7959,6 +8376,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ beliefs,
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     __shared__ int current_batch;
     __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
@@ -7982,20 +8400,26 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
     char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
     using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
-    tensor_core_input_t* tensor_core_lhs = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
     tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
     float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
     auto tile_pipe = cuda::make_pipeline();
     HopperStageBarrier* hopper_barrier = nullptr;
     if constexpr (Sm90Path) {
         hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
-        if (tid == 0) {
-            init(hopper_barrier, 1);
-        }
-        __syncthreads();
+        initialize_async_tile_barrier(*hopper_barrier);
     }
     const bool use_tensor_core_math =
         tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
         && (transition_rank >= kTensorCoreTile)
         && (tile_size >= kTensorCoreTile)
         && (split_size >= kTensorCoreTile);
@@ -8100,8 +8524,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             }
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
-                            __syncthreads();
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                             const int current_stage = rank_tile_idx % pipeline_stages;
@@ -8154,7 +8577,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             }
                             const float* current_source_tile = source_tile_shared
                                 + static_cast<int64_t>(current_stage) * num_states * staged_rank_chunk;
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                     latent[r] = 0.0f;
                                 }
@@ -8163,14 +8586,24 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     const int active_src = min(kTensorCoreTile, num_states - src_start);
 #if __CUDA_ARCH__ >= 700
                                     if (active_src == kTensorCoreTile) {
-                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                            prev_prob + src_start,
-                                            current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
-                                            staged_rank_chunk,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            latent);
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                prev_prob + src_start,
+                                                current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                                staged_rank_chunk,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                latent);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                prev_prob + src_start,
+                                                current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                                staged_rank_chunk,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                latent);
+                                        }
                                     } else
 #endif
                                     {
@@ -8196,19 +8629,29 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             __syncthreads();
                             const float* current_dest_tile = dest_tile_shared
                                 + static_cast<int64_t>(current_stage) * staged_rank_chunk * tile_size;
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
                                     const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
 #if __CUDA_ARCH__ >= 700
                                     if (active_dst == kTensorCoreTile) {
-                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                            latent,
-                                            current_dest_tile + dst_subtile,
-                                            tile_size,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            score_cache + state_start + dst_subtile);
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                latent,
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                score_cache + state_start + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                latent,
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                score_cache + state_start + dst_subtile);
+                                        }
                                     } else
 #endif
                                     {
@@ -8232,9 +8675,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe, hopper_barrier);
+                                wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                            } else {
+                                __syncthreads();
                             }
-                            __syncthreads();
                         }
                     }
                     for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {
@@ -8335,16 +8779,18 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool Sm90Path = false>
 __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_masked_tiled_chunk_kernel(
     const scalar_t* __restrict__ grad_beliefs,
     const scalar_t* __restrict__ grad_final_belief,
     const float* __restrict__ transition_source_logits,
     const float* __restrict__ transition_dest_logits,
+    const CUtensorMap* __restrict__ transition_source_tensor_map,
+    const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const bool* __restrict__ transition_mask,
     const float* __restrict__ row_sums,
@@ -8370,7 +8816,9 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_maske
     float* __restrict__ grad_transition_gate_per_batch,
     float* __restrict__ grad_transition_stay_per_batch) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     __shared__ int current_batch;
+    __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     extern __shared__ float shared_mem[];
@@ -8384,6 +8832,33 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_maske
     const int rank_chunk = max(1, min(tile_size, kMaskedBackwardRankChunk));
     float* dest_logits_tile = scratch + num_warps + 4;
     float* source_logits_tile = dest_logits_tile + rank_chunk * tile_size;
+    char* tensor_core_workspace_raw = reinterpret_cast<char*>(
+        source_logits_tile + static_cast<int64_t>(rank_chunk) * num_states);
+    std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
+    tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
+    char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
+    using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
+    float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
+    auto tile_pipe = cuda::make_pipeline();
+    HopperStageBarrier* hopper_barrier = nullptr;
+    if constexpr (Sm90Path) {
+        hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
+        initialize_async_tile_barrier(*hopper_barrier);
+    }
+    const bool use_tensor_core_math =
+        tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile);
 
     while (true) {
         if (tid == 0) {
@@ -8454,15 +8929,128 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_maske
                     for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
                         const int src = linear / active_states;
                         const int dst_local = linear - (src * active_states);
+                        tile_cache[src * tile_size + dst_local] = 0.0f;
+                    }
+                    __syncthreads();
+                    for (int rank_start = 0; rank_start < transition_rank; rank_start += rank_chunk) {
+                        const int active_rank = min(rank_chunk, transition_rank - rank_start);
+                        if constexpr (Sm90Path) {
+                            if (can_use_sm90_tma_float_tile_async(
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    active_rank,
+                                    active_states,
+                                    rank_chunk,
+                                    tile_size)) {
+                                enqueue_sm90_tma_float_tile_pair_async(
+                                    dest_logits_tile,
+                                    source_logits_tile,
+                                    transition_source_tensor_map,
+                                    transition_dest_tensor_map,
+                                    state_start,
+                                    rank_start,
+                                    num_states,
+                                    rank_chunk,
+                                    tile_size,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_pair_slice_async(
+                                    tile_pipe,
+                                    dest_logits_tile,
+                                    transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                    num_states,
+                                    active_rank,
+                                    active_states,
+                                    tile_size,
+                                    source_logits_tile,
+                                    transition_source_logits + rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    active_rank,
+                                    rank_chunk,
+                                    hopper_barrier);
+                            }
+                        } else {
+                            enqueue_float_matrix_pair_slice_async(
+                                tile_pipe,
+                                dest_logits_tile,
+                                transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                num_states,
+                                active_rank,
+                                active_states,
+                                tile_size,
+                                source_logits_tile,
+                                transition_source_logits + rank_start,
+                                transition_rank,
+                                num_states,
+                                active_rank,
+                                rank_chunk,
+                                hopper_barrier);
+                        }
+                        wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                        if ((use_tensor_core_math || use_wgmma_math) && active_rank == kTensorCoreTile) {
+                            for (int src = 0; src < num_states; ++src) {
+                                const float* source_row = source_logits_tile + static_cast<int64_t>(src) * rank_chunk;
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                source_row,
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                source_row,
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile);
+                                        }
+                                    } else
+#endif
+                                    {
+                                        for (int dst_local = dst_subtile + tid; dst_local < dst_subtile + active_dst; dst_local += blockDim.x) {
+                                            float accum = tile_cache[src * tile_size + dst_local];
+                                            for (int r = 0; r < active_rank; ++r) {
+                                                accum += source_row[r]
+                                                    * dest_logits_tile[static_cast<int64_t>(r) * tile_size + dst_local];
+                                            }
+                                            tile_cache[src * tile_size + dst_local] = accum;
+                                        }
+                                        __syncthreads();
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
+                                const int src = linear / active_states;
+                                const int dst_local = linear - (src * active_states);
+                                float accum = tile_cache[src * tile_size + dst_local];
+                                for (int r = 0; r < active_rank; ++r) {
+                                    accum += source_logits_tile[static_cast<int64_t>(src) * rank_chunk + r]
+                                        * dest_logits_tile[static_cast<int64_t>(r) * tile_size + dst_local];
+                                }
+                                tile_cache[src * tile_size + dst_local] = accum;
+                            }
+                            __syncthreads();
+                        }
+                    }
+                    for (int linear = tid; linear < num_states * active_states; linear += blockDim.x) {
+                        const int src = linear / active_states;
+                        const int dst_local = linear - (src * active_states);
                         const int dst = state_start + dst_local;
-                        tile_cache[src * tile_size + dst_local] = masked_transition_raw_value(
-                            transition_source_logits,
-                            transition_dest_logits,
-                            transition_mask,
-                            num_states,
-                            transition_rank,
-                            src,
-                            dst) / row_sums[src];
+                        float masked_value = 0.0f;
+                        if (transition_mask[src * num_states + dst]) {
+                            masked_value = tile_cache[src * tile_size + dst_local] / row_sums[src];
+                        }
+                        tile_cache[src * tile_size + dst_local] = masked_value;
                     }
                     __syncthreads();
 
@@ -8545,26 +9133,113 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_maske
                         const int64_t source_base = static_cast<int64_t>(src) * transition_rank;
                         for (int rank_start = 0; rank_start < transition_rank; rank_start += rank_chunk) {
                             const int active_rank = min(rank_chunk, transition_rank - rank_start);
-                            for (int linear = tid; linear < active_rank * active_states; linear += blockDim.x) {
-                                const int r_local = linear / active_states;
-                                const int dst_local = linear - (r_local * active_states);
-                                const int dst = state_start + dst_local;
-                                dest_logits_tile[r_local * tile_size + dst_local] =
-                                    transition_dest_logits[static_cast<int64_t>(rank_start + r_local) * num_states + dst];
+                            if constexpr (Sm90Path) {
+                                if (can_use_sm90_tma_float_matrix_slice_async(
+                                        transition_dest_tensor_map,
+                                        active_states,
+                                        active_rank,
+                                        tile_size,
+                                        rank_chunk)) {
+                                    enqueue_sm90_tma_float_matrix_slice_async(
+                                        dest_logits_tile,
+                                        transition_dest_tensor_map,
+                                        state_start,
+                                        rank_start,
+                                        active_rank,
+                                        active_states,
+                                        *hopper_barrier);
+                                } else {
+                                    enqueue_float_matrix_slice_async(
+                                        tile_pipe,
+                                        dest_logits_tile,
+                                        transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                        num_states,
+                                        active_rank,
+                                        active_states,
+                                        static_cast<int>(tile_size),
+                                        hopper_barrier);
+                                }
+                            } else {
+                                enqueue_float_matrix_slice_async(
+                                    tile_pipe,
+                                    dest_logits_tile,
+                                    transition_dest_logits + static_cast<int64_t>(rank_start) * num_states + state_start,
+                                    num_states,
+                                    active_rank,
+                                    active_states,
+                                    static_cast<int>(tile_size),
+                                    hopper_barrier);
                             }
-                            __syncthreads();
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                             float grad_source_accum[kMaskedBackwardRankChunk];
                             #pragma unroll
                             for (int r_local = 0; r_local < kMaskedBackwardRankChunk; ++r_local) {
                                 grad_source_accum[r_local] = 0.0f;
                             }
-                            for (int dst_local = 0; dst_local < active_states; ++dst_local) {
-                                const float grad_raw = tile_cache[src * tile_size + dst_local];
-                                #pragma unroll
-                                for (int r_local = 0; r_local < kMaskedBackwardRankChunk; ++r_local) {
-                                    if (r_local < active_rank) {
-                                        grad_source_accum[r_local] += grad_raw
-                                            * dest_logits_tile[r_local * tile_size + dst_local];
+                            if ((use_tensor_core_math || use_wgmma_math) && active_rank == kTensorCoreTile) {
+                                float* tensor_core_vector = grad_mix;
+                                for (int r_local = tid; r_local < active_rank; r_local += blockDim.x) {
+                                    tensor_core_vector[r_local] = 0.0f;
+                                }
+                                __syncthreads();
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        if (use_wgmma_math) {
+                                            for (int r_local = tid; r_local < active_rank; r_local += blockDim.x) {
+                                                tensor_core_accum[r_local] = 0.0f;
+                                            }
+                                            __syncthreads();
+                                            wgmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                tensor_core_matrix,
+                                                tensor_core_accum);
+                                            for (int r_local = tid; r_local < active_rank; r_local += blockDim.x) {
+                                                tensor_core_vector[r_local] += tensor_core_accum[r_local];
+                                            }
+                                            __syncthreads();
+                                        } else {
+                                            wmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                                dest_logits_tile + dst_subtile,
+                                                tile_size,
+                                                tile_cache + static_cast<int64_t>(src) * tile_size + dst_subtile,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                tensor_core_vector);
+                                        }
+                                    } else
+#endif
+                                    {
+                                        for (int dst_local = dst_subtile; dst_local < dst_subtile + active_dst; ++dst_local) {
+                                            const float grad_raw = tile_cache[src * tile_size + dst_local];
+                                            #pragma unroll
+                                            for (int r_local = 0; r_local < kMaskedBackwardRankChunk; ++r_local) {
+                                                if (r_local < active_rank) {
+                                                    grad_source_accum[r_local] += grad_raw
+                                                        * dest_logits_tile[r_local * tile_size + dst_local];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                for (int r_local = 0; r_local < active_rank; ++r_local) {
+                                    grad_source_accum[r_local] += tensor_core_vector[r_local];
+                                }
+                            } else {
+                                for (int dst_local = 0; dst_local < active_states; ++dst_local) {
+                                    const float grad_raw = tile_cache[src * tile_size + dst_local];
+                                    #pragma unroll
+                                    for (int r_local = 0; r_local < kMaskedBackwardRankChunk; ++r_local) {
+                                        if (r_local < active_rank) {
+                                            grad_source_accum[r_local] += grad_raw
+                                                * dest_logits_tile[r_local * tile_size + dst_local];
+                                        }
                                     }
                                 }
                             }
@@ -8578,13 +9253,44 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_maske
 
                     for (int rank_start = 0; rank_start < transition_rank; rank_start += rank_chunk) {
                         const int active_rank = min(rank_chunk, transition_rank - rank_start);
-                        for (int linear = tid; linear < active_rank * num_states; linear += blockDim.x) {
-                            const int r_local = linear / num_states;
-                            const int src = linear - (r_local * num_states);
-                            source_logits_tile[r_local * num_states + src] =
-                                transition_source_logits[static_cast<int64_t>(src) * transition_rank + rank_start + r_local];
+                        if constexpr (Sm90Path) {
+                            if (can_use_sm90_tma_float_matrix_slice_async(
+                                    transition_source_tensor_map,
+                                    active_rank,
+                                    num_states,
+                                    rank_chunk,
+                                    num_states)) {
+                                enqueue_sm90_tma_float_matrix_slice_async(
+                                    source_logits_tile,
+                                    transition_source_tensor_map,
+                                    rank_start,
+                                    0,
+                                    num_states,
+                                    active_rank,
+                                    *hopper_barrier);
+                            } else {
+                                enqueue_float_matrix_slice_async(
+                                    tile_pipe,
+                                    source_logits_tile,
+                                    transition_source_logits + rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    active_rank,
+                                    rank_chunk,
+                                    hopper_barrier);
+                            }
+                        } else {
+                            enqueue_float_matrix_slice_async(
+                                tile_pipe,
+                                source_logits_tile,
+                                transition_source_logits + rank_start,
+                                transition_rank,
+                                num_states,
+                                active_rank,
+                                rank_chunk,
+                                hopper_barrier);
                         }
-                        __syncthreads();
+                        wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                         for (int dst_local = tid; dst_local < active_states; dst_local += blockDim.x) {
                             const int dst = state_start + dst_local;
                             for (int r_local = 0; r_local < active_rank; ++r_local) {
@@ -8630,7 +9336,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     float score_clamp_min,
@@ -8660,6 +9366,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     float* __restrict__ grad_transition_gate_output,
     float* __restrict__ grad_transition_stay_output) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int staged_rank_chunk = max(1, min(split_size, Sm90Path ? kSm90AsyncTileRankChunk : kAsyncTileRankChunk));
@@ -8693,10 +9400,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     HopperStageBarrier* hopper_barrier = nullptr;
     if constexpr (Sm90Path) {
         hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
-        if (tid == 0) {
-            init(hopper_barrier, 1);
-        }
-        __syncthreads();
+        initialize_async_tile_barrier(*hopper_barrier);
     }
     char* tensor_core_workspace_raw = reinterpret_cast<char*>(
         source_tile_shared + static_cast<int64_t>(pipeline_stages) * num_states * staged_rank_chunk);
@@ -8704,11 +9408,20 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
     char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
     using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
-    tensor_core_input_t* tensor_core_lhs = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
     tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
     float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
     const bool use_tensor_core_math =
         tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
         && (transition_rank >= kTensorCoreTile)
         && (tile_size >= kTensorCoreTile)
         && (split_size >= kTensorCoreTile);
@@ -8802,8 +9515,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                         }
                     }
                     if (initial_prefetch > 0) {
-                        wait_for_async_tile(tile_pipe, hopper_barrier);
-                        __syncthreads();
+                        wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                     }
                     for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                         const int current_rank_start = rank_tile_idx * staged_rank_chunk;
@@ -8844,7 +9556,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                         }
                         const float* current_source_tile = source_tile_shared
                             + static_cast<int64_t>(current_stage) * num_states * staged_rank_chunk;
-                        if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                        if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                             for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                 latent[r] = 0.0f;
                             }
@@ -8853,14 +9565,24 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 const int active_src = min(kTensorCoreTile, num_states - src_start);
 #if __CUDA_ARCH__ >= 700
                                 if (active_src == kTensorCoreTile) {
-                                    wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                        prev_prob + src_start,
-                                        current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
-                                        staged_rank_chunk,
-                                        tensor_core_lhs,
-                                        tensor_core_rhs,
-                                        tensor_core_accum,
-                                        latent);
+                                    if (use_wgmma_math) {
+                                        wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                            prev_prob + src_start,
+                                            current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                            staged_rank_chunk,
+                                            wgmma_a_shared,
+                                            wgmma_b_shared,
+                                            latent);
+                                    } else {
+                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                            prev_prob + src_start,
+                                            current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                            staged_rank_chunk,
+                                            tensor_core_lhs,
+                                            tensor_core_rhs,
+                                            tensor_core_accum,
+                                            latent);
+                                    }
                                 } else
 #endif
                                 {
@@ -8889,9 +9611,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                             }
                         }
                         if (rank_tile_idx + 1 < total_rank_tiles) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                        } else {
+                            __syncthreads();
                         }
-                        __syncthreads();
                     }
                 }
 
@@ -8939,8 +9662,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                             }
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
-                            __syncthreads();
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                             const int current_rank_start = rank_tile_idx * staged_rank_chunk;
@@ -8985,19 +9707,29 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                             __syncthreads();
                             const float* current_dest_tile = dest_tile_shared
                                 + static_cast<int64_t>(current_stage) * staged_rank_chunk * tile_size;
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
                                     const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
 #if __CUDA_ARCH__ >= 700
                                     if (active_dst == kTensorCoreTile) {
-                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                            latent,
-                                            current_dest_tile + dst_subtile,
-                                            tile_size,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            grad_mix_tile + dst_subtile);
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                latent,
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                grad_mix_tile + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                latent,
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                grad_mix_tile + dst_subtile);
+                                        }
                                     } else
 #endif
                                     {
@@ -9021,9 +9753,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe, hopper_barrier);
+                                wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                            } else {
+                                __syncthreads();
                             }
-                            __syncthreads();
                         }
                     }
 
@@ -9104,8 +9837,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                             }
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
-                            __syncthreads();
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                             const int current_rank_start = rank_tile_idx * staged_rank_chunk;
@@ -9151,7 +9883,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
 
                             const float* current_dest_tile = dest_tile_shared
                                 + static_cast<int64_t>(current_stage) * staged_rank_chunk * tile_size;
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                     latent[r] = 0.0f;
                                 }
@@ -9160,14 +9892,25 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                     const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
 #if __CUDA_ARCH__ >= 700
                                     if (active_dst == kTensorCoreTile) {
-                                        wmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
-                                            current_dest_tile + dst_subtile,
-                                            tile_size,
-                                            grad_mix_tile + dst_subtile,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            latent);
+                                        if (use_wgmma_math) {
+                                            wgmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                grad_mix_tile + dst_subtile,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                tensor_core_matrix,
+                                                latent);
+                                        } else {
+                                            wmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                                current_dest_tile + dst_subtile,
+                                                tile_size,
+                                                grad_mix_tile + dst_subtile,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                latent);
+                                        }
                                     } else
 #endif
                                     {
@@ -9210,9 +9953,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe, hopper_barrier);
+                                wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                            } else {
+                                __syncthreads();
                             }
-                            __syncthreads();
                         }
                     }
                 }
@@ -9255,8 +9999,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                         }
                     }
                     if (initial_prefetch > 0) {
-                        wait_for_async_tile(tile_pipe, hopper_barrier);
-                        __syncthreads();
+                        wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                     }
                     for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                         const int current_rank_start = rank_tile_idx * staged_rank_chunk;
@@ -9301,7 +10044,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                         __syncthreads();
                         const float* current_source_tile = source_tile_shared
                             + static_cast<int64_t>(current_stage) * num_states * staged_rank_chunk;
-                        if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                        if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                             for (int src_start = 0; src_start < num_states; src_start += kTensorCoreTile) {
                                 const int active_src = min(kTensorCoreTile, num_states - src_start);
                                 for (int src_local = tid; src_local < active_src; src_local += blockDim.x) {
@@ -9310,14 +10053,25 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 __syncthreads();
 #if __CUDA_ARCH__ >= 700
                                 if (active_src == kTensorCoreTile) {
-                                    wmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
-                                        current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
-                                        staged_rank_chunk,
-                                        latent,
-                                        tensor_core_lhs,
-                                        tensor_core_rhs,
-                                        tensor_core_accum,
-                                        grad_mix_tile);
+                                    if (use_wgmma_math) {
+                                        wgmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                            current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                            staged_rank_chunk,
+                                            latent,
+                                            wgmma_a_shared,
+                                            wgmma_b_shared,
+                                            tensor_core_matrix,
+                                            grad_mix_tile);
+                                    } else {
+                                        wmma_matrix_times_replicated_col_vector_16x16<scalar_t>(
+                                            current_source_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                            staged_rank_chunk,
+                                            latent,
+                                            tensor_core_lhs,
+                                            tensor_core_rhs,
+                                            tensor_core_accum,
+                                            grad_mix_tile);
+                                    }
                                 } else
 #endif
                                 {
@@ -9355,9 +10109,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                             }
                         }
                         if (rank_tile_idx + 1 < total_rank_tiles) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                        } else {
+                            __syncthreads();
                         }
-                        __syncthreads();
                     }
                 }
 
@@ -9416,11 +10171,12 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     const packed_t* __restrict__ transition_source_packed,
     const float* __restrict__ transition_source_scales,
     const packed_t* __restrict__ transition_dest_packed,
+    const CUtensorMap* __restrict__ transition_source_tensor_map,
     const CUtensorMap* __restrict__ transition_dest_tensor_map,
     const float* __restrict__ transition_dest_scales,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     float score_clamp_min,
@@ -9440,6 +10196,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     scalar_t* __restrict__ beliefs,
     scalar_t* __restrict__ final_log_belief) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     __shared__ int current_batch;
     __shared__ alignas(HopperStageBarrier) unsigned char hopper_stage_barrier_storage[sizeof(HopperStageBarrier)];
     const bool has_seq_lens = seq_lens != nullptr;
@@ -9457,13 +10214,17 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     float* dest_tile_shared = tile_stats + 2;
     packed_t* dest_tile_packed_shared = reinterpret_cast<packed_t*>(
         dest_tile_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
+    packed_t* source_tile_packed_shared = dest_tile_packed_shared
+        + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size;
     char* tensor_core_workspace_raw = reinterpret_cast<char*>(
-        dest_tile_packed_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * tile_size);
+        source_tile_packed_shared + static_cast<int64_t>(pipeline_stages) * staged_rank_chunk * num_states);
     std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
     tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
     char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
     using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
-    tensor_core_input_t* tensor_core_lhs = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
     tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
     float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
     float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
@@ -9471,13 +10232,16 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
     HopperStageBarrier* hopper_barrier = nullptr;
     if constexpr (Sm90Path) {
         hopper_barrier = reinterpret_cast<HopperStageBarrier*>(hopper_stage_barrier_storage);
-        if (tid == 0) {
-            init(hopper_barrier, 1);
-        }
-        __syncthreads();
+        initialize_async_tile_barrier(*hopper_barrier);
     }
     const bool use_tensor_core_math =
         tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
         && (transition_rank >= kTensorCoreTile)
         && (tile_size >= kTensorCoreTile)
         && (split_size >= kTensorCoreTile);
@@ -9541,19 +10305,30 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                             const int stage_slot = next_tile_to_launch % pipeline_stages;
                             packed_t* staged_dest_tile = dest_tile_packed_shared
                                 + static_cast<int64_t>(stage_slot) * staged_rank_chunk * tile_size;
+                            packed_t* staged_source_tile = source_tile_packed_shared
+                                + static_cast<int64_t>(stage_slot) * staged_rank_chunk * num_states;
                             if (can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
+                                    transition_source_tensor_map,
+                                    active_rank,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    num_states)
+                                && can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
                                     transition_dest_tensor_map,
                                     active_states,
                                     active_rank,
                                     tile_size,
                                     staged_rank_chunk)) {
-                                enqueue_sm90_tma_packed_matrix_slice_async(
+                                enqueue_sm90_tma_packed_tile_pair_async(
                                     staged_dest_tile,
+                                    staged_source_tile,
+                                    transition_source_tensor_map,
                                     transition_dest_tensor_map,
                                     state_start,
                                     rank_start,
-                                    active_states,
-                                    active_rank,
+                                    num_states,
+                                    staged_rank_chunk,
+                                    tile_size,
                                     *hopper_barrier);
                             } else {
                                 enqueue_packed_matrix_slice_async(
@@ -9565,11 +10340,19 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                     active_states,
                                     tile_size,
                                     hopper_barrier);
+                                enqueue_packed_matrix_slice_async(
+                                    tile_pipe,
+                                    staged_source_tile,
+                                    transition_source_packed + rank_start,
+                                    transition_rank,
+                                    num_states,
+                                    active_rank,
+                                    staged_rank_chunk,
+                                    hopper_barrier);
                             }
                         }
                         if (initial_prefetch > 0) {
-                            wait_for_async_tile(tile_pipe, hopper_barrier);
-                            __syncthreads();
+                            wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
                         }
                         for (int rank_tile_idx = 0; rank_tile_idx < total_rank_tiles; ++rank_tile_idx) {
                             const int current_rank_start = rank_tile_idx * staged_rank_chunk;
@@ -9581,19 +10364,30 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 const int next_stage = next_tile_to_launch % pipeline_stages;
                                 packed_t* staged_dest_tile = dest_tile_packed_shared
                                     + static_cast<int64_t>(next_stage) * staged_rank_chunk * tile_size;
+                                packed_t* staged_source_tile = source_tile_packed_shared
+                                    + static_cast<int64_t>(next_stage) * staged_rank_chunk * num_states;
                                 if (can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
+                                        transition_source_tensor_map,
+                                        next_active_rank,
+                                        num_states,
+                                        staged_rank_chunk,
+                                        num_states)
+                                    && can_use_sm90_tma_packed_matrix_slice_async<packed_t>(
                                         transition_dest_tensor_map,
                                         active_states,
                                         next_active_rank,
                                         tile_size,
                                         staged_rank_chunk)) {
-                                    enqueue_sm90_tma_packed_matrix_slice_async(
+                                    enqueue_sm90_tma_packed_tile_pair_async(
                                         staged_dest_tile,
+                                        staged_source_tile,
+                                        transition_source_tensor_map,
                                         transition_dest_tensor_map,
                                         state_start,
                                         next_rank_start,
-                                        active_states,
-                                        next_active_rank,
+                                        num_states,
+                                        staged_rank_chunk,
+                                        tile_size,
                                         *hopper_barrier);
                                 } else {
                                     enqueue_packed_matrix_slice_async(
@@ -9605,10 +10399,21 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                         active_states,
                                         tile_size,
                                         hopper_barrier);
+                                    enqueue_packed_matrix_slice_async(
+                                        tile_pipe,
+                                        staged_source_tile,
+                                        transition_source_packed + next_rank_start,
+                                        transition_rank,
+                                        num_states,
+                                        next_active_rank,
+                                        staged_rank_chunk,
+                                        hopper_barrier);
                                 }
                                 ++next_tile_to_launch;
                             }
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            const packed_t* current_source_packed_tile = source_tile_packed_shared
+                                + static_cast<int64_t>(current_stage) * staged_rank_chunk * num_states;
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int r = tid; r < current_active_rank; r += blockDim.x) {
                                     latent[r] = 0.0f;
                                 }
@@ -9618,46 +10423,57 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
 #if __CUDA_ARCH__ >= 700
                                     if (active_src == kTensorCoreTile) {
                                         load_packed_matrix_tile_rowmajor_16x16<packed_t, Format>(
-                                            transition_source_packed,
-                                            transition_source_scales,
-                                            transition_rank,
-                                            src_start,
-                                            current_rank_start,
+                                            current_source_packed_tile + static_cast<int64_t>(src_start) * staged_rank_chunk,
+                                            transition_source_scales + src_start,
+                                            staged_rank_chunk,
+                                            0,
+                                            0,
                                             active_src,
                                             current_active_rank,
                                             tensor_core_matrix);
-                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                            prev_prob + src_start,
-                                            tensor_core_matrix,
-                                            kTensorCoreTile,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            latent);
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                prev_prob + src_start,
+                                                tensor_core_matrix,
+                                                kTensorCoreTile,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                latent);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                prev_prob + src_start,
+                                                tensor_core_matrix,
+                                                kTensorCoreTile,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                latent);
+                                        }
                                     } else
 #endif
                                     {
                                         for (int r = tid; r < current_active_rank; r += blockDim.x) {
-                                            latent[r] += packed_column_dot_lowp<packed_t, Format>(
-                                                prev_prob + src_start,
-                                                transition_source_packed + static_cast<int64_t>(src_start) * transition_rank + current_rank_start + r,
-                                                transition_source_scales + src_start,
-                                                active_src,
-                                                transition_rank,
-                                                0);
+                                            float partial = 0.0f;
+                                            for (int src_local = 0; src_local < active_src; ++src_local) {
+                                                partial += (prev_prob + src_start)[src_local]
+                                                    * unpack_packed_value<packed_t, Format>(
+                                                        current_source_packed_tile[static_cast<int64_t>(src_start + src_local) * staged_rank_chunk + r],
+                                                        transition_source_scales[src_start + src_local]);
+                                            }
+                                            latent[r] += partial;
                                         }
                                         __syncthreads();
                                     }
                                 }
                             } else {
                                 for (int r = tid; r < current_active_rank; r += blockDim.x) {
-                                    latent[r] = packed_column_dot_lowp<packed_t, Format>(
-                                        prev_prob,
-                                        transition_source_packed,
-                                        transition_source_scales,
-                                        num_states,
-                                        transition_rank,
-                                        current_rank_start + r);
+                                    float latent_value = 0.0f;
+                                    for (int src = 0; src < num_states; ++src) {
+                                        latent_value += prev_prob[src] * unpack_packed_value<packed_t, Format>(
+                                            current_source_packed_tile[static_cast<int64_t>(src) * staged_rank_chunk + r],
+                                            transition_source_scales[src]);
+                                    }
+                                    latent[r] = latent_value;
                                 }
                             }
                             const packed_t* current_packed_tile = dest_tile_packed_shared
@@ -9682,19 +10498,29 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 }
                             }
                             __syncthreads();
-                            if (use_tensor_core_math && current_active_rank == kTensorCoreTile) {
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
                                 for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
                                     const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
 #if __CUDA_ARCH__ >= 700
                                     if (active_dst == kTensorCoreTile) {
-                                        wmma_replicated_row_times_matrix_16x16<scalar_t>(
-                                            latent,
-                                            dest_tile_shared + dst_subtile,
-                                            tile_size,
-                                            tensor_core_lhs,
-                                            tensor_core_rhs,
-                                            tensor_core_accum,
-                                            score_cache + state_start + dst_subtile);
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                latent,
+                                                dest_tile_shared + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                score_cache + state_start + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                latent,
+                                                dest_tile_shared + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                score_cache + state_start + dst_subtile);
+                                        }
                                     } else
 #endif
                                     {
@@ -9718,9 +10544,10 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_tiled_
                                 }
                             }
                             if (rank_tile_idx + 1 < total_rank_tiles) {
-                                wait_for_async_tile(tile_pipe, hopper_barrier);
+                                wait_for_async_tile_and_sync(tile_pipe, hopper_barrier);
+                            } else {
+                                __syncthreads();
                             }
-                            __syncthreads();
                         }
                     }
 
@@ -9820,7 +10647,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     float score_clamp_min,
@@ -9852,6 +10679,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     (void)score_threshold;
     (void)score_topk;
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int staged_rank_chunk = max(1, min(split_size, Sm90Path ? kSm90AsyncTileRankChunk : kAsyncTileRankChunk));
@@ -9874,7 +10702,30 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
     float* dest_tile_shared = scratch + num_warps;
     packed_t* dest_tile_packed_shared = reinterpret_cast<packed_t*>(
         dest_tile_shared + static_cast<int64_t>(staged_rank_chunk) * tile_size);
+    char* tensor_core_workspace_raw = reinterpret_cast<char*>(
+        dest_tile_packed_shared + static_cast<int64_t>(async_tile_pipeline_stages<Sm90Path>()) * staged_rank_chunk * tile_size);
+    std::uintptr_t tensor_core_workspace_addr = reinterpret_cast<std::uintptr_t>(tensor_core_workspace_raw);
+    tensor_core_workspace_addr = (tensor_core_workspace_addr + 31u) & ~std::uintptr_t(31u);
+    char* tensor_core_workspace = reinterpret_cast<char*>(tensor_core_workspace_addr);
+    using tensor_core_input_t = tensor_core_input_type_t<scalar_t>;
+    tensor_core_input_t* wgmma_a_shared = reinterpret_cast<tensor_core_input_t*>(tensor_core_workspace);
+    tensor_core_input_t* wgmma_b_shared = wgmma_a_shared + (kWgmmaRows * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_lhs = wgmma_b_shared + (kTensorCoreTile * kTensorCoreTile);
+    tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
+    float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
+    float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
     auto tile_pipe = cuda::make_pipeline();
+    const bool use_tensor_core_math =
+        tensor_core_math_enabled_for_scalar<scalar_t>()
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
+    const bool use_wgmma_math =
+        wgmma_math_enabled_for_scalar<scalar_t>()
+        && blockDim.x >= 128
+        && (transition_rank >= kTensorCoreTile)
+        && (tile_size >= kTensorCoreTile)
+        && (split_size >= kTensorCoreTile);
 
     while (true) {
         if (tid == 0) {
@@ -9928,15 +10779,74 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
 
                 for (int rank_start = 0; rank_start < transition_rank; rank_start += staged_rank_chunk) {
                     const int active_rank = min(staged_rank_chunk, transition_rank - rank_start);
-                    for (int r = tid; r < active_rank; r += blockDim.x) {
-                        latent_cache[rank_start + r] = packed_column_dot_lowp<packed_t, Format>(
-                            prev_prob,
-                            transition_source_packed,
-                            transition_source_scales,
-                            num_states,
-                            transition_rank,
-                            rank_start + r);
-                        grad_latent_accum[rank_start + r] = 0.0f;
+                    if ((use_tensor_core_math || use_wgmma_math) && active_rank == kTensorCoreTile) {
+                        for (int r = tid; r < active_rank; r += blockDim.x) {
+                            latent[r] = 0.0f;
+                        }
+                        __syncthreads();
+                        for (int src_start = 0; src_start < num_states; src_start += kTensorCoreTile) {
+                            const int active_src = min(kTensorCoreTile, num_states - src_start);
+#if __CUDA_ARCH__ >= 700
+                            if (active_src == kTensorCoreTile) {
+                                load_packed_matrix_tile_rowmajor_16x16<packed_t, Format>(
+                                    transition_source_packed + static_cast<int64_t>(src_start) * transition_rank + rank_start,
+                                    transition_source_scales + src_start,
+                                    transition_rank,
+                                    0,
+                                    0,
+                                    active_src,
+                                    active_rank,
+                                    tensor_core_matrix);
+                                if (use_wgmma_math) {
+                                    wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                        prev_prob + src_start,
+                                        tensor_core_matrix,
+                                        kTensorCoreTile,
+                                        wgmma_a_shared,
+                                        wgmma_b_shared,
+                                        latent);
+                                } else {
+                                    wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                        prev_prob + src_start,
+                                        tensor_core_matrix,
+                                        kTensorCoreTile,
+                                        tensor_core_lhs,
+                                        tensor_core_rhs,
+                                        tensor_core_accum,
+                                        latent);
+                                }
+                            } else
+#endif
+                            {
+                                for (int r = tid; r < active_rank; r += blockDim.x) {
+                                    float partial = 0.0f;
+                                    for (int src_local = 0; src_local < active_src; ++src_local) {
+                                        partial += prev_prob[src_start + src_local]
+                                            * unpack_packed_value<packed_t, Format>(
+                                                transition_source_packed[static_cast<int64_t>(src_start + src_local) * transition_rank
+                                                    + rank_start + r],
+                                                transition_source_scales[src_start + src_local]);
+                                    }
+                                    latent[r] += partial;
+                                }
+                                __syncthreads();
+                            }
+                        }
+                        for (int r = tid; r < active_rank; r += blockDim.x) {
+                            latent_cache[rank_start + r] = latent[r];
+                            grad_latent_accum[rank_start + r] = 0.0f;
+                        }
+                    } else {
+                        for (int r = tid; r < active_rank; r += blockDim.x) {
+                            latent_cache[rank_start + r] = packed_column_dot_lowp<packed_t, Format>(
+                                prev_prob,
+                                transition_source_packed,
+                                transition_source_scales,
+                                num_states,
+                                transition_rank,
+                                rank_start + r);
+                            grad_latent_accum[rank_start + r] = 0.0f;
+                        }
                     }
                     __syncthreads();
                 }
@@ -10003,12 +10913,50 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 }
                             }
                             __syncthreads();
-                            for (int dst = tid; dst < active_states; dst += blockDim.x) {
-                                grad_mix_tile[dst] += lowp_dot_rhs_strided(
-                                    latent,
-                                    dest_tile_shared + dst,
-                                    tile_size,
-                                    current_active_rank);
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                latent,
+                                                dest_tile_shared + dst_subtile,
+                                                tile_size,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                grad_mix_tile + dst_subtile);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                latent,
+                                                dest_tile_shared + dst_subtile,
+                                                tile_size,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                grad_mix_tile + dst_subtile);
+                                        }
+                                    } else
+#endif
+                                    {
+                                        for (int dst = dst_subtile + tid; dst < dst_subtile + active_dst; dst += blockDim.x) {
+                                            grad_mix_tile[dst] += lowp_dot_rhs_strided(
+                                                latent,
+                                                dest_tile_shared + dst,
+                                                tile_size,
+                                                current_active_rank);
+                                        }
+                                        __syncthreads();
+                                    }
+                                }
+                            } else {
+                                for (int dst = tid; dst < active_states; dst += blockDim.x) {
+                                    grad_mix_tile[dst] += lowp_dot_rhs_strided(
+                                        latent,
+                                        dest_tile_shared + dst,
+                                        tile_size,
+                                        current_active_rank);
+                                }
                             }
                             if (next_active_rank > 0) {
                                 wait_for_async_tile(tile_pipe);
@@ -10082,8 +11030,14 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                     active_states,
                                     tile_size);
                             }
-                            for (int r = tid; r < current_active_rank; r += blockDim.x) {
-                                latent[r] = latent_cache[current_rank_start + r];
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    latent[r] = 0.0f;
+                                }
+                            } else {
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    latent[r] = latent_cache[current_rank_start + r];
+                                }
                             }
                             const packed_t* current_packed_tile = dest_tile_packed_shared
                                 + static_cast<int64_t>(current_stage) * staged_rank_chunk * tile_size;
@@ -10107,17 +11061,73 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                                 }
                             }
                             __syncthreads();
-                            for (int r = tid; r < current_active_rank; r += blockDim.x) {
-                                const int r_idx = current_rank_start + r;
-                                const float grad_latent_value = lowp_dot_contiguous(
-                                    grad_mix_tile,
-                                    dest_tile_shared + static_cast<int64_t>(r) * tile_size,
-                                    active_states);
-                                for (int dst = 0; dst < active_states; ++dst) {
-                                    grad_transition_dest_probs[static_cast<int64_t>(r_idx) * num_states + state_start + dst]
-                                        += latent_cache[r_idx] * grad_mix_tile[dst];
+                            if ((use_tensor_core_math || use_wgmma_math) && current_active_rank == kTensorCoreTile) {
+                                for (int dst_subtile = 0; dst_subtile < active_states; dst_subtile += kTensorCoreTile) {
+                                    const int active_dst = min(kTensorCoreTile, active_states - dst_subtile);
+#if __CUDA_ARCH__ >= 700
+                                    if (active_dst == kTensorCoreTile) {
+                                        for (int idx = tid; idx < kTensorCoreTile * kTensorCoreTile; idx += blockDim.x) {
+                                            const int row = idx / kTensorCoreTile;
+                                            const int col = idx - row * kTensorCoreTile;
+                                            tensor_core_matrix[idx] =
+                                                dest_tile_shared[static_cast<int64_t>(col) * tile_size + dst_subtile + row];
+                                        }
+                                        __syncthreads();
+                                        if (use_wgmma_math) {
+                                            wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                                grad_mix_tile + dst_subtile,
+                                                tensor_core_matrix,
+                                                kTensorCoreTile,
+                                                wgmma_a_shared,
+                                                wgmma_b_shared,
+                                                latent);
+                                        } else {
+                                            wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                                grad_mix_tile + dst_subtile,
+                                                tensor_core_matrix,
+                                                kTensorCoreTile,
+                                                tensor_core_lhs,
+                                                tensor_core_rhs,
+                                                tensor_core_accum,
+                                                latent);
+                                        }
+                                        __syncthreads();
+                                    } else
+#endif
+                                    {
+                                        for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                            latent[r] += lowp_dot_contiguous(
+                                                grad_mix_tile + dst_subtile,
+                                                dest_tile_shared + static_cast<int64_t>(r) * tile_size + dst_subtile,
+                                                active_dst);
+                                        }
+                                        __syncthreads();
+                                    }
+                                    for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                        const int r_idx = current_rank_start + r;
+                                        for (int dst = dst_subtile; dst < dst_subtile + active_dst; ++dst) {
+                                            grad_transition_dest_probs[static_cast<int64_t>(r_idx) * num_states + state_start + dst]
+                                                += latent_cache[r_idx] * grad_mix_tile[dst];
+                                        }
+                                    }
+                                    __syncthreads();
                                 }
-                                grad_latent_accum[r_idx] += grad_latent_value;
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    grad_latent_accum[current_rank_start + r] += latent[r];
+                                }
+                            } else {
+                                for (int r = tid; r < current_active_rank; r += blockDim.x) {
+                                    const int r_idx = current_rank_start + r;
+                                    const float grad_latent_value = lowp_dot_contiguous(
+                                        grad_mix_tile,
+                                        dest_tile_shared + static_cast<int64_t>(r) * tile_size,
+                                        active_states);
+                                    for (int dst = 0; dst < active_states; ++dst) {
+                                        grad_transition_dest_probs[static_cast<int64_t>(r_idx) * num_states + state_start + dst]
+                                            += latent_cache[r_idx] * grad_mix_tile[dst];
+                                    }
+                                    grad_latent_accum[r_idx] += grad_latent_value;
+                                }
                             }
                             if (next_active_rank > 0) {
                                 wait_for_async_tile(tile_pipe);
@@ -10137,18 +11147,79 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_tiled
                         latent[r] = grad_latent_accum[rank_start + r];
                     }
                     __syncthreads();
-                    for (int src = tid; src < num_states; src += blockDim.x) {
-                        const float prev_prob_value = prev_prob[src];
-                        const int64_t source_base = static_cast<int64_t>(src) * transition_rank + rank_start;
-                        const float carry_contrib = packed_row_dot_lowp<packed_t, Format>(
-                            latent,
-                            transition_source_packed + source_base,
-                            transition_source_scales[src],
-                            active_rank);
-                        for (int r = 0; r < active_rank; ++r) {
-                            grad_transition_source_probs[source_base + r] += prev_prob_value * latent[r];
+                    if ((use_tensor_core_math || use_wgmma_math) && active_rank == kTensorCoreTile) {
+                        for (int src_start = 0; src_start < num_states; src_start += kTensorCoreTile) {
+                            const int active_src = min(kTensorCoreTile, num_states - src_start);
+#if __CUDA_ARCH__ >= 700
+                            if (active_src == kTensorCoreTile) {
+                                for (int idx = tid; idx < kTensorCoreTile * kTensorCoreTile; idx += blockDim.x) {
+                                    const int row = idx / kTensorCoreTile;
+                                    const int col = idx - row * kTensorCoreTile;
+                                    tensor_core_matrix[idx] = unpack_packed_value<packed_t, Format>(
+                                        transition_source_packed[static_cast<int64_t>(src_start + col) * transition_rank + rank_start + row],
+                                        transition_source_scales[src_start + col]);
+                                }
+                                for (int src_local = tid; src_local < active_src; src_local += blockDim.x) {
+                                    grad_mix_tile[src_local] = 0.0f;
+                                }
+                                __syncthreads();
+                                if (use_wgmma_math) {
+                                    wgmma_replicated_row_times_matrix_64x16x16<scalar_t>(
+                                        latent,
+                                        tensor_core_matrix,
+                                        kTensorCoreTile,
+                                        wgmma_a_shared,
+                                        wgmma_b_shared,
+                                        grad_mix_tile);
+                                } else {
+                                    wmma_replicated_row_times_matrix_16x16<scalar_t>(
+                                        latent,
+                                        tensor_core_matrix,
+                                        kTensorCoreTile,
+                                        tensor_core_lhs,
+                                        tensor_core_rhs,
+                                        tensor_core_accum,
+                                        grad_mix_tile);
+                                }
+                                __syncthreads();
+                            } else
+#endif
+                            {
+                                for (int src_local = tid; src_local < active_src; src_local += blockDim.x) {
+                                    const int src = src_start + src_local;
+                                    grad_mix_tile[src_local] = packed_row_dot_lowp<packed_t, Format>(
+                                        latent,
+                                        transition_source_packed + static_cast<int64_t>(src) * transition_rank + rank_start,
+                                        transition_source_scales[src],
+                                        active_rank);
+                                }
+                                __syncthreads();
+                            }
+                            for (int src_local = tid; src_local < active_src; src_local += blockDim.x) {
+                                const int src = src_start + src_local;
+                                const float prev_prob_value = prev_prob[src];
+                                const int64_t source_base = static_cast<int64_t>(src) * transition_rank + rank_start;
+                                next_carry[src] += grad_mix_tile[src_local];
+                                for (int r = 0; r < active_rank; ++r) {
+                                    grad_transition_source_probs[source_base + r] += prev_prob_value * latent[r];
+                                }
+                            }
+                            __syncthreads();
                         }
-                        next_carry[src] += carry_contrib;
+                    } else {
+                        for (int src = tid; src < num_states; src += blockDim.x) {
+                            const float prev_prob_value = prev_prob[src];
+                            const int64_t source_base = static_cast<int64_t>(src) * transition_rank + rank_start;
+                            const float carry_contrib = packed_row_dot_lowp<packed_t, Format>(
+                                latent,
+                                transition_source_packed + source_base,
+                                transition_source_scales[src],
+                                active_rank);
+                            for (int r = 0; r < active_rank; ++r) {
+                                grad_transition_source_probs[source_base + r] += prev_prob_value * latent[r];
+                            }
+                            next_carry[src] += carry_contrib;
+                        }
                     }
                     __syncthreads();
                 }
@@ -11257,7 +12328,7 @@ void launch_forward_chunk_dense_128_rank8(
     const torch::Tensor& transition_dest_probs,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     double score_clamp_min,
     double score_clamp_max,
@@ -11300,7 +12371,7 @@ void launch_forward_chunk_dense_128_rank8(
             transition_dest_probs.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             static_cast<float>(score_clamp_min),
             static_cast<float>(score_clamp_max),
@@ -11318,7 +12389,7 @@ void launch_forward_chunk_dense_128_rank8(
             transition_dest_probs.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             static_cast<float>(score_clamp_min),
             static_cast<float>(score_clamp_max),
@@ -11343,7 +12414,7 @@ void launch_forward_chunk(
     const torch::Tensor& transition_dest_probs,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     double score_clamp_min,
     double score_clamp_max,
@@ -11371,7 +12442,7 @@ void launch_forward_chunk(
         transition_dest_probs.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -11396,7 +12467,7 @@ void launch_forward_chunk(
     const torch::Tensor& transition_dest_probs,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -11425,7 +12496,7 @@ void launch_forward_masked_dense_chunk(
     const torch::Tensor& transition_dest_logits,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -11455,7 +12526,7 @@ void launch_forward_masked_dense_chunk(
         transition_dest_logits.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         transition_mask.data_ptr<bool>(),
         seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
@@ -11482,7 +12553,7 @@ void launch_forward_masked_dense_chunk(
     const torch::Tensor& transition_dest_logits,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -11562,7 +12633,7 @@ void launch_backward_masked_dense_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -11601,7 +12672,7 @@ void launch_backward_masked_dense_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         static_cast<float>(score_clamp_min),
@@ -11637,7 +12708,7 @@ void launch_backward_masked_dense_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t chunk_start,
@@ -11685,7 +12756,7 @@ void launch_forward_chunk_quantized(
     const torch::Tensor& transition_dest_scales,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -11713,7 +12784,7 @@ void launch_forward_chunk_quantized(
         transition_dest_scales.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -11738,7 +12809,7 @@ void launch_forward_chunk_fp8(
     const torch::Tensor& transition_dest_scales,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -11769,7 +12840,7 @@ void launch_forward_chunk_fp8(
         transition_dest_scales.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -11932,7 +13003,7 @@ void launch_forward_sparse_chunk(
     const torch::Tensor& block_col_idx,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -11961,7 +13032,7 @@ void launch_forward_sparse_chunk(
         block_col_idx.data_ptr<int32_t>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         num_states,
@@ -11993,7 +13064,7 @@ void launch_forward_sparse_factor_chunk(
     const torch::Tensor& block_mask,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -12038,7 +13109,7 @@ void launch_forward_sparse_factor_chunk(
             block_mask.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -12076,7 +13147,7 @@ void launch_forward_sparse_logits_chunk(
     const torch::Tensor& block_mask,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -12129,7 +13200,7 @@ void launch_forward_sparse_logits_chunk(
             block_mask.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -12217,7 +13288,7 @@ void launch_forward_tiled_chunk(
     const torch::Tensor& transition_dest_probs,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -12312,7 +13383,7 @@ void launch_forward_tiled_chunk(
                 dest_tensor_map_desc.device_ptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -12344,7 +13415,7 @@ void launch_forward_tiled_chunk(
                 nullptr,
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -12377,7 +13448,7 @@ void launch_forward_tiled_chunk(
     const torch::Tensor& transition_dest_probs,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -12458,7 +13529,7 @@ void launch_forward_masked_tiled_chunk(
     const torch::Tensor& row_sums,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -12478,6 +13549,7 @@ void launch_forward_masked_tiled_chunk(
     const int transition_rank = static_cast<int>(transition_source_logits.size(1));
     const int seq_len = static_cast<int>(local_logits.size(1));
     const int total_batches = static_cast<int>(local_logits.size(0));
+    const bool sm90_path = use_sm90_tiled_kernel_family(local_logits.get_device());
     auto launch_config = select_tiled_launch_config_occupancy_driven(
         local_logits,
         total_batches,
@@ -12487,48 +13559,118 @@ void launch_forward_masked_tiled_chunk(
                 static_cast<int>(local_logits.size(2)),
                 block_threads);
         },
-        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t>);
+        sm90_path
+            ? causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false>);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     work_queue_counter.zero_();
-    finalize_persistent_launch_config(
-        "causal_machine_scan masked tiled forward",
-        launch_config,
-        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t>);
+    if (sm90_path) {
+        finalize_persistent_launch_config(
+            "causal_machine_scan masked tiled forward sm90",
+            launch_config,
+            causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true>);
+    } else {
+        finalize_persistent_launch_config(
+            "causal_machine_scan masked tiled forward",
+            launch_config,
+            causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false>);
+    }
     const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
         stream,
         launch_config.device_index,
         {&transition_source_logits, &transition_dest_logits});
-    causal_machine_forward_masked_tiled_chunk_kernel<scalar_t><<<
-        launch_config.grid,
-        launch_config.block,
-        launch_config.shared_bytes,
-        stream>>>(
-            local_logits.data_ptr<scalar_t>(),
+    DeviceTensorMapDescriptor source_tensor_map_desc;
+    DeviceTensorMapDescriptor dest_tensor_map_desc;
+    if (sm90_path && can_use_tma(local_logits.get_device())) {
+        const int staged_rank_chunk = max(1, min(transition_rank, kTensorCoreTile));
+        source_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_source_logits,
             transition_source_logits.data_ptr<float>(),
+            transition_rank,
+            num_states,
+            static_cast<int64_t>(transition_rank) * sizeof(float),
+            staged_rank_chunk,
+            num_states,
+            stream);
+        dest_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_dest_logits,
             transition_dest_logits.data_ptr<float>(),
-            transition_context.data_ptr<scalar_t>(),
-            initial_log_belief.data_ptr<float>(),
-            static_cast<float>(transition_gate),
-            transition_stay_probs.data_ptr<float>(),
-            transition_mask.data_ptr<bool>(),
-            row_sums.data_ptr<float>(),
-            seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
-            static_cast<float>(score_clamp_min),
-            static_cast<float>(score_clamp_max),
-            static_cast<float>(score_threshold),
-            static_cast<int>(score_topk),
             num_states,
             transition_rank,
+            static_cast<int64_t>(num_states) * sizeof(float),
             static_cast<int>(tile_size),
-            seq_len,
-            static_cast<int>(chunk_start),
-            static_cast<int>(chunk_len),
-            total_batches,
-            work_queue_counter.data_ptr<int32_t>(),
-            masked_transition_tile_cache.data_ptr<float>(),
-            filtered_value_cache.data_ptr<float>(),
-            beliefs.data_ptr<scalar_t>(),
-            final_log_belief.data_ptr<scalar_t>());
+            staged_rank_chunk,
+            stream);
+    }
+    if (sm90_path) {
+        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true><<<
+            launch_config.grid,
+            launch_config.block,
+            launch_config.shared_bytes,
+            stream>>>(
+                local_logits.data_ptr<scalar_t>(),
+                transition_source_logits.data_ptr<float>(),
+                transition_dest_logits.data_ptr<float>(),
+                source_tensor_map_desc.device_ptr,
+                dest_tensor_map_desc.device_ptr,
+                transition_context.data_ptr<scalar_t>(),
+                initial_log_belief.data_ptr<float>(),
+                transition_gate.data_ptr<float>(),
+                transition_stay_probs.data_ptr<float>(),
+                transition_mask.data_ptr<bool>(),
+                row_sums.data_ptr<float>(),
+                seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
+                static_cast<float>(score_clamp_min),
+                static_cast<float>(score_clamp_max),
+                static_cast<float>(score_threshold),
+                static_cast<int>(score_topk),
+                num_states,
+                transition_rank,
+                static_cast<int>(tile_size),
+                seq_len,
+                static_cast<int>(chunk_start),
+                static_cast<int>(chunk_len),
+                total_batches,
+                work_queue_counter.data_ptr<int32_t>(),
+                masked_transition_tile_cache.data_ptr<float>(),
+                filtered_value_cache.data_ptr<float>(),
+                beliefs.data_ptr<scalar_t>(),
+                final_log_belief.data_ptr<scalar_t>());
+    } else {
+        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false><<<
+            launch_config.grid,
+            launch_config.block,
+            launch_config.shared_bytes,
+            stream>>>(
+                local_logits.data_ptr<scalar_t>(),
+                transition_source_logits.data_ptr<float>(),
+                transition_dest_logits.data_ptr<float>(),
+                nullptr,
+                nullptr,
+                transition_context.data_ptr<scalar_t>(),
+                initial_log_belief.data_ptr<float>(),
+                transition_gate.data_ptr<float>(),
+                transition_stay_probs.data_ptr<float>(),
+                transition_mask.data_ptr<bool>(),
+                row_sums.data_ptr<float>(),
+                seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
+                static_cast<float>(score_clamp_min),
+                static_cast<float>(score_clamp_max),
+                static_cast<float>(score_threshold),
+                static_cast<int>(score_topk),
+                num_states,
+                transition_rank,
+                static_cast<int>(tile_size),
+                seq_len,
+                static_cast<int>(chunk_start),
+                static_cast<int>(chunk_len),
+                total_batches,
+                work_queue_counter.data_ptr<int32_t>(),
+                masked_transition_tile_cache.data_ptr<float>(),
+                filtered_value_cache.data_ptr<float>(),
+                beliefs.data_ptr<scalar_t>(),
+                final_log_belief.data_ptr<scalar_t>());
+    }
     if (persisting_l2_window) {
         clear_persisting_l2_window(stream);
     }
@@ -12543,7 +13685,7 @@ void launch_forward_masked_tiled_chunk(
     const torch::Tensor& row_sums,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -12565,11 +13707,15 @@ void launch_forward_masked_tiled_chunk(
                 static_cast<int>(local_logits.size(2)),
                 block_threads);
         },
-        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t>);
+        use_sm90_tiled_kernel_family(local_logits.get_device())
+            ? causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false>);
     finalize_persistent_launch_config(
         "causal_machine_scan masked tiled forward",
         launch_config,
-        causal_machine_forward_masked_tiled_chunk_kernel<scalar_t>);
+        use_sm90_tiled_kernel_family(local_logits.get_device())
+            ? causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false>);
     auto work_queue_counter = make_device_work_queue_counter(local_logits);
     auto masked_transition_tile_cache = torch::empty(
         {launch_config.grid.x, local_logits.size(2), tile_size},
@@ -12610,7 +13756,7 @@ void launch_forward_masked_tiled_chunk(
     const torch::Tensor& row_sums,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -12650,7 +13796,7 @@ void launch_forward_tiled_chunk_packed(
     const torch::Tensor& transition_dest_scales,
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -12707,11 +13853,21 @@ void launch_forward_tiled_chunk_packed(
         stream,
         launch_config.device_index,
         {&transition_source_packed, &transition_dest_packed, &transition_source_scales, &transition_dest_scales});
+    DeviceTensorMapDescriptor source_tensor_map_desc;
     DeviceTensorMapDescriptor dest_tensor_map_desc;
     if (sm90_path && can_use_tma(local_logits.get_device())) {
         const int staged_rank_chunk = max(
             1,
             min(static_cast<int>(split_size), kSm90AsyncTileRankChunk));
+        source_tensor_map_desc = encode_tma_descriptor_2d_packed<packed_t>(
+            transition_source_packed,
+            transition_source_packed.data_ptr<packed_t>(),
+            transition_rank,
+            num_states,
+            static_cast<int64_t>(transition_rank) * sizeof(packed_t),
+            staged_rank_chunk,
+            num_states,
+            stream);
         dest_tensor_map_desc = encode_tma_descriptor_2d_packed<packed_t>(
             transition_dest_packed,
             transition_dest_packed.data_ptr<packed_t>(),
@@ -12732,11 +13888,12 @@ void launch_forward_tiled_chunk_packed(
                 transition_source_packed.data_ptr<packed_t>(),
                 transition_source_scales.data_ptr<float>(),
                 transition_dest_packed.data_ptr<packed_t>(),
+                source_tensor_map_desc.device_ptr,
                 dest_tensor_map_desc.device_ptr,
                 transition_dest_scales.data_ptr<float>(),
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -12766,10 +13923,11 @@ void launch_forward_tiled_chunk_packed(
                 transition_source_scales.data_ptr<float>(),
                 transition_dest_packed.data_ptr<packed_t>(),
                 nullptr,
+                nullptr,
                 transition_dest_scales.data_ptr<float>(),
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -12804,7 +13962,7 @@ void launch_backward_tiled_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -12913,7 +14071,7 @@ void launch_backward_tiled_chunk(
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -12957,7 +14115,7 @@ void launch_backward_tiled_chunk(
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -13004,7 +14162,7 @@ void launch_backward_tiled_chunk_packed(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     double score_clamp_min,
@@ -13088,7 +14246,7 @@ void launch_backward_tiled_chunk_packed(
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -13132,7 +14290,7 @@ void launch_backward_tiled_chunk_packed(
                 transition_context.data_ptr<scalar_t>(),
                 initial_log_belief.data_ptr<float>(),
                 beliefs.data_ptr<scalar_t>(),
-                static_cast<float>(transition_gate),
+                transition_gate.data_ptr<float>(),
                 transition_stay_probs.data_ptr<float>(),
                 seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
                 static_cast<float>(score_clamp_min),
@@ -13178,7 +14336,7 @@ void launch_backward_masked_tiled_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -13201,6 +14359,7 @@ void launch_backward_masked_tiled_chunk(
     const int seq_len = static_cast<int>(beliefs.size(1));
     const int total_batches = static_cast<int>(beliefs.size(0));
     const int transition_rank = static_cast<int>(transition_source_logits.size(1));
+    const bool sm90_path = use_sm90_tiled_kernel_family(beliefs.get_device());
     auto launch_config = select_tiled_launch_config_occupancy_driven(
         beliefs,
         total_batches,
@@ -13211,54 +14370,130 @@ void launch_backward_masked_tiled_chunk(
                 static_cast<int>(tile_size),
                 block_threads);
         },
-        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t>);
+        sm90_path
+            ? causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false>);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     work_queue_counter.zero_();
-    finalize_persistent_launch_config(
-        "causal_machine_scan masked tiled backward",
-        launch_config,
-        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t>);
+    if (sm90_path) {
+        finalize_persistent_launch_config(
+            "causal_machine_scan masked tiled backward sm90",
+            launch_config,
+            causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true>);
+    } else {
+        finalize_persistent_launch_config(
+            "causal_machine_scan masked tiled backward",
+            launch_config,
+            causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false>);
+    }
     const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
         stream,
         launch_config.device_index,
         {&transition_source_logits, &transition_dest_logits});
-    causal_machine_backward_masked_tiled_chunk_kernel<scalar_t><<<
-        launch_config.grid,
-        launch_config.block,
-        launch_config.shared_bytes,
-        stream>>>(
-            grad_beliefs.data_ptr<scalar_t>(),
-            grad_final_belief.data_ptr<scalar_t>(),
+    DeviceTensorMapDescriptor source_tensor_map_desc;
+    DeviceTensorMapDescriptor dest_tensor_map_desc;
+    if (sm90_path && can_use_tma(beliefs.get_device())) {
+        const int rank_chunk = max(1, min(static_cast<int>(tile_size), kMaskedBackwardRankChunk));
+        source_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_source_logits,
             transition_source_logits.data_ptr<float>(),
+            transition_rank,
+            static_cast<int>(beliefs.size(2)),
+            static_cast<int64_t>(transition_rank) * sizeof(float),
+            rank_chunk,
+            static_cast<int>(beliefs.size(2)),
+            stream);
+        dest_tensor_map_desc = encode_tma_descriptor_2d_float(
+            transition_dest_logits,
             transition_dest_logits.data_ptr<float>(),
-            transition_context.data_ptr<scalar_t>(),
-            initial_log_belief.data_ptr<float>(),
-            beliefs.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
-            transition_stay_probs.data_ptr<float>(),
-            transition_mask.data_ptr<bool>(),
-            row_sums.data_ptr<float>(),
-            seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
-            static_cast<float>(score_clamp_min),
-            static_cast<float>(score_clamp_max),
-            static_cast<float>(score_threshold),
-            static_cast<int>(score_topk),
             static_cast<int>(beliefs.size(2)),
             transition_rank,
+            static_cast<int64_t>(beliefs.size(2)) * sizeof(float),
             static_cast<int>(tile_size),
-            seq_len,
-            static_cast<int>(chunk_start),
-            static_cast<int>(chunk_len),
-            total_batches,
-            work_queue_counter.data_ptr<int32_t>(),
-            masked_transition_tile_cache.data_ptr<float>(),
-            grad_local_logits.data_ptr<scalar_t>(),
-            grad_transition_source_per_batch.data_ptr<float>(),
-            grad_transition_dest_per_batch.data_ptr<float>(),
-            grad_transition_context.data_ptr<scalar_t>(),
-            grad_initial_log_belief.data_ptr<float>(),
-            grad_transition_gate_per_batch.data_ptr<float>(),
-            grad_transition_stay_per_batch.data_ptr<float>());
+            rank_chunk,
+            stream);
+    }
+    if (sm90_path) {
+        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true><<<
+            launch_config.grid,
+            launch_config.block,
+            launch_config.shared_bytes,
+            stream>>>(
+                grad_beliefs.data_ptr<scalar_t>(),
+                grad_final_belief.data_ptr<scalar_t>(),
+                transition_source_logits.data_ptr<float>(),
+                transition_dest_logits.data_ptr<float>(),
+                source_tensor_map_desc.device_ptr,
+                dest_tensor_map_desc.device_ptr,
+                transition_context.data_ptr<scalar_t>(),
+                initial_log_belief.data_ptr<float>(),
+                beliefs.data_ptr<scalar_t>(),
+                transition_gate.data_ptr<float>(),
+                transition_stay_probs.data_ptr<float>(),
+                transition_mask.data_ptr<bool>(),
+                row_sums.data_ptr<float>(),
+                seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
+                static_cast<float>(score_clamp_min),
+                static_cast<float>(score_clamp_max),
+                static_cast<float>(score_threshold),
+                static_cast<int>(score_topk),
+                static_cast<int>(beliefs.size(2)),
+                transition_rank,
+                static_cast<int>(tile_size),
+                seq_len,
+                static_cast<int>(chunk_start),
+                static_cast<int>(chunk_len),
+                total_batches,
+                work_queue_counter.data_ptr<int32_t>(),
+                masked_transition_tile_cache.data_ptr<float>(),
+                grad_local_logits.data_ptr<scalar_t>(),
+                grad_transition_source_per_batch.data_ptr<float>(),
+                grad_transition_dest_per_batch.data_ptr<float>(),
+                grad_transition_context.data_ptr<scalar_t>(),
+                grad_initial_log_belief.data_ptr<float>(),
+                grad_transition_gate_per_batch.data_ptr<float>(),
+                grad_transition_stay_per_batch.data_ptr<float>());
+    } else {
+        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false><<<
+            launch_config.grid,
+            launch_config.block,
+            launch_config.shared_bytes,
+            stream>>>(
+                grad_beliefs.data_ptr<scalar_t>(),
+                grad_final_belief.data_ptr<scalar_t>(),
+                transition_source_logits.data_ptr<float>(),
+                transition_dest_logits.data_ptr<float>(),
+                nullptr,
+                nullptr,
+                transition_context.data_ptr<scalar_t>(),
+                initial_log_belief.data_ptr<float>(),
+                beliefs.data_ptr<scalar_t>(),
+                transition_gate.data_ptr<float>(),
+                transition_stay_probs.data_ptr<float>(),
+                transition_mask.data_ptr<bool>(),
+                row_sums.data_ptr<float>(),
+                seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
+                static_cast<float>(score_clamp_min),
+                static_cast<float>(score_clamp_max),
+                static_cast<float>(score_threshold),
+                static_cast<int>(score_topk),
+                static_cast<int>(beliefs.size(2)),
+                transition_rank,
+                static_cast<int>(tile_size),
+                seq_len,
+                static_cast<int>(chunk_start),
+                static_cast<int>(chunk_len),
+                total_batches,
+                work_queue_counter.data_ptr<int32_t>(),
+                masked_transition_tile_cache.data_ptr<float>(),
+                grad_local_logits.data_ptr<scalar_t>(),
+                grad_transition_source_per_batch.data_ptr<float>(),
+                grad_transition_dest_per_batch.data_ptr<float>(),
+                grad_transition_context.data_ptr<scalar_t>(),
+                grad_initial_log_belief.data_ptr<float>(),
+                grad_transition_gate_per_batch.data_ptr<float>(),
+                grad_transition_stay_per_batch.data_ptr<float>());
+    }
     if (persisting_l2_window) {
         clear_persisting_l2_window(stream);
     }
@@ -13275,7 +14510,7 @@ void launch_backward_masked_tiled_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -13303,11 +14538,15 @@ void launch_backward_masked_tiled_chunk(
                 static_cast<int>(tile_size),
                 block_threads);
         },
-        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t>);
+        use_sm90_tiled_kernel_family(beliefs.get_device())
+            ? causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false>);
     finalize_persistent_launch_config(
         "causal_machine_scan masked tiled backward",
         launch_config,
-        causal_machine_backward_masked_tiled_chunk_kernel<scalar_t>);
+        use_sm90_tiled_kernel_family(beliefs.get_device())
+            ? causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true>
+            : causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false>);
     auto work_queue_counter = make_device_work_queue_counter(beliefs);
     auto masked_transition_tile_cache = torch::empty(
         {launch_config.grid.x, beliefs.size(2), tile_size},
@@ -13353,7 +14592,7 @@ void launch_backward_masked_tiled_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& transition_mask,
     const torch::Tensor& seq_lens,
@@ -13411,7 +14650,7 @@ void launch_backward_sparse_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -13456,7 +14695,7 @@ void launch_backward_sparse_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         num_states,
@@ -13497,7 +14736,7 @@ void launch_backward_sparse_factor_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -13556,7 +14795,7 @@ void launch_backward_sparse_factor_chunk(
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
             beliefs.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -13604,7 +14843,7 @@ void launch_backward_sparse_logits_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     const torch::Tensor& seq_lens,
     int64_t block_size,
@@ -13663,7 +14902,7 @@ void launch_backward_sparse_logits_chunk(
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
             beliefs.data_ptr<scalar_t>(),
-            static_cast<float>(transition_gate),
+            transition_gate_scalar_value(transition_gate),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -13698,7 +14937,7 @@ void launch_backward_chunk_dense_128_rank8(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     double score_clamp_min,
     double score_clamp_max,
@@ -13738,7 +14977,7 @@ void launch_backward_chunk_dense_128_rank8(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -13769,7 +15008,7 @@ void launch_backward_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     double score_clamp_min,
     double score_clamp_max,
@@ -13804,7 +15043,7 @@ void launch_backward_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -13836,7 +15075,7 @@ void launch_backward_chunk(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -13940,7 +15179,7 @@ void launch_backward_chunk_quantized(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -13975,7 +15214,7 @@ void launch_backward_chunk_quantized(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -14007,7 +15246,7 @@ void launch_backward_chunk_fp8(
     const torch::Tensor& transition_context,
     const torch::Tensor& initial_log_belief,
     const torch::Tensor& beliefs,
-    double transition_gate,
+    const torch::Tensor& transition_gate,
     const torch::Tensor& transition_stay_probs,
     int64_t chunk_start,
     int64_t chunk_len,
@@ -14045,7 +15284,7 @@ void launch_backward_chunk_fp8(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        static_cast<float>(transition_gate),
+        transition_gate_scalar_value(transition_gate),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -14382,14 +15621,21 @@ std::vector<int64_t> causal_machine_scan_describe_masked_tiled_forward_runtime_c
     const int device = static_cast<int>(device_index);
     c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device));
     const int block_threads = masked_tiled_block_threads(tile_size);
+    const bool sm90_path = use_sm90_tiled_kernel_family(device);
     const int64_t shared_bytes = causal_machine_scan_forward_masked_tiled_chunk_shared_bytes_cuda(
         num_states,
         tile_size);
-    const auto diag = describe_kernel_launch(
-        causal_machine_forward_masked_tiled_chunk_kernel<float>,
-        device,
-        block_threads,
-        static_cast<size_t>(shared_bytes));
+    const auto diag = sm90_path
+        ? describe_kernel_launch(
+            causal_machine_forward_masked_tiled_chunk_kernel<float, true>,
+            device,
+            block_threads,
+            static_cast<size_t>(shared_bytes))
+        : describe_kernel_launch(
+            causal_machine_forward_masked_tiled_chunk_kernel<float, false>,
+            device,
+            block_threads,
+            static_cast<size_t>(shared_bytes));
     const int64_t worker_blocks = persistent_worker_blocks(device, static_cast<int>(total_batches));
     const int64_t preferred_load_bytes = preferred_float_load_bytes(tile_size);
     const int64_t elements_per_load = elements_per_float_load(tile_size);
@@ -14528,14 +15774,21 @@ std::vector<int64_t> causal_machine_scan_describe_masked_tiled_backward_runtime_
     const int64_t free_mem_bytes = std::max<int64_t>(current_free_global_mem(), 1);
     const int64_t worker_blocks = persistent_worker_blocks(device, static_cast<int>(total_batches));
     const int block_threads = masked_tiled_block_threads(tile_size);
+    const bool sm90_path = use_sm90_tiled_kernel_family(device);
     const int64_t shared_bytes = causal_machine_scan_backward_masked_tiled_chunk_shared_bytes_cuda(
         num_states,
         tile_size);
-    const auto diag = describe_kernel_launch(
-        causal_machine_backward_masked_tiled_chunk_kernel<float>,
-        device,
-        block_threads,
-        static_cast<size_t>(shared_bytes));
+    const auto diag = sm90_path
+        ? describe_kernel_launch(
+            causal_machine_backward_masked_tiled_chunk_kernel<float, true>,
+            device,
+            block_threads,
+            static_cast<size_t>(shared_bytes))
+        : describe_kernel_launch(
+            causal_machine_backward_masked_tiled_chunk_kernel<float, false>,
+            device,
+            block_threads,
+            static_cast<size_t>(shared_bytes));
     const int64_t preferred_load_bytes = preferred_float_load_bytes(tile_size);
     const int64_t elements_per_load = elements_per_float_load(tile_size);
     const int64_t candidate_bytes = estimate_persisting_l2_candidate_bytes_for_tiled_path(
@@ -14582,7 +15835,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_works
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14603,7 +15856,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_wo
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14624,7 +15877,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspac
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -14644,7 +15897,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -14665,7 +15918,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14682,7 +15935,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -14708,7 +15961,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14725,7 +15978,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -14742,7 +15995,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_works
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14804,7 +16057,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_cu
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14872,7 +16125,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_wo
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -14934,7 +16187,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -14993,7 +16246,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_workspac
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -15044,7 +16297,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -15113,7 +16366,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_logits_kernel_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15169,7 +16422,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_tiled_logits_kerne
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -15238,7 +16491,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_aten_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15282,7 +16535,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_aten_cuda(
     auto stay_probs = transition_stay_probs.to(float_options).view({1, num_states});
     auto one_minus_stay = 1.0f - stay_probs;
     auto carry = grad_final_belief_f32.clone();
-    const float gate_value = static_cast<float>(transition_gate);
+    const float gate_value = transition_gate_scalar_value(transition_gate);
     const int64_t rank_tile = std::max<int64_t>(1, split_size);
     const int64_t effective_chunk_size = std::max<int64_t>(1, chunk_size);
     const int64_t state_tile_size = std::max<int64_t>(1, tile_size);
@@ -15400,7 +16653,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_works
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15428,7 +16681,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_w
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15456,7 +16709,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspa
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -15483,7 +16736,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15642,7 +16895,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_c
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15710,7 +16963,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_w
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -15801,7 +17054,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -15884,7 +17137,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_workspa
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     torch::Tensor seq_lens,
@@ -15988,7 +17241,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_works
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -16144,7 +17397,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t chunk_size,
@@ -16303,7 +17556,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
@@ -16317,6 +17570,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -16449,7 +17703,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
@@ -16464,6 +17718,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     }
     auto beliefs = torch::empty_like(local_logits);
     auto final_log_belief = torch::empty_like(initial_log_belief);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto transition_rank = transition_source_logits.size(1);
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -16502,7 +17757,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_cuda(
     torch::Tensor transition_dest_logits,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -16524,6 +17779,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_cuda(
         return {beliefs, final_log_belief};
     }
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -16558,7 +17814,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace_
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -16579,7 +17835,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -16632,6 +17888,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_cuda(
     }
 
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -16698,7 +17955,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace_
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor transition_mask,
     torch::Tensor seq_lens,
@@ -16753,6 +18010,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace_
     }
 
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -16856,7 +18114,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_cuda(
     torch::Tensor block_col_idx,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -16869,6 +18127,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -17003,7 +18262,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_factors_cuda(
     torch::Tensor block_mask,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -17018,6 +18277,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_factors_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     auto padded_source_probs = transition_source_probs.contiguous();
     auto padded_dest_probs = transition_dest_probs.contiguous();
     if (padded_states != transition_source_probs.size(0)) {
@@ -17076,7 +18336,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_cuda(
     torch::Tensor block_mask,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -17092,6 +18352,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(local_logits.size(1), chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -17146,7 +18407,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -17399,7 +18660,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_factors_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -17509,7 +18770,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_sparse_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     torch::Tensor seq_lens,
     int64_t block_size,
@@ -17985,7 +19246,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_composable_logits_cuda(
     return {beliefs, final_log_belief};
 }
 
-std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
+std::vector<torch::Tensor> causal_machine_scan_backward_workspace_cuda(
     torch::Tensor grad_beliefs,
     torch::Tensor grad_final_belief,
     torch::Tensor transition_source_probs,
@@ -17993,11 +19254,15 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
-    double score_clamp_max) {
+    double score_clamp_max,
+    torch::Tensor grad_transition_source_per_batch,
+    torch::Tensor grad_transition_dest_per_batch,
+    torch::Tensor grad_transition_stay_per_batch,
+    torch::Tensor grad_transition_gate_per_batch) {
     c10::cuda::CUDAGuard device_guard(beliefs.device());
     const auto batch_size = beliefs.size(0);
     const auto seq_len = beliefs.size(1);
@@ -18018,18 +19283,10 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     auto grad_transition_dest_probs = torch::zeros({transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_stay_probs = torch::zeros({num_states}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_gate = torch::zeros({1}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_source_per_batch = direct_small_rank_grad
-        ? torch::zeros({direct_staging_worker_blocks, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32))
-        : torch::zeros({batch_size, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_dest_per_batch = direct_small_rank_grad
-        ? torch::zeros({direct_staging_worker_blocks, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32))
-        : torch::zeros({batch_size, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_stay_per_batch = direct_small_rank_grad
-        ? torch::zeros({direct_staging_worker_blocks, num_states}, beliefs.options().dtype(torch::kFloat32))
-        : torch::zeros({batch_size, num_states}, beliefs.options().dtype(torch::kFloat32));
-    auto grad_transition_gate_per_batch = direct_small_rank_grad
-        ? torch::zeros({direct_staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32))
-        : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
+    grad_transition_source_per_batch.zero_();
+    grad_transition_dest_per_batch.zero_();
+    grad_transition_stay_per_batch.zero_();
+    grad_transition_gate_per_batch.zero_();
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
     auto carry = grad_final_belief.contiguous();
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
@@ -18344,7 +19601,63 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     };
 }
 
-std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
+std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_probs,
+    torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size,
+    double score_clamp_min,
+    double score_clamp_max) {
+    c10::cuda::CUDAGuard device_guard(beliefs.device());
+    const auto batch_size = beliefs.size(0);
+    const auto num_states = beliefs.size(2);
+    const auto transition_rank = transition_source_probs.size(1);
+    const bool direct_small_rank_grad = can_use_direct_grad_reduce(
+        beliefs.get_device(),
+        static_cast<int>(num_states),
+        static_cast<int>(transition_rank));
+    const int64_t direct_staging_worker_blocks = direct_small_rank_grad
+        ? small_state_direct_staging_worker_blocks(beliefs.get_device(), batch_size)
+        : 0;
+    auto grad_transition_source_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_dest_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_stay_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, num_states}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, num_states}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_gate_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
+    return causal_machine_scan_backward_workspace_cuda(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate,
+        transition_stay_probs,
+        chunk_size,
+        score_clamp_min,
+        score_clamp_max,
+        grad_transition_source_per_batch,
+        grad_transition_dest_per_batch,
+        grad_transition_stay_per_batch,
+        grad_transition_gate_per_batch);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_logits_workspace_cuda(
     torch::Tensor grad_beliefs,
     torch::Tensor grad_final_belief,
     torch::Tensor transition_source_logits,
@@ -18352,11 +19665,15 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size,
     double score_clamp_min,
-    double score_clamp_max) {
+    double score_clamp_max,
+    torch::Tensor grad_transition_source_per_batch,
+    torch::Tensor grad_transition_dest_per_batch,
+    torch::Tensor grad_transition_stay_per_batch,
+    torch::Tensor grad_transition_gate_per_batch) {
     c10::cuda::CUDAGuard device_guard(beliefs.device());
     auto transition_source_probs = torch::empty_like(transition_source_logits);
     auto transition_dest_probs = torch::empty_like(transition_dest_logits);
@@ -18373,7 +19690,8 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
         static_cast<int>(transition_dest_logits.size(1)),
         transition_dest_probs.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto grads = causal_machine_scan_backward_cuda(
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
+    auto grads = causal_machine_scan_backward_workspace_cuda(
         grad_beliefs,
         grad_final_belief,
         transition_source_probs,
@@ -18385,7 +19703,11 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
         transition_stay_probs,
         chunk_size,
         score_clamp_min,
-        score_clamp_max);
+        score_clamp_max,
+        grad_transition_source_per_batch,
+        grad_transition_dest_per_batch,
+        grad_transition_stay_per_batch,
+        grad_transition_gate_per_batch);
     auto grad_transition_source_logits = torch::empty_like(transition_source_logits);
     auto grad_transition_dest_logits = torch::empty_like(transition_dest_logits);
     row_softmax_backward_kernel<<<source_grid, block, 0, stream>>>(
@@ -18402,6 +19724,61 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
     grads[1] = grad_transition_source_logits;
     grads[2] = grad_transition_dest_logits;
     return grads;
+}
+
+std::vector<torch::Tensor> causal_machine_scan_backward_logits_cuda(
+    torch::Tensor grad_beliefs,
+    torch::Tensor grad_final_belief,
+    torch::Tensor transition_source_logits,
+    torch::Tensor transition_dest_logits,
+    torch::Tensor transition_context,
+    torch::Tensor initial_log_belief,
+    torch::Tensor beliefs,
+    torch::Tensor transition_gate,
+    torch::Tensor transition_stay_probs,
+    int64_t chunk_size,
+    double score_clamp_min,
+    double score_clamp_max) {
+    c10::cuda::CUDAGuard device_guard(beliefs.device());
+    const auto batch_size = beliefs.size(0);
+    const auto num_states = beliefs.size(2);
+    const auto transition_rank = transition_source_logits.size(1);
+    const bool direct_small_rank_grad = can_use_direct_grad_reduce(
+        beliefs.get_device(),
+        static_cast<int>(num_states),
+        static_cast<int>(transition_rank));
+    const int64_t direct_staging_worker_blocks = direct_small_rank_grad
+        ? small_state_direct_staging_worker_blocks(beliefs.get_device(), batch_size)
+        : 0;
+    auto grad_transition_source_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, num_states, transition_rank}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_dest_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, transition_rank, num_states}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_stay_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks, num_states}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size, num_states}, beliefs.options().dtype(torch::kFloat32));
+    auto grad_transition_gate_per_batch = direct_small_rank_grad
+        ? torch::zeros({direct_staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32))
+        : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
+    return causal_machine_scan_backward_logits_workspace_cuda(
+        grad_beliefs,
+        grad_final_belief,
+        transition_source_logits,
+        transition_dest_logits,
+        transition_context,
+        initial_log_belief,
+        beliefs,
+        transition_gate,
+        transition_stay_probs,
+        chunk_size,
+        score_clamp_min,
+        score_clamp_max,
+        grad_transition_source_per_batch,
+        grad_transition_dest_per_batch,
+        grad_transition_stay_per_batch,
+        grad_transition_gate_per_batch);
 }
 
 std::vector<torch::Tensor> causal_machine_scan_backward_composable_cuda(
@@ -18607,7 +19984,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(local_logits.device());
@@ -18619,6 +19996,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     {
         AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -18679,7 +20057,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8_cuda_impl(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(local_logits.device());
@@ -18691,6 +20069,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8_cuda_impl(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     {
         AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -18750,7 +20129,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size) {
@@ -18791,7 +20170,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(beliefs.device());
@@ -18827,6 +20206,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
     auto carry = grad_final_belief.contiguous();
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     if (seq_len == 0) {
         grad_initial_log_belief.copy_(grad_final_belief);
     } else {
@@ -18951,7 +20331,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t chunk_size) {
     c10::cuda::CUDAGuard device_guard(beliefs.device());
@@ -18986,6 +20366,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
     auto carry = grad_final_belief.contiguous();
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
+    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     if (seq_len == 0) {
         grad_initial_log_belief.copy_(grad_final_belief);
     } else {
@@ -19109,7 +20490,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda(
     torch::Tensor transition_context,
     torch::Tensor initial_log_belief,
     torch::Tensor beliefs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     torch::Tensor transition_stay_probs,
     int64_t fp8_format,
     int64_t chunk_size) {
@@ -19330,7 +20711,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
     torch::Tensor transition_dest_probs,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     double score_clamp_min,
     double score_clamp_max) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(local_logits));
@@ -19372,7 +20753,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
                         transition_dest_probs.data_ptr<float>(),
                         transition_context.data_ptr<scalar_t>(),
                         transition_stay_probs.data_ptr<float>(),
-                        static_cast<float>(transition_gate),
+                        transition_gate_scalar_value(transition_gate),
                         static_cast<float>(score_clamp_min),
                         static_cast<float>(score_clamp_max),
                         batch_size,
@@ -19397,7 +20778,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
                         transition_dest_probs.data_ptr<float>(),
                         transition_context.data_ptr<scalar_t>(),
                         transition_stay_probs.data_ptr<float>(),
-                        static_cast<float>(transition_gate),
+                        transition_gate_scalar_value(transition_gate),
                         static_cast<float>(score_clamp_min),
                         static_cast<float>(score_clamp_max),
                         batch_size,
@@ -19426,7 +20807,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate) {
+    torch::Tensor transition_gate) {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(local_logits));
     const int64_t batch_size = static_cast<int64_t>(local_logits.size(0));
     const int64_t num_states = static_cast<int64_t>(local_logits.size(2));
@@ -19476,7 +20857,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19504,7 +20885,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19532,7 +20913,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19560,7 +20941,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19588,7 +20969,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19616,7 +20997,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            static_cast<float>(transition_gate),
+                            transition_gate_scalar_value(transition_gate),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -19645,7 +21026,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_quantized_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate) {
+    torch::Tensor transition_gate) {
     return causal_machine_scan_paged_step_packed_cuda_impl<int8_t, PackedTransitionFormat::Int8>(
         paged_log_beliefs,
         paged_latent_states,
@@ -19673,7 +21054,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_fp8_cuda(
     torch::Tensor transition_dest_scales,
     torch::Tensor transition_context,
     torch::Tensor transition_stay_probs,
-    double transition_gate,
+    torch::Tensor transition_gate,
     int64_t fp8_format) {
     TORCH_CHECK(fp8_format == 0 || fp8_format == 1, "fp8_format must be 0 (e4m3) or 1 (e5m2)");
     if (fp8_format == 0) {

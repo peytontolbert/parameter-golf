@@ -616,7 +616,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
         transition_dest_logits_f32 = transition_dest_logits.contiguous().float()
         transition_source_probs_f32 = F.softmax(transition_source_logits_f32, dim=-1).contiguous()
         transition_dest_probs_f32 = F.softmax(transition_dest_logits_f32, dim=-1).contiguous()
-        gate_value = float(transition_gate.detach().float().item())
+        transition_gate_f32 = transition_gate.detach().float().reshape(())
         ctx.composable = bool(composable)
         ctx.use_packed = bool(use_packed)
         ctx.packed_kind = int(packed_kind)
@@ -634,7 +634,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                     packed_dest_scales,
                     transition_context_in,
                     initial_log_belief_in,
-                    gate_value,
+                    transition_gate_f32,
                     transition_stay_probs_f32,
                     int(chunk_size),
                 )
@@ -647,7 +647,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                     packed_dest_scales,
                     transition_context_in,
                     initial_log_belief_in,
-                    gate_value,
+                    transition_gate_f32,
                     transition_stay_probs_f32,
                     0,
                     int(chunk_size),
@@ -661,7 +661,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                     packed_dest_scales,
                     transition_context_in,
                     initial_log_belief_in,
-                    gate_value,
+                    transition_gate_f32,
                     transition_stay_probs_f32,
                     1,
                     int(chunk_size),
@@ -686,7 +686,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 beliefs.contiguous(),
                 packed_source_probs_f32,
                 packed_dest_probs_f32,
-                transition_gate.float(),
+                transition_gate_f32,
                 transition_stay_probs_f32,
             )
         elif ctx.composable:
@@ -715,7 +715,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_dest_logits_f32,
                 transition_context_in,
                 initial_log_belief_in,
-                gate_value,
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 int(chunk_size),
                 float(score_clamp_min),
@@ -727,7 +727,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 beliefs.contiguous(),
                 transition_source_logits_f32,
                 transition_dest_logits_f32,
-                transition_gate.float(),
+                transition_gate_f32,
                 transition_stay_probs_f32,
             )
         ctx.chunk_size = int(chunk_size)
@@ -766,7 +766,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_saved.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
             )
             if int(getattr(ctx, "packed_kind", _PACKED_TRANSITION_INT8)) == _PACKED_TRANSITION_INT8:
@@ -821,7 +821,7 @@ class _CausalMachineScanCudaFn(torch.autograd.Function):
                     transition_context_saved.contiguous(),
                     initial_log_belief_saved.contiguous(),
                     beliefs_saved.contiguous(),
-                    float(transition_gate_f32.detach().float().item()),
+                    transition_gate_f32,
                     transition_stay_probs_f32,
                     int(ctx.chunk_size),
                     float(ctx.score_clamp_min),
@@ -1262,7 +1262,7 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_f32.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 seq_lens_saved.contiguous(),
                 int(ctx.chunk_size),
@@ -1351,7 +1351,7 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_f32.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 0 if int(ctx.packed_kind) == _PACKED_TRANSITION_FP8_E4M3 else 1,
                 seq_lens_saved.contiguous(),
@@ -1428,7 +1428,7 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_f32.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 seq_lens_saved.contiguous(),
                 int(ctx.chunk_size),
@@ -1448,7 +1448,7 @@ class _CausalMachineTiledScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_f32.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 seq_lens_saved.contiguous(),
                 int(ctx.chunk_size),
@@ -2314,8 +2314,8 @@ def _describe_structured_scan_device_runtime_cached(device_index: int) -> dict[s
                     or getattr(props, "shared_memory_per_block", 0)
                 ),
                 "total_global_mem_bytes": int(getattr(props, "total_memory", 0)),
-                "supports_tma": 0,
-                "supports_wgmma": 0,
+                "supports_tma": 1 if int(major) >= 9 else 0,
+                "supports_wgmma": 1 if int(major) >= 9 else 0,
             }
         )
     except Exception:
@@ -2669,7 +2669,7 @@ class _CausalMachineMaskedScanCudaFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_saved.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 transition_mask_saved.contiguous(),
                 seq_lens_saved.contiguous(),
@@ -2827,7 +2827,7 @@ class _CausalMachineMaskedScanCudaProbFn(torch.autograd.Function):
                 transition_context_saved.contiguous(),
                 initial_log_belief_saved.contiguous(),
                 beliefs_saved.contiguous(),
-                float(transition_gate_f32.detach().float().item()),
+                transition_gate_f32,
                 transition_stay_probs_f32,
                 transition_mask_saved.contiguous(),
                 seq_lens_saved.contiguous(),
@@ -5134,6 +5134,7 @@ def _materialize_structured_scan_low_precision_metadata(
 
 
 def _describe_structured_scan_arch_spec(device: torch.device) -> StructuredScanArchSpec:
+    device_runtime = _describe_structured_scan_device_runtime(device) if device.type == "cuda" else {}
     if device.type != "cuda":
         return StructuredScanArchSpec(
             arch_family="cpu",
@@ -5155,8 +5156,8 @@ def _describe_structured_scan_arch_spec(device: torch.device) -> StructuredScanA
             supports_async_pipeline=True,
             supports_tensor_memory_accel=True,
             supports_cluster_launch_control=True,
-            supports_tma=False,
-            supports_wgmma=False,
+            supports_tma=bool(int(device_runtime.get("supports_tma", 1)) > 0),
+            supports_wgmma=bool(int(device_runtime.get("supports_wgmma", 1)) > 0),
             supports_tcgen05=True,
         )
     if capability_major >= 9:
@@ -5167,8 +5168,8 @@ def _describe_structured_scan_arch_spec(device: torch.device) -> StructuredScanA
             supports_async_pipeline=True,
             supports_tensor_memory_accel=True,
             supports_cluster_launch_control=True,
-            supports_tma=False,
-            supports_wgmma=False,
+            supports_tma=bool(int(device_runtime.get("supports_tma", 1)) > 0),
+            supports_wgmma=bool(int(device_runtime.get("supports_wgmma", 1)) > 0),
             supports_tcgen05=False,
         )
     if capability_major >= 8:
@@ -5367,6 +5368,12 @@ def _select_structured_scan_backend_policy(
         kernel_family = (
             "sm100_masked_tiled_async_proto"
             if major >= 10
+            else "sm90_masked_tiled_tma_wgmma"
+            if major >= 9 and bool(arch_spec.supports_tma) and bool(arch_spec.supports_wgmma)
+            else "sm90_masked_tiled_tma"
+            if major >= 9 and bool(arch_spec.supports_tma)
+            else "sm90_masked_tiled_wgmma"
+            if major >= 9 and bool(arch_spec.supports_wgmma)
             else "sm90_masked_tiled_async"
             if major >= 9
             else "sm80_masked_tiled_shared"
@@ -5387,7 +5394,9 @@ def _select_structured_scan_backend_policy(
         kernel_family = (
             "sm100_tiled_async_proto"
             if major >= 10
-            else "sm90_tiled_async"
+            else "sm90_tma_tiled_wgmma"
+            if major >= 9 and bool(arch_spec.supports_wgmma)
+            else "sm90_tma_tiled_async"
             if major >= 9
             else "sm80_tiled_shared"
         )
@@ -6101,6 +6110,10 @@ def _structured_scan_kernel_info(
         "supports_cluster_launch_control": bool(getattr(kernel_config, "supports_cluster_launch_control", False)),
         "supports_tma": bool(getattr(kernel_config, "supports_tma", False)),
         "supports_wgmma": bool(getattr(kernel_config, "supports_wgmma", False)),
+        "wgmma_kernel_implemented": bool(
+            bool(getattr(kernel_config, "supports_wgmma", False))
+            and str(getattr(kernel_config, "arch_family", "")).startswith("sm90")
+        ),
         "supports_tcgen05": bool(getattr(kernel_config, "supports_tcgen05", False)),
         "use_virtual_shared_fallback": bool(kernel_config.use_virtual_shared_fallback),
         "grouped_launch_packing": bool(kernel_config.grouped_launch_packing),
@@ -6113,17 +6126,39 @@ def _structured_scan_kernel_info(
         "uses_paged_cache": bool(runtime_config.use_paged_cache) if runtime_config is not None else False,
         "packed_transition_kind": _packed_transition_kind_name(packed_kind),
     }
+    arch_family = str(getattr(kernel_config, "arch_family", "legacy"))
+    hopper_specialization = arch_family.startswith("sm90") and bool(getattr(kernel_config, "supports_tma", False))
+    info["hopper_specialization"] = hopper_specialization
+    info["h100_tma_path_expected"] = hopper_specialization and bool(
+        getattr(kernel_config, "supports_async_pipeline", False)
+    )
+    info["async_pipeline_stages"] = (
+        3 if arch_family.startswith("sm90")
+        else 2 if bool(getattr(kernel_config, "supports_async_pipeline", False))
+        else 0
+    )
     if "lowp_tensor_core" in str(path):
-        arch_family = str(getattr(kernel_config, "arch_family", "legacy"))
         if arch_family.startswith("sm100"):
             info["selected_low_precision_kernel_family"] = "sm100_packed_wmma"
         elif arch_family.startswith("sm90"):
-            info["selected_low_precision_kernel_family"] = "sm90_packed_wmma"
+            supports_tma = bool(getattr(kernel_config, "supports_tma", False))
+            supports_wgmma = bool(getattr(kernel_config, "supports_wgmma", False))
+            if supports_tma and supports_wgmma:
+                info["selected_low_precision_kernel_family"] = "sm90_packed_tma_wgmma"
+            elif supports_tma:
+                info["selected_low_precision_kernel_family"] = "sm90_packed_tma_wmma"
+            elif supports_wgmma:
+                info["selected_low_precision_kernel_family"] = "sm90_packed_wgmma"
+            else:
+                info["selected_low_precision_kernel_family"] = "sm90_packed_wmma"
         elif arch_family.startswith("sm80"):
             info["selected_low_precision_kernel_family"] = "sm80_packed_wmma"
         else:
             info["selected_low_precision_kernel_family"] = "packed_wmma"
         info["tensor_core_trained_path"] = True
+        info["wgmma_kernel_implemented"] = bool(
+            arch_family.startswith("sm90") and bool(getattr(kernel_config, "supports_wgmma", False))
+        )
     if runtime_config is not None:
         info["paged_layout"] = str(runtime_config.paged_layout)
         info["allow_virtual_shared_runtime"] = bool(runtime_config.allow_virtual_shared_fallback)
@@ -7331,6 +7366,7 @@ class Hyperparameters:
     export_high_precision_bits = int(os.environ.get("EXPORT_HIGH_PRECISION_BITS", "8"))
     save_raw_debug_model = bool(int(os.environ.get("SAVE_RAW_DEBUG_MODEL", "0" if competition_mode else "1")))
     run_final_quant_eval = bool(int(os.environ.get("RUN_FINAL_QUANT_EVAL", "0" if competition_mode else "1")))
+    verify_export_roundtrip = bool(int(os.environ.get("VERIFY_EXPORT_ROUNDTRIP", "0" if competition_mode else "1")))
     export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "300000"))
     export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "4"))
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
@@ -7625,6 +7661,7 @@ class Hyperparameters:
             "mup_proj_init": "MUP_PROJ_INIT",
             "export_quant_bits": "EXPORT_QUANT_BITS",
             "export_codec": "EXPORT_CODEC",
+            "verify_export_roundtrip": "VERIFY_EXPORT_ROUNDTRIP",
             "export_high_precision_bits": "EXPORT_HIGH_PRECISION_BITS",
             "export_high_precision_budget_bytes": "EXPORT_HIGH_PRECISION_BUDGET_BYTES",
             "export_high_precision_max_tensors": "EXPORT_HIGH_PRECISION_MAX_TENSORS",
@@ -15665,15 +15702,17 @@ def main() -> None:
             "adjust model/code size or quantization settings."
         )
 
+    should_reload_quant_artifact = bool(args.verify_export_roundtrip or args.run_final_quant_eval)
     if distributed:
         dist.barrier()
-    with open(quant_model_path, "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(decompress_blob(quant_blob_disk, used_codec)), map_location="cpu")
-    if args.export_quant_bits < 8:
-        base_model.load_state_dict(dequantize_state_dict_mixed_precision(quant_state), strict=True)
-    else:
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if should_reload_quant_artifact:
+        with open(quant_model_path, "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(decompress_blob(quant_blob_disk, used_codec)), map_location="cpu")
+        if args.export_quant_bits < 8:
+            base_model.load_state_dict(dequantize_state_dict_mixed_precision(quant_state), strict=True)
+        else:
+            base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     if args.run_final_quant_eval:
         torch.cuda.synchronize()
         if uses_sliding_eval(args):
