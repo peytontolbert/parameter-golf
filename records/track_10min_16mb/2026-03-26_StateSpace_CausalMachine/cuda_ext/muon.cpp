@@ -53,6 +53,25 @@ void muon_grouped_step_family_workspace_cuda(
     bool nesterov,
     int64_t ns_steps,
     double eps);
+void muon_grouped_step_family_workspace_with_ptrs_cuda(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
+    torch::Tensor effective_batch,
+    torch::Tensor momentum_batch,
+    torch::Tensor norms,
+    torch::Tensor ns_input_batch,
+    torch::Tensor gram_batch,
+    torch::Tensor gram_sq_batch,
+    torch::Tensor next_x_batch,
+    int64_t family_code,
+    double lr,
+    double momentum,
+    double weight_decay,
+    bool nesterov,
+    int64_t ns_steps,
+    double eps);
 void muon_grouped_step_family_workspace_capturable_cuda(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
@@ -407,6 +426,120 @@ void muon_grouped_step_family_workspace(
         eps);
 }
 
+void muon_grouped_step_family_workspace_with_ptrs(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
+    torch::Tensor effective_batch,
+    torch::Tensor momentum_batch,
+    torch::Tensor norms,
+    torch::Tensor ns_input_batch,
+    torch::Tensor gram_batch,
+    torch::Tensor gram_sq_batch,
+    torch::Tensor next_x_batch,
+    int64_t family_code,
+    double lr,
+    double momentum,
+    double weight_decay,
+    bool nesterov,
+    int64_t ns_steps,
+    double eps = 1.0e-7) {
+    if (params.empty()) {
+        throw std::invalid_argument("muon_grouped_step_family_workspace_with_ptrs requires at least one parameter tensor");
+    }
+    if (params.size() != grads.size()) {
+        throw std::invalid_argument("params and grads must have matching lengths");
+    }
+    TORCH_CHECK(family_code >= 0 && family_code <= 3, "invalid Muon family code");
+    const auto ref_sizes = params.front().sizes();
+    const auto ref_device = params.front().device();
+    const int64_t bucket_size = static_cast<int64_t>(params.size());
+    const int64_t rows = ref_sizes[0];
+    const int64_t cols = ref_sizes[1];
+    const bool transpose_input = family_code == 1;
+    const int64_t ns_rows = transpose_input ? cols : rows;
+    const int64_t ns_cols = transpose_input ? rows : cols;
+    for (size_t idx = 0; idx < params.size(); ++idx) {
+        const auto& p = params[idx];
+        const auto& g = grads[idx];
+        TORCH_CHECK(p.is_cuda(), "muon_grouped_step_family_workspace_with_ptrs expects CUDA params");
+        TORCH_CHECK(g.is_cuda(), "muon_grouped_step_family_workspace_with_ptrs expects CUDA grads");
+        TORCH_CHECK(p.dim() == 2, "muon_grouped_step_family_workspace_with_ptrs expects matrix params");
+        TORCH_CHECK(g.dim() == 2, "muon_grouped_step_family_workspace_with_ptrs expects matrix grads");
+        TORCH_CHECK(p.sizes() == ref_sizes, "muon_grouped_step_family_workspace_with_ptrs requires same-shape params");
+        TORCH_CHECK(g.sizes() == ref_sizes, "muon_grouped_step_family_workspace_with_ptrs requires same-shape grads");
+        TORCH_CHECK(p.device() == ref_device, "all grouped params must share a device");
+        TORCH_CHECK(g.device() == ref_device, "all grouped grads must share a device");
+        TORCH_CHECK(p.is_contiguous(), "grouped params must be contiguous");
+        TORCH_CHECK(g.is_contiguous(), "grouped grads must be contiguous");
+    }
+    TORCH_CHECK(
+        effective_batch.is_cuda() && effective_batch.dim() == 3 &&
+            effective_batch.size(0) == bucket_size && effective_batch.size(1) == rows && effective_batch.size(2) == cols,
+        "effective_batch shape mismatch");
+    TORCH_CHECK(
+        momentum_batch.is_cuda() && momentum_batch.dim() == 3 &&
+            momentum_batch.size(0) == bucket_size && momentum_batch.size(1) == rows && momentum_batch.size(2) == cols,
+        "momentum_batch shape mismatch");
+    TORCH_CHECK(
+        norms.is_cuda() && norms.dim() == 2 &&
+            norms.size(0) == bucket_size && norms.size(1) == 1,
+        "norms shape mismatch");
+    TORCH_CHECK(
+        ns_input_batch.is_cuda() && ns_input_batch.dim() == 3 &&
+            ns_input_batch.size(0) == bucket_size && ns_input_batch.size(1) == ns_rows && ns_input_batch.size(2) == ns_cols,
+        "ns_input_batch shape mismatch");
+    TORCH_CHECK(
+        gram_batch.is_cuda() && gram_batch.dim() == 3 &&
+            gram_batch.size(0) == bucket_size && gram_batch.size(1) == ns_rows && gram_batch.size(2) == ns_rows,
+        "gram_batch shape mismatch");
+    TORCH_CHECK(
+        gram_sq_batch.is_cuda() && gram_sq_batch.dim() == 3 &&
+            gram_sq_batch.size(0) == bucket_size && gram_sq_batch.size(1) == ns_rows && gram_sq_batch.size(2) == ns_rows,
+        "gram_sq_batch shape mismatch");
+    TORCH_CHECK(
+        next_x_batch.is_cuda() && next_x_batch.dim() == 3 &&
+            next_x_batch.size(0) == bucket_size && next_x_batch.size(1) == ns_rows && next_x_batch.size(2) == ns_cols,
+        "next_x_batch shape mismatch");
+    TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "effective_batch must be float32");
+    TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "momentum_batch must be float32");
+    TORCH_CHECK(norms.scalar_type() == torch::kFloat, "norms must be float32");
+    const auto workspace_dtype = ns_input_batch.scalar_type();
+    TORCH_CHECK(
+        is_supported_muon_workspace_dtype(workspace_dtype),
+        "ns_input_batch must be float32 or bf16");
+    TORCH_CHECK(gram_batch.scalar_type() == workspace_dtype, "gram_batch dtype must match ns_input_batch");
+    TORCH_CHECK(gram_sq_batch.scalar_type() == workspace_dtype, "gram_sq_batch dtype must match ns_input_batch");
+    TORCH_CHECK(next_x_batch.scalar_type() == workspace_dtype, "next_x_batch dtype must match ns_input_batch");
+    check_pointer_tensor(param_ptrs, bucket_size, ref_device, "param_ptrs");
+    check_pointer_tensor(grad_ptrs, bucket_size, ref_device, "grad_ptrs");
+    TORCH_CHECK(std::isfinite(lr), "lr must be finite");
+    TORCH_CHECK(std::isfinite(momentum), "momentum must be finite");
+    TORCH_CHECK(std::isfinite(weight_decay), "weight_decay must be finite");
+    TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "eps must be finite and positive");
+    TORCH_CHECK(ns_steps >= 0, "ns_steps must be non-negative");
+    muon_grouped_step_family_workspace_with_ptrs_cuda(
+        std::move(params),
+        std::move(grads),
+        std::move(param_ptrs),
+        std::move(grad_ptrs),
+        std::move(effective_batch),
+        std::move(momentum_batch),
+        std::move(norms),
+        std::move(ns_input_batch),
+        std::move(gram_batch),
+        std::move(gram_sq_batch),
+        std::move(next_x_batch),
+        family_code,
+        lr,
+        momentum,
+        weight_decay,
+        nesterov,
+        ns_steps,
+        eps);
+}
+
 void muon_grouped_step_family_workspace_capturable(
     std::vector<torch::Tensor> params,
     std::vector<torch::Tensor> grads,
@@ -529,6 +662,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "grouped_step_family_workspace",
         &muon_grouped_step_family_workspace,
         "Grouped Muon step with family-specialized workspaces (CUDA)");
+    m.def(
+        "grouped_step_family_workspace_with_ptrs",
+        &muon_grouped_step_family_workspace_with_ptrs,
+        "Grouped Muon step with family-specialized workspaces and cached pointer tensors (CUDA)");
     m.def(
         "grouped_step_family_workspace_capturable",
         &muon_grouped_step_family_workspace_capturable,

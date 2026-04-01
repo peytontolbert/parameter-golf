@@ -665,6 +665,50 @@ void fused_prepare_muon_batch(
     AT_CUDA_CHECK(cudaGetLastError());
 }
 
+void fused_prepare_muon_batch_with_ptrs(
+    const std::vector<torch::Tensor>& grads,
+    const torch::Tensor& grad_ptrs,
+    torch::Tensor momentum_batch,
+    torch::Tensor effective_batch,
+    double momentum,
+    bool nesterov,
+    int64_t family_code) {
+    const auto bucket_size = static_cast<int64_t>(grads.size());
+    TORCH_CHECK(bucket_size > 0, "fused_prepare_muon_batch_with_ptrs requires non-empty grads");
+    const int device_index = get_cuda_device_index(grads.front(), "fused_prepare_muon_batch_with_ptrs", "grads");
+    check_cuda_device(grads, device_index, "fused_prepare_muon_batch_with_ptrs", "grads");
+    check_cuda_device(grad_ptrs, device_index, "fused_prepare_muon_batch_with_ptrs", "grad_ptrs");
+    check_cuda_device(momentum_batch, device_index, "fused_prepare_muon_batch_with_ptrs", "momentum_batch");
+    check_cuda_device(effective_batch, device_index, "fused_prepare_muon_batch_with_ptrs", "effective_batch");
+    c10::cuda::CUDAGuard device_guard(device_index);
+    TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch_with_ptrs expects float momentum_batch");
+    TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch_with_ptrs expects float effective_batch");
+    const int64_t rows = grads.front().size(0);
+    const int64_t cols = grads.front().size(1);
+    const int threads = muon_family_threads(family_code);
+    const int64_t total = bucket_size * rows * cols;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    const float momentum_f = static_cast<float>(momentum);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        grads.front().scalar_type(),
+        "fused_prepare_muon_batch_with_ptrs_kernel",
+        [&] {
+            fused_prepare_muon_batch_kernel<scalar_t><<<blocks, threads, 0, stream>>>(
+                grad_ptrs.data_ptr<int64_t>(),
+                momentum_batch.data_ptr<float>(),
+                effective_batch.data_ptr<float>(),
+                momentum_f,
+                nesterov,
+                bucket_size,
+                rows,
+                cols);
+        });
+    AT_CUDA_CHECK(cudaGetLastError());
+}
+
 void fused_prepare_muon_batch_capturable(
     const std::vector<torch::Tensor>& grads,
     const torch::Tensor& grad_ptrs,
@@ -795,6 +839,60 @@ void apply_projected_updates(
                     using projected_t = scalar_t;
                     apply_projected_updates_kernel<param_t, projected_t><<<blocks, threads, 0, stream>>>(
                         ptrs.data_ptr<int64_t>(),
+                        projected_batch.data_ptr<projected_t>(),
+                        lr_f,
+                        decay_factor,
+                        aspect_scale_f,
+                        transpose_input,
+                        bucket_size,
+                        rows,
+                        cols);
+                });
+        });
+    AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void apply_projected_updates_with_ptrs(
+    const std::vector<torch::Tensor>& params,
+    const torch::Tensor& param_ptrs,
+    const torch::Tensor& projected_batch,
+    double lr,
+    double weight_decay,
+    bool transpose_input,
+    double aspect_scale,
+    int64_t family_code) {
+    const auto bucket_size = static_cast<int64_t>(params.size());
+    TORCH_CHECK(bucket_size > 0, "apply_projected_updates_with_ptrs requires non-empty params");
+    const int device_index = get_cuda_device_index(params.front(), "apply_projected_updates_with_ptrs", "params");
+    check_cuda_device(params, device_index, "apply_projected_updates_with_ptrs", "params");
+    check_cuda_device(param_ptrs, device_index, "apply_projected_updates_with_ptrs", "param_ptrs");
+    check_cuda_device(projected_batch, device_index, "apply_projected_updates_with_ptrs", "projected_batch");
+    c10::cuda::CUDAGuard device_guard(device_index);
+    const int64_t rows = params.front().size(0);
+    const int64_t cols = params.front().size(1);
+    const int threads = muon_family_threads(family_code);
+    const int64_t total = bucket_size * rows * cols;
+    const int blocks = static_cast<int>((total + threads - 1) / threads);
+    const float lr_f = static_cast<float>(lr);
+    const float decay_factor = static_cast<float>(weight_decay > 0.0 ? (1.0 - lr * weight_decay) : 1.0);
+    const float aspect_scale_f = static_cast<float>(aspect_scale);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        params.front().scalar_type(),
+        "apply_projected_updates_with_ptrs_param_dispatch",
+        [&] {
+            using param_t = scalar_t;
+            AT_DISPATCH_FLOATING_TYPES_AND2(
+                at::ScalarType::Half,
+                at::ScalarType::BFloat16,
+                projected_batch.scalar_type(),
+                "apply_projected_updates_with_ptrs_projected_dispatch",
+                [&] {
+                    using projected_t = scalar_t;
+                    apply_projected_updates_kernel<param_t, projected_t><<<blocks, threads, 0, stream>>>(
+                        param_ptrs.data_ptr<int64_t>(),
                         projected_batch.data_ptr<projected_t>(),
                         lr_f,
                         decay_factor,
@@ -1230,6 +1328,43 @@ void muon_grouped_step_family_workspace_cuda(
         std::max(1.0, static_cast<double>(params.front().size(0)) / std::max(1.0, static_cast<double>(params.front().size(1)))));
     apply_projected_updates(
         params,
+        ns_input_batch,
+        lr,
+        weight_decay,
+        muon_family_transposes(family_code),
+        aspect_scale,
+        family_code);
+}
+
+void muon_grouped_step_family_workspace_with_ptrs_cuda(
+    std::vector<torch::Tensor> params,
+    std::vector<torch::Tensor> grads,
+    torch::Tensor param_ptrs,
+    torch::Tensor grad_ptrs,
+    torch::Tensor effective_batch,
+    torch::Tensor momentum_batch,
+    torch::Tensor norms,
+    torch::Tensor ns_input_batch,
+    torch::Tensor gram_batch,
+    torch::Tensor gram_sq_batch,
+    torch::Tensor next_x_batch,
+    int64_t family_code,
+    double lr,
+    double momentum,
+    double weight_decay,
+    bool nesterov,
+    int64_t ns_steps,
+    double eps) {
+    const auto bucket_size = static_cast<int64_t>(params.size());
+    TORCH_CHECK(bucket_size > 0, "muon_grouped_step_family_workspace_with_ptrs_cuda requires a non-empty bucket");
+    fused_prepare_muon_batch_with_ptrs(grads, grad_ptrs, momentum_batch, effective_batch, momentum, nesterov, family_code);
+    normalize_effective_batch(effective_batch, norms, ns_input_batch, eps, family_code);
+    batched_newton_schulz_workspace(ns_input_batch, gram_batch, gram_sq_batch, next_x_batch, ns_steps);
+    const double aspect_scale = std::sqrt(
+        std::max(1.0, static_cast<double>(params.front().size(0)) / std::max(1.0, static_cast<double>(params.front().size(1)))));
+    apply_projected_updates_with_ptrs(
+        params,
+        param_ptrs,
         ns_input_batch,
         lr,
         weight_decay,

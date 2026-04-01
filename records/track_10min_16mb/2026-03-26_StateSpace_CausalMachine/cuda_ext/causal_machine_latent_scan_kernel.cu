@@ -126,6 +126,7 @@ torch::Tensor make_device_work_queue_counter(const torch::Tensor& reference) {
 }
 
 std::mutex g_latent_workspace_cache_mutex;
+std::unordered_map<std::uintptr_t, torch::Tensor> g_latent_work_queue_counter_cache;
 
 enum class LatentWorkspaceTag : std::uint8_t {
     Forward = 0,
@@ -213,6 +214,25 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> get_or_create_latent_wor
     ensure_tensor(std::get<1>(entry));
     ensure_tensor(std::get<2>(entry));
     return entry;
+}
+
+torch::Tensor get_or_create_latent_work_queue_counter(const torch::Tensor& ref) {
+    const auto device_index = ref.get_device();
+    const auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
+    const std::uintptr_t key =
+        reinterpret_cast<std::uintptr_t>(stream) ^ (static_cast<std::uintptr_t>(static_cast<uint32_t>(device_index)) << 32);
+    std::lock_guard<std::mutex> lock(g_latent_workspace_cache_mutex);
+    auto& counter = g_latent_work_queue_counter_cache[key];
+    if (
+        !counter.defined()
+        || counter.scalar_type() != torch::kInt32
+        || counter.device() != ref.device()
+        || counter.numel() != 1
+    ) {
+        counter = make_device_work_queue_counter(ref);
+    }
+    counter.zero_();
+    return counter;
 }
 
 template <typename scalar_t>
@@ -1999,7 +2019,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
             const dim3 rank_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
-            auto work_queue_counter = make_device_work_queue_counter(drive);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
             if (use_half2) {
                 latent_scan_forward_kernel_half2<true><<<rank_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
@@ -2059,7 +2079,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     drive.get_device(),
                     total_chunk_tasks,
                     launch_threads);
-            auto work_queue_counter = make_device_work_queue_counter(drive);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
             const dim3 persistent_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
@@ -2229,7 +2249,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
             const dim3 rank_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
-            auto work_queue_counter = make_device_work_queue_counter(drive);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
             if (use_half2) {
                 latent_scan_forward_kernel_half2<false><<<rank_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
@@ -2288,7 +2308,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     drive.get_device(),
                     total_chunk_tasks,
                     launch_threads);
-            auto work_queue_counter = make_device_work_queue_counter(drive);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
             const dim3 persistent_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
@@ -2462,7 +2482,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
             const dim3 rank_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
-            auto work_queue_counter = make_device_work_queue_counter(states);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(states);
             if (use_half2) {
                 latent_scan_backward_kernel_half2<true, true><<<rank_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
@@ -2533,7 +2553,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     states.get_device(),
                     total_chunk_tasks,
                     launch_threads);
-            auto work_queue_counter = make_device_work_queue_counter(states);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(states);
             const dim3 persistent_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
@@ -2720,7 +2740,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
             const dim3 rank_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));
-            auto work_queue_counter = make_device_work_queue_counter(prior_states);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(prior_states);
             if (use_half2) {
                 latent_scan_backward_kernel_half2<false, false><<<rank_grid, block, 0, stream>>>(
                     nullptr,
@@ -2790,7 +2810,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     prior_states.get_device(),
                     total_chunk_tasks,
                     launch_threads);
-            auto work_queue_counter = make_device_work_queue_counter(prior_states);
+            auto work_queue_counter = get_or_create_latent_work_queue_counter(prior_states);
             const dim3 persistent_grid(
                 static_cast<unsigned int>(worker_blocks),
                 static_cast<unsigned int>(rank_tiles));

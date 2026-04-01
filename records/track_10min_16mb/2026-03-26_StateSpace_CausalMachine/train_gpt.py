@@ -7999,7 +7999,7 @@ def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
     return 3
 
 
-def _muon_family_workspace_dtype(shape: tuple[int, int], family_code: int) -> torch.dtype:
+def _muon_family_workspace_dtype(shape: tuple[int, int], family_code: int, device: torch.device) -> torch.dtype:
     raw = os.environ.get("MUON_FAMILY_WORKSPACE_DTYPE", "auto").strip().lower()
     if raw in {"float", "float32", "fp32"}:
         return torch.float32
@@ -8010,10 +8010,12 @@ def _muon_family_workspace_dtype(shape: tuple[int, int], family_code: int) -> to
             "MUON_FAMILY_WORKSPACE_DTYPE must be one of auto, float32, or bfloat16; "
             f"got {raw!r}"
         )
-    # Keep the full family workspace path on fp32 NS state by default. The
-    # fused prepare/apply kernels remain active, but the actual Newton-Schulz
-    # recurrence now keeps a uniform high-precision state across square and
-    # rectangular buckets alike. bf16 remains available as an explicit opt-in.
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        if int(props.major) >= 9:
+            return torch.bfloat16
+    # Older local tuning boxes keep the more conservative fp32 workspace by
+    # default. Hopper-class runs can opt into the bf16 workspace path via auto.
     return torch.float32
 
 
@@ -8348,7 +8350,7 @@ class Muon(torch.optim.Optimizer):
         shape = tuple(int(v) for v in params_bucket[0].shape)
         device = params_bucket[0].device
         family_code = _muon_bucket_family_code(shape)
-        workspace_dtype = _muon_family_workspace_dtype(shape, family_code)
+        workspace_dtype = _muon_family_workspace_dtype(shape, family_code, device)
         key = (
             device.index if device.index is not None else -1,
             params_bucket[0].dtype,
@@ -8393,8 +8395,8 @@ class Muon(torch.optim.Optimizer):
             )
             gram_sq_batch = torch.empty_like(gram_batch)
             next_x_batch = torch.empty_like(ns_input_batch)
-            param_ptrs = _make_cuda_pointer_tensor(params_bucket, device) if self._capturable_requested else None
-            grad_ptrs = _make_cuda_pointer_tensor(grads_bucket, device) if self._capturable_requested else None
+            param_ptrs = _make_cuda_pointer_tensor(params_bucket, device)
+            grad_ptrs = _make_cuda_pointer_tensor(grads_bucket, device)
             square_backend = ""
             if family_code == 0 and ext is not None and hasattr(ext, "describe_square_backend"):
                 square_backend = _muon_square_backend_name(int(ext.describe_square_backend(ns_input_batch)))
@@ -8426,16 +8428,15 @@ class Muon(torch.optim.Optimizer):
                 "momentum_views": momentum_views,
             }
             self._cuda_bucket_workspaces[key] = workspace
-        elif self._capturable_requested:
-            grad_tensor_ids = tuple(id(grad) for grad in grads_bucket)
-            grad_data_ptrs = tuple(int(grad.data_ptr()) for grad in grads_bucket)
-            if (
-                workspace.get("grad_tensor_ids") != grad_tensor_ids
-                or workspace.get("grad_data_ptrs") != grad_data_ptrs
-            ):
-                workspace["grad_ptrs"] = _make_cuda_pointer_tensor(grads_bucket, device)
-                workspace["grad_tensor_ids"] = grad_tensor_ids
-                workspace["grad_data_ptrs"] = grad_data_ptrs
+        grad_tensor_ids = tuple(id(grad) for grad in grads_bucket)
+        grad_data_ptrs = tuple(int(grad.data_ptr()) for grad in grads_bucket)
+        if (
+            workspace.get("grad_tensor_ids") != grad_tensor_ids
+            or workspace.get("grad_data_ptrs") != grad_data_ptrs
+        ):
+            workspace["grad_ptrs"] = _make_cuda_pointer_tensor(grads_bucket, device)
+            workspace["grad_tensor_ids"] = grad_tensor_ids
+            workspace["grad_data_ptrs"] = grad_data_ptrs
         if family_code == 0 and ext is not None and hasattr(ext, "describe_square_backend"):
             current_square_backend = _muon_square_backend_name(int(ext.describe_square_backend(workspace["ns_input_batch"])))
             if workspace.get("square_backend") != current_square_backend and hasattr(ext, "prewarm_square_backend"):
@@ -8630,24 +8631,46 @@ class Muon(torch.optim.Optimizer):
                 bucket_started_at = time.perf_counter() if PROFILE_MUON_STEP else 0.0
                 try:
                     assert muon_ext is not None
-                    muon_ext.grouped_step_family_workspace(
-                        params_bucket,
-                        grads_bucket,
-                        workspace["effective_batch"],
-                        workspace["momentum_batch"],
-                        workspace["norms"],
-                        workspace["ns_input_batch"],
-                        workspace["gram_batch"],
-                        workspace["gram_sq_batch"],
-                        workspace["next_x_batch"],
-                        int(workspace["family_code"]),
-                        float(lr),
-                        float(momentum),
-                        float(weight_decay),
-                        bool(nesterov),
-                        int(current_backend_steps),
-                        1.0e-7,
-                    )
+                    if hasattr(muon_ext, "grouped_step_family_workspace_with_ptrs"):
+                        muon_ext.grouped_step_family_workspace_with_ptrs(
+                            params_bucket,
+                            grads_bucket,
+                            workspace["param_ptrs"],
+                            workspace["grad_ptrs"],
+                            workspace["effective_batch"],
+                            workspace["momentum_batch"],
+                            workspace["norms"],
+                            workspace["ns_input_batch"],
+                            workspace["gram_batch"],
+                            workspace["gram_sq_batch"],
+                            workspace["next_x_batch"],
+                            int(workspace["family_code"]),
+                            float(lr),
+                            float(momentum),
+                            float(weight_decay),
+                            bool(nesterov),
+                            int(current_backend_steps),
+                            1.0e-7,
+                        )
+                    else:
+                        muon_ext.grouped_step_family_workspace(
+                            params_bucket,
+                            grads_bucket,
+                            workspace["effective_batch"],
+                            workspace["momentum_batch"],
+                            workspace["norms"],
+                            workspace["ns_input_batch"],
+                            workspace["gram_batch"],
+                            workspace["gram_sq_batch"],
+                            workspace["next_x_batch"],
+                            int(workspace["family_code"]),
+                            float(lr),
+                            float(momentum),
+                            float(weight_decay),
+                            bool(nesterov),
+                            int(current_backend_steps),
+                            1.0e-7,
+                        )
                     total_stats["cuda_tensor_count"] = int(total_stats["cuda_tensor_count"]) + len(bucket_items)
                     total_stats["cuda_element_count"] = int(total_stats["cuda_element_count"]) + bucket_element_count
                     self._record_square_backend_stats(
