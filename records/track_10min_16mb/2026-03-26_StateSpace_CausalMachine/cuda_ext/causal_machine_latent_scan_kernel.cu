@@ -22,6 +22,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr int kLatentChunkSize = 64;
+constexpr int kSmallChunkScanThreads = 32;
 // Keep the prefix-scan fast path active for substantially longer sequences.
 // With chunk size 64, 256 scan threads covers up to 16384 tokens before the
 // kernel has to fall back to the sequential carry path.
@@ -30,6 +31,7 @@ constexpr int kChunkScanThreads = 256;
 // under-fills large GPUs on the competition shape. Favor the chunked path for
 // 1024-token runs unless the user explicitly opts back in.
 constexpr int kDefaultSingleKernelMaxSeqLen = 512;
+constexpr int kDefaultNonPersistentChunkMaxNumChunks = 32;
 
 struct AffineScanValue {
     float mul;
@@ -67,6 +69,18 @@ int latent_single_kernel_max_seq_len() {
         }
         const int parsed = std::atoi(raw);
         return parsed >= 0 ? parsed : kDefaultSingleKernelMaxSeqLen;
+    }();
+    return cached;
+}
+
+int latent_nonpersistent_chunk_max_num_chunks() {
+    static const int cached = []() {
+        const char* raw = std::getenv("CAUSAL_MACHINE_LATENT_SCAN_NONPERSISTENT_MAX_NUM_CHUNKS");
+        if (raw == nullptr || raw[0] == '\0') {
+            return kDefaultNonPersistentChunkMaxNumChunks;
+        }
+        const int parsed = std::atoi(raw);
+        return parsed >= 0 ? parsed : kDefaultNonPersistentChunkMaxNumChunks;
     }();
     return cached;
 }
@@ -628,8 +642,8 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_carry_kernel(
     }
 }
 
-template <typename scalar_t, typename work_t>
-__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_kernel(
+template <typename scalar_t, typename work_t, int ScanThreads>
+__global__ __launch_bounds__(ScanThreads) void latent_chunk_prefix_scan_kernel(
     const work_t* __restrict__ chunk_mul,
     const work_t* __restrict__ chunk_add,
     const scalar_t* __restrict__ initial_state,
@@ -641,11 +655,11 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_ke
     const int current_batch = blockIdx.x;
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
-    if (current_batch >= total_batches || r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || r >= rank_dim || tid >= ScanThreads) {
         return;
     }
 
-    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    using BlockScan = cub::BlockScan<AffineScanValue, ScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
     AffineScanValue current = affine_scan_identity();
@@ -981,8 +995,8 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_persis
     }
 }
 
-template <typename scalar_t, typename work_t>
-__global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix_scan_kernel(
+template <typename scalar_t, typename work_t, int ScanThreads>
+__global__ __launch_bounds__(ScanThreads) void latent_chunk_reverse_prefix_scan_kernel(
     const work_t* __restrict__ chunk_mul,
     const work_t* __restrict__ chunk_add,
     const scalar_t* __restrict__ grad_final_state,
@@ -993,11 +1007,11 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix
     const int current_batch = blockIdx.x;
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
-    if (current_batch >= total_batches || r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || r >= rank_dim || tid >= ScanThreads) {
         return;
     }
 
-    using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
+    using BlockScan = cub::BlockScan<AffineScanValue, ScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
     AffineScanValue current = affine_scan_identity();
@@ -1830,11 +1844,26 @@ void latent_prefix_scan_dispatch(
     cudaStream_t stream,
     torch::Tensor& chunk_prev,
     torch::Tensor& final_state) {
+    if (num_chunks <= kSmallChunkScanThreads) {
+        const dim3 scan_grid(
+            static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>(rank_dim));
+        latent_chunk_prefix_scan_kernel<scalar_t, work_t, kSmallChunkScanThreads><<<scan_grid, kSmallChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<work_t>(),
+            chunk_add.data_ptr<work_t>(),
+            initial_state.data_ptr<scalar_t>(),
+            batch_size,
+            num_chunks,
+            rank_dim,
+            chunk_prev.data_ptr<work_t>(),
+            final_state.data_ptr<scalar_t>());
+        return;
+    }
     if (num_chunks <= kChunkScanThreads) {
         const dim3 scan_grid(
             static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(rank_dim));
-        latent_chunk_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+        latent_chunk_prefix_scan_kernel<scalar_t, work_t, kChunkScanThreads><<<scan_grid, kChunkScanThreads, 0, stream>>>(
             chunk_mul.data_ptr<work_t>(),
             chunk_add.data_ptr<work_t>(),
             initial_state.data_ptr<scalar_t>(),
@@ -1903,11 +1932,25 @@ void latent_reverse_prefix_scan_dispatch(
     int rank_dim,
     cudaStream_t stream,
     torch::Tensor& chunk_carry) {
+    if (num_chunks <= kSmallChunkScanThreads) {
+        const dim3 scan_grid(
+            static_cast<unsigned int>(batch_size),
+            static_cast<unsigned int>(rank_dim));
+        latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t, kSmallChunkScanThreads><<<scan_grid, kSmallChunkScanThreads, 0, stream>>>(
+            chunk_mul.data_ptr<work_t>(),
+            chunk_add.data_ptr<work_t>(),
+            grad_final_state.data_ptr<scalar_t>(),
+            batch_size,
+            num_chunks,
+            rank_dim,
+            chunk_carry.data_ptr<work_t>());
+        return;
+    }
     if (num_chunks <= kChunkScanThreads) {
         const dim3 scan_grid(
             static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(rank_dim));
-        latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
+        latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t, kChunkScanThreads><<<scan_grid, kChunkScanThreads, 0, stream>>>(
             chunk_mul.data_ptr<work_t>(),
             chunk_add.data_ptr<work_t>(),
             grad_final_state.data_ptr<scalar_t>(),
@@ -2061,61 +2104,93 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
             const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::Forward, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const bool use_nonpersistent_chunk_kernels = num_chunks <= latent_nonpersistent_chunk_max_num_chunks();
             const int total_chunk_tasks = batch_size * num_chunks;
-            const int worker_blocks = use_half2
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel_half2,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : use_float_workspace
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel<scalar_t, float>,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads);
-            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
-            const dim3 persistent_grid(
-                static_cast<unsigned int>(worker_blocks),
-                static_cast<unsigned int>(rank_tiles));
-            if (use_half2) {
-                latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
-                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
-                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
-            } else if (use_float_workspace) {
-                latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
-                    drive.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
+            const int chunk_launch_threads = latent_launch_threads(rank_dim);
+            const dim3 chunk_block(static_cast<unsigned int>(chunk_launch_threads));
+            const int chunk_rank_tiles = static_cast<int>((rank_dim + chunk_launch_threads - 1) / chunk_launch_threads);
+            torch::Tensor work_queue_counter;
+            dim3 persistent_grid{};
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_summary_kernel<scalar_t, float><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_summary_kernel<scalar_t, scalar_t><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             } else {
-                latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
-                    drive.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<scalar_t>(),
-                    chunk_add.data_ptr<scalar_t>());
+                const int worker_blocks = use_half2
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel_half2,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : use_float_workspace
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel<scalar_t, float>,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads);
+                work_queue_counter = get_or_create_latent_work_queue_counter(drive);
+                persistent_grid = dim3(
+                    static_cast<unsigned int>(worker_blocks),
+                    static_cast<unsigned int>(rank_tiles));
+                if (use_half2) {
+                    latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
+                        reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                        reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else if (use_float_workspace) {
+                    latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             }
             if (use_half2) {
                 latent_prefix_scan_dispatch<scalar_t, float>(
@@ -2151,7 +2226,33 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     chunk_prev,
                     final_state);
             }
-            if (!use_half2 && !use_float_workspace) {
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_finalize_kernel<scalar_t, float, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_prev.data_ptr<float>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        prior_states.data_ptr<scalar_t>(),
+                        states.data_ptr<scalar_t>());
+                } else {
+                    latent_chunk_finalize_kernel<scalar_t, scalar_t, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_prev.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        prior_states.data_ptr<scalar_t>(),
+                        states.data_ptr<scalar_t>());
+                }
+            } else if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
                     drive.data_ptr<scalar_t>(),
@@ -2290,61 +2391,93 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
             const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::ForwardPrior, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const bool use_nonpersistent_chunk_kernels = num_chunks <= latent_nonpersistent_chunk_max_num_chunks();
             const int total_chunk_tasks = batch_size * num_chunks;
-            const int worker_blocks = use_half2
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel_half2,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : use_float_workspace
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel<scalar_t, float>,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : occupancy_persistent_worker_blocks(
-                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
-                    drive.get_device(),
-                    total_chunk_tasks,
-                    launch_threads);
-            auto work_queue_counter = get_or_create_latent_work_queue_counter(drive);
-            const dim3 persistent_grid(
-                static_cast<unsigned int>(worker_blocks),
-                static_cast<unsigned int>(rank_tiles));
-            if (use_half2) {
-                latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
-                    reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
-                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
-            } else if (use_float_workspace) {
-                latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
-                    drive.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
+            const int chunk_launch_threads = latent_launch_threads(rank_dim);
+            const dim3 chunk_block(static_cast<unsigned int>(chunk_launch_threads));
+            const int chunk_rank_tiles = static_cast<int>((rank_dim + chunk_launch_threads - 1) / chunk_launch_threads);
+            torch::Tensor work_queue_counter;
+            dim3 persistent_grid{};
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_summary_kernel<scalar_t, float><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_summary_kernel<scalar_t, scalar_t><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             } else {
-                latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
-                    drive.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<scalar_t>(),
-                    chunk_add.data_ptr<scalar_t>());
+                const int worker_blocks = use_half2
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel_half2,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : use_float_workspace
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel<scalar_t, float>,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : occupancy_persistent_worker_blocks(
+                        latent_chunk_summary_persistent_kernel<scalar_t, scalar_t>,
+                        drive.get_device(),
+                        total_chunk_tasks,
+                        launch_threads);
+                work_queue_counter = get_or_create_latent_work_queue_counter(drive);
+                persistent_grid = dim3(
+                    static_cast<unsigned int>(worker_blocks),
+                    static_cast<unsigned int>(rank_tiles));
+                if (use_half2) {
+                    latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
+                        reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
+                        reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else if (use_float_workspace) {
+                    latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_summary_persistent_kernel<scalar_t, scalar_t><<<persistent_grid, block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             }
             if (use_half2) {
                 latent_prefix_scan_dispatch<scalar_t, float>(
@@ -2380,7 +2513,33 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     chunk_prev,
                     final_state);
             }
-            if (!use_half2 && !use_float_workspace) {
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_finalize_kernel<scalar_t, float, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_prev.data_ptr<float>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        prior_states.data_ptr<scalar_t>(),
+                        nullptr);
+                } else {
+                    latent_chunk_finalize_kernel<scalar_t, scalar_t, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        drive.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_prev.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        prior_states.data_ptr<scalar_t>(),
+                        nullptr);
+                }
+            } else if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
                     drive.data_ptr<scalar_t>(),
@@ -2535,64 +2694,98 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
             const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::Backward, states, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const bool use_nonpersistent_chunk_kernels = num_chunks <= latent_nonpersistent_chunk_max_num_chunks();
             const int total_chunk_tasks = batch_size * num_chunks;
-            const int worker_blocks = use_half2
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel_half2<true>,
-                    states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : use_float_workspace
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true>,
-                    states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true>,
-                    states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads);
-            auto work_queue_counter = get_or_create_latent_work_queue_counter(states);
-            const dim3 persistent_grid(
-                static_cast<unsigned int>(worker_blocks),
-                static_cast<unsigned int>(rank_tiles));
-            if (use_half2) {
-                latent_chunk_backward_summary_persistent_kernel_half2<true><<<persistent_grid, block, 0, stream>>>(
-                    reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
-                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
-                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
-            } else if (use_float_workspace) {
-                latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true><<<persistent_grid, block, 0, stream>>>(
-                    grad_states.data_ptr<scalar_t>(),
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
+            const int chunk_launch_threads = latent_launch_threads(rank_dim);
+            const dim3 chunk_block(static_cast<unsigned int>(chunk_launch_threads));
+            const int chunk_rank_tiles = static_cast<int>((rank_dim + chunk_launch_threads - 1) / chunk_launch_threads);
+            torch::Tensor work_queue_counter;
+            dim3 persistent_grid{};
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_backward_summary_kernel<scalar_t, float, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_backward_summary_kernel<scalar_t, scalar_t, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             } else {
-                latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
-                    grad_states.data_ptr<scalar_t>(),
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<scalar_t>(),
-                    chunk_add.data_ptr<scalar_t>());
+                const int worker_blocks = use_half2
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel_half2<true>,
+                        states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : use_float_workspace
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true>,
+                        states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true>,
+                        states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads);
+                work_queue_counter = get_or_create_latent_work_queue_counter(states);
+                persistent_grid = dim3(
+                    static_cast<unsigned int>(worker_blocks),
+                    static_cast<unsigned int>(rank_tiles));
+                if (use_half2) {
+                    latent_chunk_backward_summary_persistent_kernel_half2<true><<<persistent_grid, block, 0, stream>>>(
+                        reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
+                        reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                        reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else if (use_float_workspace) {
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true><<<persistent_grid, block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             }
             if (use_half2) {
                 latent_reverse_prefix_scan_dispatch<scalar_t, float>(
@@ -2625,7 +2818,43 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     stream,
                     chunk_carry);
             }
-            if (!use_half2 && !use_float_workspace) {
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_backward_finalize_kernel<scalar_t, float, true, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        states.data_ptr<scalar_t>(),
+                        nullptr,
+                        initial_state.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_carry.data_ptr<float>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        grad_drive.data_ptr<scalar_t>(),
+                        grad_decay.data_ptr<float>(),
+                        grad_initial_state.data_ptr<scalar_t>());
+                } else {
+                    latent_chunk_backward_finalize_kernel<scalar_t, scalar_t, true, true><<<chunk_grid, chunk_block, 0, stream>>>(
+                        grad_states.data_ptr<scalar_t>(),
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        states.data_ptr<scalar_t>(),
+                        nullptr,
+                        initial_state.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_carry.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        grad_drive.data_ptr<scalar_t>(),
+                        grad_decay.data_ptr<float>(),
+                        grad_initial_state.data_ptr<scalar_t>());
+                }
+            } else if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, true, true><<<persistent_grid, block, 0, stream>>>(
                     grad_states.data_ptr<scalar_t>(),
@@ -2792,64 +3021,98 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
             const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : prior_states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::BackwardPrior, prior_states, batch_size, num_chunks, rank_dim, workspace_dtype);
+            const bool use_nonpersistent_chunk_kernels = num_chunks <= latent_nonpersistent_chunk_max_num_chunks();
             const int total_chunk_tasks = batch_size * num_chunks;
-            const int worker_blocks = use_half2
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel_half2<false>,
-                    prior_states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : use_float_workspace
-                ? occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false>,
-                    prior_states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads)
-                : occupancy_persistent_worker_blocks(
-                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false>,
-                    prior_states.get_device(),
-                    total_chunk_tasks,
-                    launch_threads);
-            auto work_queue_counter = get_or_create_latent_work_queue_counter(prior_states);
-            const dim3 persistent_grid(
-                static_cast<unsigned int>(worker_blocks),
-                static_cast<unsigned int>(rank_tiles));
-            if (use_half2) {
-                latent_chunk_backward_summary_persistent_kernel_half2<false><<<persistent_grid, block, 0, stream>>>(
-                    nullptr,
-                    reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
-                    reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
-            } else if (use_float_workspace) {
-                latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false><<<persistent_grid, block, 0, stream>>>(
-                    nullptr,
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<float>(),
-                    chunk_add.data_ptr<float>());
+            const int chunk_launch_threads = latent_launch_threads(rank_dim);
+            const dim3 chunk_block(static_cast<unsigned int>(chunk_launch_threads));
+            const int chunk_rank_tiles = static_cast<int>((rank_dim + chunk_launch_threads - 1) / chunk_launch_threads);
+            torch::Tensor work_queue_counter;
+            dim3 persistent_grid{};
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_backward_summary_kernel<scalar_t, float, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_backward_summary_kernel<scalar_t, scalar_t, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             } else {
-                latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
-                    nullptr,
-                    grad_prior_states.data_ptr<scalar_t>(),
-                    decay.data_ptr<scalar_t>(),
-                    seq_len,
-                    rank_dim,
-                    num_chunks,
-                    total_chunk_tasks,
-                    work_queue_counter.data_ptr<int32_t>(),
-                    chunk_mul.data_ptr<scalar_t>(),
-                    chunk_add.data_ptr<scalar_t>());
+                const int worker_blocks = use_half2
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel_half2<false>,
+                        prior_states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : use_float_workspace
+                    ? occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false>,
+                        prior_states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads)
+                    : occupancy_persistent_worker_blocks(
+                        latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false>,
+                        prior_states.get_device(),
+                        total_chunk_tasks,
+                        launch_threads);
+                work_queue_counter = get_or_create_latent_work_queue_counter(prior_states);
+                persistent_grid = dim3(
+                    static_cast<unsigned int>(worker_blocks),
+                    static_cast<unsigned int>(rank_tiles));
+                if (use_half2) {
+                    latent_chunk_backward_summary_persistent_kernel_half2<false><<<persistent_grid, block, 0, stream>>>(
+                        nullptr,
+                        reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
+                        reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else if (use_float_workspace) {
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false><<<persistent_grid, block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<float>(),
+                        chunk_add.data_ptr<float>());
+                } else {
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        total_chunk_tasks,
+                        work_queue_counter.data_ptr<int32_t>(),
+                        chunk_mul.data_ptr<scalar_t>(),
+                        chunk_add.data_ptr<scalar_t>());
+                }
             }
             if (use_half2) {
                 latent_reverse_prefix_scan_dispatch<scalar_t, float>(
@@ -2882,7 +3145,43 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     stream,
                     chunk_carry);
             }
-            if (!use_half2 && !use_float_workspace) {
+            if (use_nonpersistent_chunk_kernels) {
+                const dim3 chunk_grid(
+                    static_cast<unsigned int>(batch_size),
+                    static_cast<unsigned int>(num_chunks),
+                    static_cast<unsigned int>(chunk_rank_tiles));
+                if (use_float_workspace) {
+                    latent_chunk_backward_finalize_kernel<scalar_t, float, false, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        nullptr,
+                        prior_states.data_ptr<scalar_t>(),
+                        initial_state.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_carry.data_ptr<float>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        grad_drive.data_ptr<scalar_t>(),
+                        grad_decay.data_ptr<float>(),
+                        grad_initial_state.data_ptr<scalar_t>());
+                } else {
+                    latent_chunk_backward_finalize_kernel<scalar_t, scalar_t, false, false><<<chunk_grid, chunk_block, 0, stream>>>(
+                        nullptr,
+                        grad_prior_states.data_ptr<scalar_t>(),
+                        nullptr,
+                        prior_states.data_ptr<scalar_t>(),
+                        initial_state.data_ptr<scalar_t>(),
+                        decay.data_ptr<scalar_t>(),
+                        chunk_carry.data_ptr<scalar_t>(),
+                        seq_len,
+                        rank_dim,
+                        num_chunks,
+                        grad_drive.data_ptr<scalar_t>(),
+                        grad_decay.data_ptr<float>(),
+                        grad_initial_state.data_ptr<scalar_t>());
+                }
+            } else if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, false, false><<<persistent_grid, block, 0, stream>>>(
                     nullptr,

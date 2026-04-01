@@ -11005,6 +11005,9 @@ class DistributedTokenLoader:
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self.prefetch_depth = max(int(os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH", "2")), 1)
         self._prefetched_batches: deque[dict[str, object]] = deque()
+        self._pinned_token_buffer_ring_size = max(self.prefetch_depth + 1, 2)
+        self._pinned_token_buffers: dict[tuple[tuple[int, ...], torch.dtype], list[Tensor]] = {}
+        self._pinned_token_buffer_next: dict[tuple[tuple[int, ...], torch.dtype], int] = {}
         batch_prep_workers = _resolve_loader_worker_count("TOKEN_LOADER_BATCH_PREP_WORKERS")
         self._batch_prep_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=batch_prep_workers)
         self._prepared_batches: deque[tuple[str, tuple[int, int, int], Future[dict[str, object]]]] = deque()
@@ -11094,7 +11097,7 @@ class DistributedTokenLoader:
         assert isinstance(seq_len, int)
         assert isinstance(packed, bool)
 
-        token_span_host = torch.empty_like(token_span_cpu, pin_memory=True)
+        token_span_host = self._acquire_pinned_token_buffer(token_span_cpu)
         token_span_host.copy_(token_span_cpu)
 
         if self.prefetch_stream is None:
@@ -11117,6 +11120,20 @@ class DistributedTokenLoader:
             "loss_mask": loss_mask_dev,
             "batch_info": prepared["batch_info"],
         }
+
+    def _acquire_pinned_token_buffer(self, token_span_cpu: Tensor) -> Tensor:
+        key = (tuple(int(v) for v in token_span_cpu.shape), token_span_cpu.dtype)
+        buffers = self._pinned_token_buffers.get(key)
+        if buffers is None:
+            buffers = [
+                torch.empty_like(token_span_cpu, pin_memory=True)
+                for _ in range(self._pinned_token_buffer_ring_size)
+            ]
+            self._pinned_token_buffers[key] = buffers
+            self._pinned_token_buffer_next[key] = 0
+        next_idx = self._pinned_token_buffer_next[key]
+        self._pinned_token_buffer_next[key] = (next_idx + 1) % len(buffers)
+        return buffers[next_idx]
 
     def _clear_prefetch_pipeline(self) -> None:
         self._prefetched_batches.clear()
@@ -15586,6 +15603,7 @@ def main() -> None:
         not muon_optimizers or (muon_graph_capture_ready and not muon_graph_capture_forced_off)
     )
     graph_step_optimizers = list(optimizers) if graph_full_step_supported else [opt for opt in optimizers if not isinstance(opt, Muon)]
+    partial_cuda_graph_supported = bool(args.use_cuda_graphs)
 
     def _prepare_graphable_optimizers() -> None:
         if not graph_full_step_supported:
@@ -15620,26 +15638,37 @@ def main() -> None:
 
     _prepare_graphable_optimizers()
     if not args.use_cuda_graphs:
+        cuda_graph_capture_mode = "disabled"
         cuda_graph_disable_reason = "disabled"
+    elif graph_full_step_supported:
+        cuda_graph_capture_mode = "full_step"
+        cuda_graph_disable_reason = "eligible_full_step"
     elif distributed:
-        cuda_graph_disable_reason = "distributed_full_step_unsupported"
+        cuda_graph_capture_mode = "partial_step"
+        cuda_graph_disable_reason = "partial:distributed_full_step_unsupported"
     elif muon_graph_capture_forced_off:
-        cuda_graph_disable_reason = "muon_full_step_forced_off"
+        cuda_graph_capture_mode = "partial_step"
+        cuda_graph_disable_reason = "partial:muon_full_step_forced_off"
     elif muon_graph_capture_forced_on and not muon_graph_capture_ready:
         muon_reasons = sorted({opt.graph_capture_disable_reason() for opt in muon_optimizers if opt.graph_capture_disable_reason()})
         suffix = f":{','.join(muon_reasons)}" if muon_reasons else ""
-        cuda_graph_disable_reason = f"muon_full_step_forced_on_but_unsupported{suffix}"
+        cuda_graph_capture_mode = "partial_step"
+        cuda_graph_disable_reason = f"partial:muon_full_step_forced_on_but_unsupported{suffix}"
     elif muon_optimizers and not muon_graph_capture_ready:
         muon_reasons = sorted({opt.graph_capture_disable_reason() for opt in muon_optimizers if opt.graph_capture_disable_reason()})
         suffix = f":{','.join(muon_reasons)}" if muon_reasons else ""
-        cuda_graph_disable_reason = f"muon_full_step_unsupported{suffix}"
+        cuda_graph_capture_mode = "partial_step"
+        cuda_graph_disable_reason = f"partial:muon_full_step_unsupported{suffix}"
     else:
-        cuda_graph_disable_reason = "eligible"
-    cuda_graph_eligible = cuda_graph_disable_reason == "eligible"
+        cuda_graph_capture_mode = "partial_step"
+        cuda_graph_disable_reason = "partial:full_step_unavailable"
+    cuda_graph_eligible = partial_cuda_graph_supported and cuda_graph_capture_mode != "disabled"
     log0(
         f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
         f"muon_cuda_graph_mode:{args.muon_cuda_graph_mode} "
-        f"cuda_graph_full_step:{int(graph_full_step_supported and args.use_cuda_graphs)} "
+        f"cuda_graph_mode:{cuda_graph_capture_mode} "
+        f"cuda_graph_full_step:{int(cuda_graph_capture_mode == 'full_step')} "
+        f"cuda_graph_partial_step:{int(cuda_graph_capture_mode == 'partial_step')} "
         f"cuda_graph_reason:{cuda_graph_disable_reason}"
     )
 
@@ -15726,11 +15755,12 @@ def main() -> None:
     current_train_step = 0
     mid_aux_health_cap = 1.0
     active_mid_aux_loss_coeff = float(args.mid_aux_loss_coeff)
-    def compute_training_loss(
-        x: Tensor,
-        y: Tensor,
-        loss_mask: Tensor | None,
-    ) -> Tensor:
+    current_mid_aux_coeff_t = torch.zeros((), device=device, dtype=torch.float32)
+
+    def refresh_training_step_buffers(step: int) -> None:
+        nonlocal current_train_step
+        current_train_step = int(step)
+        base_model.set_training_step(current_train_step)
         mid_aux_sched = 1.0
         if args.mid_aux_ramp_steps > 0:
             mid_aux_sched = min(
@@ -15749,9 +15779,14 @@ def main() -> None:
                 )
                 mid_aux_sched *= max(1.0 - decay_progress, 0.0)
         current_mid_aux_coeff = active_mid_aux_loss_coeff * mid_aux_sched * mid_aux_health_cap
-        current_mid_aux_coeff_t = torch.tensor(current_mid_aux_coeff, device=x.device, dtype=torch.float32)
+        current_mid_aux_coeff_t.fill_(float(current_mid_aux_coeff))
+
+    def compute_training_loss(
+        x: Tensor,
+        y: Tensor,
+        loss_mask: Tensor | None,
+    ) -> Tensor:
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            base_model.set_training_step(current_train_step)
             loss = model(
                 x,
                 y,
@@ -15773,6 +15808,7 @@ def main() -> None:
         sample_batches: Sequence[tuple[Tensor, Tensor, Tensor | None]],
         *,
         ema_active: bool,
+        captures_full_step: bool,
     ) -> dict[str, object]:
         if not sample_batches:
             raise ValueError("build_train_cuda_graph requires at least one microbatch")
@@ -15808,15 +15844,16 @@ def main() -> None:
                 (captured_loss * grad_scale).backward()
             total_loss.div_(float(len(static_batches)))
             static_loss.copy_(total_loss)
-            if args.grad_clip_norm > 0:
+            if captures_full_step and args.grad_clip_norm > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
                 static_grad_norm.copy_(grad_norm.detach().to(dtype=static_grad_norm.dtype))
-            for opt in graph_step_optimizers:
-                opt.step()
-            if ema_active and ema_state is not None:
-                update_ema_state(ema_state, base_model, args.ema_decay)
-            for opt in graph_step_optimizers:
-                opt.zero_grad(set_to_none=False)
+            if captures_full_step:
+                for opt in graph_step_optimizers:
+                    opt.step()
+                if ema_active and ema_state is not None:
+                    update_ema_state(ema_state, base_model, args.ema_decay)
+                for opt in graph_step_optimizers:
+                    opt.zero_grad(set_to_none=False)
         graph_runtime.capture_count += 1
         return {
             "graph": graph,
@@ -15824,8 +15861,8 @@ def main() -> None:
             "static_loss": static_loss,
             "static_grad_norm": static_grad_norm,
             "graph_runtime": graph_runtime,
-            "ema_active": bool(ema_active),
-            "captures_full_step": True,
+            "ema_active": bool(ema_active) if captures_full_step else False,
+            "captures_full_step": bool(captures_full_step),
             "num_microbatches": int(len(static_batches)),
         }
 
@@ -15842,9 +15879,8 @@ def main() -> None:
         warmed_prior_state: dict[str, Tensor] = {}
         model.train()
         base_model.set_fake_quant(0)
-        base_model.set_training_step(0)
         for warmup_step in range(args.warmup_steps):
-            current_train_step = warmup_step
+            refresh_training_step_buffers(warmup_step)
             warmup_scale = lr_mul(warmup_step, 0.0)
             apply_optimizer_schedule(warmup_step, warmup_scale)
             zero_grad_all()
@@ -15893,7 +15929,7 @@ def main() -> None:
         base_model.load_state_dict(restored_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
-        current_train_step = 0
+        refresh_training_step_buffers(0)
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
@@ -15927,7 +15963,6 @@ def main() -> None:
     cuda_graph_runner: dict[str, object] | None = None
     cuda_graph_runner_fake_quant_bits: int | None = None
     cuda_graph_retry_step = max(args.cuda_graph_warmup_steps, 0)
-    graph_captures_grad_clip = args.grad_clip_norm > 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     optimizer_step_time_ms_total = 0.0
@@ -15940,6 +15975,68 @@ def main() -> None:
     sanitized_grad_events_total = 0
     sanitized_grad_values_total = 0
     last_validation_time_ms = 0.0
+
+    def finalize_training_step_after_backward(step: int, *, ema_active: bool, keep_graph_grad_buffers: bool) -> None:
+        nonlocal optimizer_step_time_ms_total
+        nonlocal muon_step_time_ms_total
+        nonlocal muon_cuda_time_ms_total
+        nonlocal muon_fallback_time_ms_total
+        nonlocal muon_cuda_tensor_count_total
+        nonlocal muon_fallback_tensor_count_total
+        nonlocal muon_cuda_failure_count_total
+        nonlocal sanitized_grad_events_total
+        nonlocal sanitized_grad_values_total
+        nonlocal ema_state_updated
+
+        if args.grad_sanitize_clamp_abs > 0:
+            sanitized_tensors, sanitized_values = _sanitize_gradients_(base_model, args.grad_sanitize_clamp_abs)
+            if sanitized_tensors > 0:
+                sanitized_grad_events_total += sanitized_tensors
+                sanitized_grad_values_total += sanitized_values
+                log0(
+                    f"grad_sanitized step:{step} tensors:{sanitized_tensors} "
+                    f"values:{sanitized_values} clamp_abs:{float(args.grad_sanitize_clamp_abs):.1f}"
+                )
+        if args.grad_clip_norm > 0:
+            grad_norm = _stable_clip_grad_norm_noncapturable_(base_model, args.grad_clip_norm)
+            if not torch.isfinite(grad_norm.detach()):
+                first_bad_grad = _first_nonfinite_grad_info(base_model)
+                if first_bad_grad is not None:
+                    bad_name, bad_group = first_bad_grad
+                    raise RuntimeError(
+                        f"non-finite gradient norm detected at step {step}: "
+                        f"{bad_name} group:{bad_group}"
+                    )
+                largest_grad = _largest_grad_abs_info(base_model)
+                if largest_grad is not None:
+                    bad_name, bad_group, bad_abs = largest_grad
+                    raise RuntimeError(
+                        f"non-finite gradient norm detected at step {step}: "
+                        f"largest_finite_grad {bad_name} group:{bad_group} max_abs:{bad_abs:.4e}"
+                    )
+                raise RuntimeError(f"non-finite gradient norm detected at step {step}")
+        optimizer_step_started_at = time.perf_counter()
+        for opt in optimizers:
+            opt.step()
+        first_bad_param = _first_nonfinite_param_name(base_model)
+        if first_bad_param is not None:
+            raise RuntimeError(f"non-finite parameter detected after optimizer step {step}: {first_bad_param}")
+        optimizer_step_time_ms_total += (time.perf_counter() - optimizer_step_started_at) * 1000.0
+        if PROFILE_MUON_STEP:
+            for opt in muon_optimizers:
+                stats = getattr(opt, "last_step_stats", None)
+                if not isinstance(stats, dict):
+                    continue
+                muon_step_time_ms_total += float(stats.get("total_ms", 0.0))
+                muon_cuda_time_ms_total += float(stats.get("cuda_ms", 0.0))
+                muon_fallback_time_ms_total += float(stats.get("fallback_ms", 0.0))
+                muon_cuda_tensor_count_total += int(stats.get("cuda_tensor_count", 0))
+                muon_fallback_tensor_count_total += int(stats.get("fallback_tensor_count", 0))
+                muon_cuda_failure_count_total += int(stats.get("cuda_failure_count", 0))
+        zero_grad_all(set_to_none=not keep_graph_grad_buffers)
+        if ema_active:
+            update_ema_state(ema_state, base_model, args.ema_decay)  # type: ignore[arg-type]
+            ema_state_updated = True
 
     step = 0
     while True:
@@ -16028,7 +16125,7 @@ def main() -> None:
         if last_step:
             break
 
-        current_train_step = step
+        refresh_training_step_buffers(step)
         elapsed_ms = end_to_end_wallclock_ms()
         scale = lr_mul(step, elapsed_ms)
         fake_quant_bits = args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms, scale) else 0
@@ -16048,20 +16145,30 @@ def main() -> None:
         used_cuda_graph = False
         train_loss = torch.zeros((), device=device)
         ema_active = ema_state is not None and step + 1 >= args.ema_start_step
+        captures_full_step = cuda_graph_capture_mode == "full_step"
         graph_runner_invalid = (
             cuda_graph_runner is None
-            or bool(cuda_graph_runner.get("ema_active", False)) != bool(ema_active)
+            or bool(cuda_graph_runner.get("captures_full_step", False)) != bool(captures_full_step)
+            or (
+                captures_full_step
+                and bool(cuda_graph_runner.get("ema_active", False)) != bool(ema_active)
+            )
             or int(cuda_graph_runner.get("num_microbatches", 0)) != len(step_batches)
         )
         if graph_step_active:
             if graph_runner_invalid:
                 try:
-                    cuda_graph_runner = build_train_cuda_graph(step_batches, ema_active=ema_active)
+                    cuda_graph_runner = build_train_cuda_graph(
+                        step_batches,
+                        ema_active=ema_active,
+                        captures_full_step=captures_full_step,
+                    )
                     cuda_graph_runner_fake_quant_bits = fake_quant_bits
                     cuda_graph_retry_step = step
                     used_cuda_graph = True
                     train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-                    ema_state_updated = ema_state_updated or ema_active
+                    if captures_full_step:
+                        ema_state_updated = ema_state_updated or ema_active
                 except Exception as exc:
                     cuda_graph_disable_reason = f"capture_failed:{type(exc).__name__}"
                     cuda_graph_retry_step = step + max(args.val_loss_every, 16, 1)
@@ -16078,7 +16185,8 @@ def main() -> None:
                 cuda_graph_runner["graph"].replay()
                 used_cuda_graph = True
                 train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-                ema_state_updated = ema_state_updated or ema_active
+                if captures_full_step:
+                    ema_state_updated = ema_state_updated or ema_active
 
         if not used_cuda_graph:
             zero_grad_all(set_to_none=True)
@@ -16091,57 +16199,9 @@ def main() -> None:
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
             train_loss /= grad_accum_steps
-
-            if args.grad_sanitize_clamp_abs > 0:
-                sanitized_tensors, sanitized_values = _sanitize_gradients_(base_model, args.grad_sanitize_clamp_abs)
-                if sanitized_tensors > 0:
-                    sanitized_grad_events_total += sanitized_tensors
-                    sanitized_grad_values_total += sanitized_values
-                    log0(
-                        f"grad_sanitized step:{step} tensors:{sanitized_tensors} "
-                        f"values:{sanitized_values} clamp_abs:{float(args.grad_sanitize_clamp_abs):.1f}"
-                    )
-            if args.grad_clip_norm > 0:
-                grad_norm = _stable_clip_grad_norm_noncapturable_(base_model, args.grad_clip_norm)
-                if not torch.isfinite(grad_norm.detach()):
-                    first_bad_grad = _first_nonfinite_grad_info(base_model)
-                    if first_bad_grad is not None:
-                        bad_name, bad_group = first_bad_grad
-                        raise RuntimeError(
-                            f"non-finite gradient norm detected at step {step}: "
-                            f"{bad_name} group:{bad_group}"
-                        )
-                    largest_grad = _largest_grad_abs_info(base_model)
-                    if largest_grad is not None:
-                        bad_name, bad_group, bad_abs = largest_grad
-                        raise RuntimeError(
-                            f"non-finite gradient norm detected at step {step}: "
-                            f"largest_finite_grad {bad_name} group:{bad_group} max_abs:{bad_abs:.4e}"
-                        )
-                    raise RuntimeError(f"non-finite gradient norm detected at step {step}")
-            optimizer_step_started_at = time.perf_counter()
-            for opt in optimizers:
-                opt.step()
-            first_bad_param = _first_nonfinite_param_name(base_model)
-            if first_bad_param is not None:
-                raise RuntimeError(f"non-finite parameter detected after optimizer step {step}: {first_bad_param}")
-            optimizer_step_time_ms = (time.perf_counter() - optimizer_step_started_at) * 1000.0
-            optimizer_step_time_ms_total += optimizer_step_time_ms
-            if PROFILE_MUON_STEP:
-                for opt in muon_optimizers:
-                    stats = getattr(opt, "last_step_stats", None)
-                    if not isinstance(stats, dict):
-                        continue
-                    muon_step_time_ms_total += float(stats.get("total_ms", 0.0))
-                    muon_cuda_time_ms_total += float(stats.get("cuda_ms", 0.0))
-                    muon_fallback_time_ms_total += float(stats.get("fallback_ms", 0.0))
-                    muon_cuda_tensor_count_total += int(stats.get("cuda_tensor_count", 0))
-                    muon_fallback_tensor_count_total += int(stats.get("fallback_tensor_count", 0))
-                    muon_cuda_failure_count_total += int(stats.get("cuda_failure_count", 0))
-            zero_grad_all(set_to_none=True)
-            if ema_active:
-                update_ema_state(ema_state, base_model, args.ema_decay)  # type: ignore[arg-type]
-                ema_state_updated = True
+            finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=False)
+        elif not captures_full_step:
+            finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=True)
 
         train_loss_value = float(train_loss.item())
 
