@@ -15590,6 +15590,9 @@ def main() -> None:
 
     def zero_grad_all(set_to_none: bool = True) -> None:
         for opt in optimizers:
+            if isinstance(opt, Muon) and set_to_none:
+                opt.zero_grad(set_to_none=False)
+                continue
             opt.zero_grad(set_to_none=set_to_none)
 
     muon_graph_capture_ready = (
