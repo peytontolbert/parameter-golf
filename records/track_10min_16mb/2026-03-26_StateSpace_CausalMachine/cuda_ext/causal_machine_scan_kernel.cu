@@ -337,6 +337,12 @@ bool can_use_direct_grad_reduce(int device_index, int num_states, int transition
     if (transition_rank <= 0 || transition_rank > num_states) {
         return false;
     }
+    // The direct in-kernel reduction path has proven numerically fragile for the
+    // smallest structured ranks used in competition training. Keep the generic
+    // kernels, but force those shapes onto the per-batch accumulation path.
+    if (transition_rank <= 16) {
+        return false;
+    }
     const int max_optin_bytes = cached_max_optin_bytes(device_index);
     return backward_chunk_shared_bytes(num_states, transition_rank, true) <= static_cast<size_t>(max_optin_bytes);
 }
@@ -1425,13 +1431,13 @@ int64_t tiled_backward_launch_worker_blocks(
     return std::max<int64_t>(1, std::min<int64_t>(staging_worker_blocks, launch_blocks));
 }
 
-int64_t small_state_direct_staging_worker_blocks(
-    int device_index,
+int64_t internal_small_state_direct_staging_worker_blocks(
+    int64_t device_index,
     int64_t total_batches) {
     return std::max<int64_t>(
         1,
         static_cast<int64_t>(persistent_worker_blocks(
-            device_index,
+            static_cast<int>(device_index),
             static_cast<int>(total_batches))));
 }
 
@@ -15307,6 +15313,12 @@ void launch_backward_chunk_fp8(
 
 }  // namespace
 
+int64_t small_state_direct_staging_worker_blocks(
+    int64_t device_index,
+    int64_t batch_size) {
+    return internal_small_state_direct_staging_worker_blocks(device_index, batch_size);
+}
+
 int64_t causal_machine_scan_single_launch_max_seq_len_cuda() {
     return scan_single_launch_max_seq_len();
 }
@@ -19301,78 +19313,35 @@ std::vector<torch::Tensor> causal_machine_scan_backward_workspace_cuda(
             [&] {
                 switch (transition_rank) {
                     case 8:
-                        if (beliefs.size(2) == 128) {
-                            if (direct_small_rank_grad) {
-                                launch_backward_chunk_dense_128_rank8<scalar_t, true>(
-                                    grad_beliefs,
-                                    carry,
-                                    transition_source_probs,
-                                    transition_dest_probs,
-                                    transition_context,
-                                    initial_log_belief,
-                                    beliefs,
-                                    transition_gate,
-                                    transition_stay_probs,
-                                    score_clamp_min,
-                                    score_clamp_max,
-                                    0,
-                                    scheduler.launch_chunk_size,
-                                    grad_local_logits,
-                                    grad_transition_source_per_batch,
-                                    grad_transition_dest_per_batch,
-                                    grad_transition_context,
-                                    grad_initial_log_belief,
-                                    grad_transition_gate_per_batch,
-                                    grad_transition_stay_per_batch);
-                            } else {
-                                launch_backward_chunk_dense_128_rank8<scalar_t>(
-                                    grad_beliefs,
-                                    carry,
-                                    transition_source_probs,
-                                    transition_dest_probs,
-                                    transition_context,
-                                    initial_log_belief,
-                                    beliefs,
-                                    transition_gate,
-                                    transition_stay_probs,
-                                    score_clamp_min,
-                                    score_clamp_max,
-                                    0,
-                                    scheduler.launch_chunk_size,
-                                    grad_local_logits,
-                                    grad_transition_source_per_batch,
-                                    grad_transition_dest_per_batch,
-                                    grad_transition_context,
-                                    grad_initial_log_belief,
-                                    grad_transition_gate_per_batch,
-                                    grad_transition_stay_per_batch);
-                            }
-                        } else {
-                            launch_backward_chunk<scalar_t, 8, true>(
-                                grad_beliefs,
-                                carry,
-                                transition_source_probs,
-                                transition_dest_probs,
-                                transition_context,
-                                initial_log_belief,
-                                beliefs,
-                                transition_gate,
-                                transition_stay_probs,
-                                score_clamp_min,
-                                score_clamp_max,
-                                0,
-                                scheduler.launch_chunk_size,
-                                grad_local_logits,
-                                grad_transition_source_per_batch,
-                                grad_transition_dest_per_batch,
-                                grad_transition_context,
-                                grad_initial_log_belief,
-                                grad_transition_gate_per_batch,
-                                grad_transition_stay_per_batch);
-                        }
+                        // Keep rank-8 backward on the generic kernel, but avoid
+                        // the direct shared-memory reduction path. That reduction
+                        // mode is the remaining unstable path on the competition
+                        // 128-state configuration after the dedicated dense fast
+                        // kernel is bypassed.
+                        launch_backward_chunk<scalar_t, 8, false>(
+                            grad_beliefs,
+                            carry,
+                            transition_source_probs,
+                            transition_dest_probs,
+                            transition_context,
+                            initial_log_belief,
+                            beliefs,
+                            transition_gate,
+                            transition_stay_probs,
+                            score_clamp_min,
+                            score_clamp_max,
+                            0,
+                            scheduler.launch_chunk_size,
+                            grad_local_logits,
+                            grad_transition_source_per_batch,
+                            grad_transition_dest_per_batch,
+                            grad_transition_context,
+                            grad_initial_log_belief,
+                            grad_transition_gate_per_batch,
+                            grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_chunk<scalar_t, 16, true>(
+                        launch_backward_chunk<scalar_t, 16, false>(
                             grad_beliefs,
                             carry,
                             transition_source_probs,
@@ -19831,14 +19800,14 @@ std::vector<torch::Tensor> causal_machine_scan_backward_composable_cuda(
             [&] {
                 switch (transition_rank) {
                     case 8:
-                        launch_backward_composable_chunk<scalar_t, 8, true>(
+                        launch_backward_composable_chunk<scalar_t, 8, false>(
                             grad_beliefs, carry, transition_source_probs, transition_dest_probs, transition_context,
                             initial_log_belief, beliefs, transition_stay_probs, 0, scheduler.launch_chunk_size,
                             grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
                             grad_transition_context, grad_initial_log_belief, grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_composable_chunk<scalar_t, 16, true>(
+                        launch_backward_composable_chunk<scalar_t, 16, false>(
                             grad_beliefs, carry, transition_source_probs, transition_dest_probs, transition_context,
                             initial_log_belief, beliefs, transition_stay_probs, 0, scheduler.launch_chunk_size,
                             grad_local_logits, grad_transition_source_per_batch, grad_transition_dest_per_batch,
@@ -20218,7 +20187,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
             [&] {
                 switch (transition_rank) {
                     case 8:
-                        launch_backward_chunk_quantized<scalar_t, 8, true>(
+                        launch_backward_chunk_quantized<scalar_t, 8, false>(
                             grad_beliefs, carry, transition_source_q, transition_source_scales, transition_dest_q,
                             transition_dest_scales, transition_context, initial_log_belief, beliefs, transition_gate,
                             transition_stay_probs, 0, scheduler.launch_chunk_size, grad_local_logits, grad_transition_source_per_batch,
@@ -20226,7 +20195,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
                             grad_transition_gate_per_batch, grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_chunk_quantized<scalar_t, 16, true>(
+                        launch_backward_chunk_quantized<scalar_t, 16, false>(
                             grad_beliefs, carry, transition_source_q, transition_source_scales, transition_dest_q,
                             transition_dest_scales, transition_context, initial_log_belief, beliefs, transition_gate,
                             transition_stay_probs, 0, scheduler.launch_chunk_size, grad_local_logits, grad_transition_source_per_batch,
@@ -20378,7 +20347,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
             ([&] {
                 switch (transition_rank) {
                     case 8:
-                        launch_backward_chunk_fp8<Format, scalar_t, 8, true>(
+                        launch_backward_chunk_fp8<Format, scalar_t, 8, false>(
                             grad_beliefs, carry, transition_source_packed, transition_source_scales, transition_dest_packed,
                             transition_dest_scales, transition_context, initial_log_belief, beliefs, transition_gate,
                             transition_stay_probs, 0, scheduler.launch_chunk_size, grad_local_logits, grad_transition_source_per_batch,
@@ -20386,7 +20355,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
                             grad_transition_gate_per_batch, grad_transition_stay_per_batch);
                         break;
                     case 16:
-                        launch_backward_chunk_fp8<Format, scalar_t, 16, true>(
+                        launch_backward_chunk_fp8<Format, scalar_t, 16, false>(
                             grad_beliefs, carry, transition_source_packed, transition_source_scales, transition_dest_packed,
                             transition_dest_scales, transition_context, initial_log_belief, beliefs, transition_gate,
                             transition_stay_probs, 0, scheduler.launch_chunk_size, grad_local_logits, grad_transition_source_per_batch,

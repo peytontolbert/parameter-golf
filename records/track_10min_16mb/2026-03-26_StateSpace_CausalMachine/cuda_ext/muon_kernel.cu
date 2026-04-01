@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +55,81 @@ inline void check_cublaslt_status(cublasStatus_t status, const char* op_name) {
     TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, op_name, " failed with cuBLAS Lt status ", static_cast<int>(status));
 }
 
+template <typename scalar_t>
+constexpr cudaDataType_t muon_cuda_data_type();
+
+template <>
+constexpr cudaDataType_t muon_cuda_data_type<float>() {
+    return CUDA_R_32F;
+}
+
+template <>
+constexpr cudaDataType_t muon_cuda_data_type<at::BFloat16>() {
+    return CUDA_R_16BF;
+}
+
+template <typename scalar_t>
+constexpr cublasComputeType_t muon_cublas_compute_type() {
+#ifdef CUBLAS_COMPUTE_32F_PEDANTIC
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        return CUBLAS_COMPUTE_32F_PEDANTIC;
+    }
+#endif
+    return CUBLAS_COMPUTE_32F;
+}
+
+template <typename scalar_t>
+constexpr cublasGemmAlgo_t muon_cublas_gemm_algo() {
+    if constexpr (std::is_same_v<scalar_t, float>) {
+        return CUBLAS_GEMM_DEFAULT;
+    }
+    return CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+}
+
+int get_cuda_device_index(const torch::Tensor& tensor, const char* op_name, const char* tensor_name) {
+    TORCH_CHECK(tensor.is_cuda(), op_name, " expects CUDA ", tensor_name);
+    return tensor.get_device();
+}
+
+void check_cuda_device(
+    const torch::Tensor& tensor,
+    int device_index,
+    const char* op_name,
+    const char* tensor_name) {
+    TORCH_CHECK(tensor.is_cuda(), op_name, " expects CUDA ", tensor_name);
+    TORCH_CHECK(
+        tensor.get_device() == device_index,
+        op_name,
+        " expects ",
+        tensor_name,
+        " on cuda:",
+        device_index,
+        " but found cuda:",
+        tensor.get_device());
+}
+
+void check_cuda_device(
+    const std::vector<torch::Tensor>& tensors,
+    int device_index,
+    const char* op_name,
+    const char* tensor_name) {
+    for (size_t idx = 0; idx < tensors.size(); ++idx) {
+        const auto& tensor = tensors[idx];
+        TORCH_CHECK(tensor.is_cuda(), op_name, " expects CUDA ", tensor_name);
+        TORCH_CHECK(
+            tensor.get_device() == device_index,
+            op_name,
+            " expects ",
+            tensor_name,
+            " on cuda:",
+            device_index,
+            " but found cuda:",
+            tensor.get_device(),
+            " at index ",
+            idx);
+    }
+}
+
 constexpr size_t kDefaultMuonCublasLtWorkspaceBytes = 32 * 1024 * 1024;
 
 size_t muon_cublaslt_workspace_bytes() {
@@ -79,6 +155,7 @@ bool muon_can_use_cublaslt_square(const torch::Tensor& x) {
     if (x.size(1) != x.size(2) || x.size(1) <= 0) {
         return false;
     }
+    c10::cuda::CUDAGuard device_guard(x.device());
     const auto* props = at::cuda::getCurrentDeviceProperties();
     return props != nullptr && props->major >= 8;
 }
@@ -120,10 +197,11 @@ MuonSquareBackend select_muon_square_backend(const torch::Tensor& x) {
     }
     const int64_t batch = x.size(0);
     const int64_t dim = x.size(1);
-    // The competition square buckets are typically 640x640 with bucket_size ~= 12.
-    // Prefer the hybrid path there: cuBLAS for Gram products, cuBLASLt for fused update GEMMs.
+    // Large square bf16 buckets still benefit from cuBLASLt on H100, but keep the
+    // default auto policy conservative. The hybrid path remains available as an
+    // explicit opt-in via MUON_SQUARE_BACKEND=hybrid.
     if (dim >= 512 && dim % 64 == 0 && batch >= 8) {
-        return MuonSquareBackend::kHybrid;
+        return MuonSquareBackend::kCublasLt;
     }
     if (dim >= 256 && dim % 32 == 0 && batch >= 4) {
         return MuonSquareBackend::kCublasLt;
@@ -157,8 +235,9 @@ struct MuonLtSquarePlan {
     cublasLtMatmulPreference_t preference = nullptr;
     cublasLtMatmulAlgo_t tn_algo{};
     cublasLtMatmulAlgo_t nn_algo{};
-    torch::Tensor workspace;
     size_t workspace_bytes = 0;
+    std::mutex workspace_mutex;
+    std::unordered_map<uintptr_t, torch::Tensor> workspaces;
 
     ~MuonLtSquarePlan() {
         if (preference != nullptr) {
@@ -281,12 +360,6 @@ std::shared_ptr<MuonLtSquarePlan> get_muon_cublaslt_square_plan(int device_index
     TORCH_CHECK(returned_results > 0, "cublasLtMatmulAlgoGetHeuristic(nn) returned no algorithms");
     plan->nn_algo = heuristic.algo;
 
-    if (plan->workspace_bytes > 0) {
-        plan->workspace = torch::empty(
-            {static_cast<int64_t>(plan->workspace_bytes)},
-            torch::TensorOptions().device(torch::kCUDA, device_index).dtype(torch::kUInt8));
-    }
-
     std::lock_guard<std::mutex> guard(cache_mutex);
     auto [it, inserted] = cache.emplace(key, plan);
     return inserted ? plan : it->second;
@@ -302,12 +375,29 @@ void muon_cublaslt_square_matmul(
     TORCH_CHECK(a.scalar_type() == torch::kBFloat16, "muon_cublaslt_square_matmul expects bf16 inputs");
     TORCH_CHECK(b.scalar_type() == torch::kBFloat16, "muon_cublaslt_square_matmul expects bf16 inputs");
     TORCH_CHECK(out.scalar_type() == torch::kBFloat16, "muon_cublaslt_square_matmul expects bf16 outputs");
-    const int device_index = a.get_device();
+    const int device_index = get_cuda_device_index(a, "muon_cublaslt_square_matmul", "a");
+    check_cuda_device(b, device_index, "muon_cublaslt_square_matmul", "b");
+    check_cuda_device(out, device_index, "muon_cublaslt_square_matmul", "out");
+    c10::cuda::CUDAGuard device_guard(device_index);
+    const auto stream = at::cuda::getCurrentCUDAStream();
     auto plan = get_muon_cublaslt_square_plan(device_index, a.size(0), a.size(1));
     auto handle = at::cuda::getCurrentCUDABlasLtHandle();
     const cublasLtMatmulDesc_t desc = transpose_a ? plan->tn_desc : plan->nn_desc;
     const cublasLtMatmulAlgo_t* algo = transpose_a ? &plan->tn_algo : &plan->nn_algo;
-    void* workspace_ptr = plan->workspace.defined() ? plan->workspace.data_ptr() : nullptr;
+    torch::Tensor workspace;
+    void* workspace_ptr = nullptr;
+    if (plan->workspace_bytes > 0) {
+        const uintptr_t stream_key = reinterpret_cast<uintptr_t>(stream.stream());
+        std::lock_guard<std::mutex> guard(plan->workspace_mutex);
+        auto& stream_workspace = plan->workspaces[stream_key];
+        if (!stream_workspace.defined()) {
+            stream_workspace = torch::empty(
+                {static_cast<int64_t>(plan->workspace_bytes)},
+                torch::TensorOptions().device(torch::kCUDA, device_index).dtype(torch::kUInt8));
+        }
+        workspace = stream_workspace;
+        workspace_ptr = workspace.data_ptr();
+    }
     check_cublaslt_status(
         cublasLtMatmul(
             handle,
@@ -325,7 +415,7 @@ void muon_cublaslt_square_matmul(
             algo,
             workspace_ptr,
             plan->workspace_bytes,
-            at::cuda::getCurrentCUDAStream()),
+            stream),
         "cublasLtMatmul");
 }
 
@@ -505,6 +595,10 @@ void gather_same_shape_tensor_batch(
     torch::Tensor dst) {
     const auto bucket_size = static_cast<int64_t>(tensors.size());
     TORCH_CHECK(bucket_size > 0, "gather_same_shape_tensor_batch requires non-empty tensors");
+    const int device_index = get_cuda_device_index(tensors.front(), "gather_same_shape_tensor_batch", "tensors");
+    check_cuda_device(tensors, device_index, "gather_same_shape_tensor_batch", "tensors");
+    check_cuda_device(dst, device_index, "gather_same_shape_tensor_batch", "dst");
+    c10::cuda::CUDAGuard device_guard(device_index);
     const int64_t rows = tensors.front().size(0);
     const int64_t cols = tensors.front().size(1);
     auto ptrs = make_device_pointer_tensor(tensors);
@@ -537,6 +631,11 @@ void fused_prepare_muon_batch(
     int64_t family_code) {
     const auto bucket_size = static_cast<int64_t>(grads.size());
     TORCH_CHECK(bucket_size > 0, "fused_prepare_muon_batch requires non-empty grads");
+    const int device_index = get_cuda_device_index(grads.front(), "fused_prepare_muon_batch", "grads");
+    check_cuda_device(grads, device_index, "fused_prepare_muon_batch", "grads");
+    check_cuda_device(momentum_batch, device_index, "fused_prepare_muon_batch", "momentum_batch");
+    check_cuda_device(effective_batch, device_index, "fused_prepare_muon_batch", "effective_batch");
+    c10::cuda::CUDAGuard device_guard(device_index);
     TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch expects float momentum_batch");
     TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch expects float effective_batch");
     const int64_t rows = grads.front().size(0);
@@ -576,6 +675,13 @@ void fused_prepare_muon_batch_capturable(
     int64_t family_code) {
     const auto bucket_size = static_cast<int64_t>(grads.size());
     TORCH_CHECK(bucket_size > 0, "fused_prepare_muon_batch_capturable requires non-empty grads");
+    const int device_index = get_cuda_device_index(grads.front(), "fused_prepare_muon_batch_capturable", "grads");
+    check_cuda_device(grads, device_index, "fused_prepare_muon_batch_capturable", "grads");
+    check_cuda_device(grad_ptrs, device_index, "fused_prepare_muon_batch_capturable", "grad_ptrs");
+    check_cuda_device(momentum_batch, device_index, "fused_prepare_muon_batch_capturable", "momentum_batch");
+    check_cuda_device(effective_batch, device_index, "fused_prepare_muon_batch_capturable", "effective_batch");
+    check_cuda_device(momentum, device_index, "fused_prepare_muon_batch_capturable", "momentum");
+    c10::cuda::CUDAGuard device_guard(device_index);
     TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch_capturable expects float momentum_batch");
     TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "fused_prepare_muon_batch_capturable expects float effective_batch");
     TORCH_CHECK(momentum.is_cuda(), "fused_prepare_muon_batch_capturable expects CUDA momentum tensor");
@@ -612,6 +718,10 @@ void normalize_effective_batch(
     torch::Tensor ns_input_batch,
     double eps,
     int64_t family_code) {
+    const int device_index = get_cuda_device_index(effective_batch, "normalize_effective_batch", "effective_batch");
+    check_cuda_device(norms, device_index, "normalize_effective_batch", "norms");
+    check_cuda_device(ns_input_batch, device_index, "normalize_effective_batch", "ns_input_batch");
+    c10::cuda::CUDAGuard device_guard(device_index);
     const int64_t bucket_size = effective_batch.size(0);
     const int64_t rows = effective_batch.size(1);
     const int64_t cols = effective_batch.size(2);
@@ -655,6 +765,10 @@ void apply_projected_updates(
     int64_t family_code) {
     const auto bucket_size = static_cast<int64_t>(params.size());
     TORCH_CHECK(bucket_size > 0, "apply_projected_updates requires non-empty params");
+    const int device_index = get_cuda_device_index(params.front(), "apply_projected_updates", "params");
+    check_cuda_device(params, device_index, "apply_projected_updates", "params");
+    check_cuda_device(projected_batch, device_index, "apply_projected_updates", "projected_batch");
+    c10::cuda::CUDAGuard device_guard(device_index);
     const int64_t rows = params.front().size(0);
     const int64_t cols = params.front().size(1);
     auto ptrs = make_device_pointer_tensor(params);
@@ -705,6 +819,13 @@ void apply_projected_updates_capturable(
     int64_t family_code) {
     const auto bucket_size = static_cast<int64_t>(params.size());
     TORCH_CHECK(bucket_size > 0, "apply_projected_updates_capturable requires non-empty params");
+    const int device_index = get_cuda_device_index(params.front(), "apply_projected_updates_capturable", "params");
+    check_cuda_device(params, device_index, "apply_projected_updates_capturable", "params");
+    check_cuda_device(param_ptrs, device_index, "apply_projected_updates_capturable", "param_ptrs");
+    check_cuda_device(projected_batch, device_index, "apply_projected_updates_capturable", "projected_batch");
+    check_cuda_device(lr, device_index, "apply_projected_updates_capturable", "lr");
+    check_cuda_device(weight_decay, device_index, "apply_projected_updates_capturable", "weight_decay");
+    c10::cuda::CUDAGuard device_guard(device_index);
     TORCH_CHECK(lr.is_cuda(), "apply_projected_updates_capturable expects CUDA lr tensor");
     TORCH_CHECK(weight_decay.is_cuda(), "apply_projected_updates_capturable expects CUDA weight_decay tensor");
     TORCH_CHECK(lr.scalar_type() == torch::kFloat, "apply_projected_updates_capturable expects float32 lr tensor");
@@ -747,12 +868,18 @@ void apply_projected_updates_capturable(
     AT_CUDA_CHECK(cudaGetLastError());
 }
 
-void batched_newton_schulz_workspace(
+template <typename scalar_t>
+void batched_newton_schulz_workspace_impl(
     torch::Tensor x,
     torch::Tensor gram,
     torch::Tensor gram_sq,
     torch::Tensor next_x,
     int64_t steps) {
+    const int device_index = get_cuda_device_index(x, "batched_newton_schulz_workspace", "x");
+    check_cuda_device(gram, device_index, "batched_newton_schulz_workspace", "gram");
+    check_cuda_device(gram_sq, device_index, "batched_newton_schulz_workspace", "gram_sq");
+    check_cuda_device(next_x, device_index, "batched_newton_schulz_workspace", "next_x");
+    c10::cuda::CUDAGuard device_guard(device_index);
     constexpr double a = 3.4445;
     constexpr double b = -4.7750;
     constexpr double c = 2.0315;
@@ -761,25 +888,32 @@ void batched_newton_schulz_workspace(
     const int64_t cols = x.size(2);
     const int64_t x_stride = rows * cols;
     const int64_t gram_stride = rows * rows;
-    auto* gram_ptr = gram.data_ptr<at::BFloat16>();
-    auto* gram_sq_ptr = gram_sq.data_ptr<at::BFloat16>();
+    auto* gram_ptr = gram.data_ptr<scalar_t>();
+    auto* gram_sq_ptr = gram_sq.data_ptr<scalar_t>();
     const float one = 1.0f;
     const float zero = 0.0f;
     const float a_f = static_cast<float>(a);
     const float b_f = static_cast<float>(b);
     const float c_f = static_cast<float>(c);
+    constexpr cudaDataType_t cuda_dtype = muon_cuda_data_type<scalar_t>();
+    constexpr cublasComputeType_t compute_type = muon_cublas_compute_type<scalar_t>();
+    constexpr cublasGemmAlgo_t gemm_algo = muon_cublas_gemm_algo<scalar_t>();
     auto handle = at::cuda::getCurrentCUDABlasHandle();
-    const MuonSquareBackend square_backend = select_muon_square_backend(x);
+    const bool supports_bf16_square_fast_path = std::is_same_v<scalar_t, at::BFloat16>;
+    const MuonSquareBackend square_backend = supports_bf16_square_fast_path
+        ? select_muon_square_backend(x)
+        : MuonSquareBackend::kCublas;
     const bool use_cublaslt_square_gram =
-        square_backend == MuonSquareBackend::kCublasLt;
+        supports_bf16_square_fast_path && square_backend == MuonSquareBackend::kCublasLt;
     const bool use_cublaslt_square_update =
-        square_backend == MuonSquareBackend::kCublasLt || square_backend == MuonSquareBackend::kHybrid;
+        supports_bf16_square_fast_path
+        && (square_backend == MuonSquareBackend::kCublasLt || square_backend == MuonSquareBackend::kHybrid);
     torch::Tensor current = x;
     torch::Tensor scratch = next_x;
 
     for (int64_t step = 0; step < steps; ++step) {
-        auto* current_ptr = current.data_ptr<at::BFloat16>();
-        auto* scratch_ptr = scratch.data_ptr<at::BFloat16>();
+        auto* current_ptr = current.data_ptr<scalar_t>();
+        auto* scratch_ptr = scratch.data_ptr<scalar_t>();
         if (use_cublaslt_square_gram) {
             muon_cublaslt_square_matmul(current, current, gram, /*transpose_a=*/true, one, zero);
         } else {
@@ -793,21 +927,21 @@ void batched_newton_schulz_workspace(
                     static_cast<int>(cols),
                     &one,
                     current_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     current_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     &zero,
                     gram_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     static_cast<int>(batch),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    compute_type,
+                    gemm_algo),
                 "cublasGemmStridedBatchedEx(xxt)");
         }
         if (use_cublaslt_square_gram) {
@@ -823,21 +957,21 @@ void batched_newton_schulz_workspace(
                     static_cast<int>(rows),
                     &one,
                     gram_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     gram_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     &zero,
                     gram_sq_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     static_cast<int>(batch),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    compute_type,
+                    gemm_algo),
                 "cublasGemmStridedBatchedEx(gram_sq)");
         }
         scratch.copy_(current);
@@ -855,21 +989,21 @@ void batched_newton_schulz_workspace(
                     static_cast<int>(rows),
                     &b_f,
                     current_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     gram_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     &a_f,
                     scratch_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     static_cast<int>(batch),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    compute_type,
+                    gemm_algo),
                 "cublasGemmStridedBatchedEx(update1)");
             check_cublas_status(
                 cublasGemmStridedBatchedEx(
@@ -881,21 +1015,21 @@ void batched_newton_schulz_workspace(
                     static_cast<int>(rows),
                     &c_f,
                     current_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     gram_sq_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(rows),
                     static_cast<long long>(gram_stride),
                     &one,
                     scratch_ptr,
-                    CUDA_R_16BF,
+                    cuda_dtype,
                     static_cast<int>(cols),
                     static_cast<long long>(x_stride),
                     static_cast<int>(batch),
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    compute_type,
+                    gemm_algo),
                 "cublasGemmStridedBatchedEx(update2)");
         }
         std::swap(current, scratch);
@@ -905,14 +1039,34 @@ void batched_newton_schulz_workspace(
     }
 }
 
+void batched_newton_schulz_workspace(
+    torch::Tensor x,
+    torch::Tensor gram,
+    torch::Tensor gram_sq,
+    torch::Tensor next_x,
+    int64_t steps) {
+    TORCH_CHECK(
+        x.scalar_type() == torch::kFloat || x.scalar_type() == torch::kBFloat16,
+        "batched_newton_schulz_workspace expects float32 or bf16 x");
+    TORCH_CHECK(gram.scalar_type() == x.scalar_type(), "gram dtype must match x");
+    TORCH_CHECK(gram_sq.scalar_type() == x.scalar_type(), "gram_sq dtype must match x");
+    TORCH_CHECK(next_x.scalar_type() == x.scalar_type(), "next_x dtype must match x");
+    if (x.scalar_type() == torch::kFloat) {
+        batched_newton_schulz_workspace_impl<float>(std::move(x), std::move(gram), std::move(gram_sq), std::move(next_x), steps);
+        return;
+    }
+    batched_newton_schulz_workspace_impl<at::BFloat16>(std::move(x), std::move(gram), std::move(gram_sq), std::move(next_x), steps);
+}
+
 torch::Tensor batched_newton_schulz(
     const torch::Tensor& input,
     int64_t steps,
     double eps) {
     const bool transposed = input.size(1) > input.size(2);
-    auto x = transposed ? input.transpose(1, 2).contiguous().to(torch::kBFloat16) : input.to(torch::kBFloat16);
+    const auto work_dtype = input.scalar_type() == torch::kFloat ? torch::kFloat : torch::kBFloat16;
+    auto x = transposed ? input.transpose(1, 2).contiguous().to(work_dtype) : input.to(work_dtype);
     auto norms = input.to(torch::kFloat).flatten(1).norm(2, 1, true).clamp_min(eps).view({input.size(0), 1, 1});
-    x.div_(norms.to(torch::kBFloat16));
+    x.div_(norms.to(work_dtype));
     auto gram = torch::empty({x.size(0), x.size(1), x.size(1)}, x.options());
     auto gram_sq = torch::empty_like(gram);
     auto next_x = torch::empty_like(x);

@@ -1697,13 +1697,11 @@ py::dict causal_machine_scan_describe_device_runtime_config(int64_t device_index
 
 void check_same_cuda_device(const torch::Tensor& tensor, const torch::Tensor& reference, const char* name);
 
-namespace {
-
 torch::Tensor make_cuda_workspace_tensor(
     int64_t device_index,
     at::ScalarType dtype,
     at::IntArrayRef sizes,
-    bool zero_init = false) {
+    bool zero_init) {
     auto options = torch::TensorOptions().device(torch::kCUDA, device_index).dtype(dtype);
     return zero_init ? torch::zeros(sizes, options) : torch::empty(sizes, options);
 }
@@ -1839,14 +1837,18 @@ py::dict causal_machine_scan_describe_workspace_config(
             split_size,
             batch_size,
             device_index);
+        const int64_t persistent_blocks = runtime["persistent_blocks"].cast<int64_t>();
         const int64_t staging_worker_blocks = runtime["backward_staging_worker_blocks"].cast<int64_t>();
+        info["persistent_blocks"] = persistent_blocks;
         info["staging_worker_blocks"] = staging_worker_blocks;
+        info["filtered_value_cache_shape"] = std::vector<int64_t>{persistent_blocks, num_states};
         info["latent_cache_staging_shape"] = std::vector<int64_t>{staging_worker_blocks, transition_rank};
         info["grad_latent_accum_staging_shape"] = std::vector<int64_t>{staging_worker_blocks, transition_rank};
         info["grad_transition_source_probs_staging_shape"] = std::vector<int64_t>{staging_worker_blocks, num_states, transition_rank};
         info["grad_transition_dest_probs_staging_shape"] = std::vector<int64_t>{staging_worker_blocks, transition_rank, num_states};
         info["grad_transition_gate_staging_shape"] = std::vector<int64_t>{staging_worker_blocks};
         info["grad_transition_stay_staging_shape"] = std::vector<int64_t>{staging_worker_blocks, num_states};
+        total_bytes += persistent_blocks * num_states * static_cast<int64_t>(sizeof(float));
         total_bytes += staging_worker_blocks * transition_rank * static_cast<int64_t>(sizeof(float));
         total_bytes += staging_worker_blocks * transition_rank * static_cast<int64_t>(sizeof(float));
         total_bytes += staging_worker_blocks * num_states * transition_rank * static_cast<int64_t>(sizeof(float));
@@ -1862,8 +1864,10 @@ py::dict causal_machine_scan_describe_workspace_config(
         const int64_t persistent_blocks = runtime["persistent_blocks"].cast<int64_t>();
         info["persistent_blocks"] = persistent_blocks;
         info["masked_transition_tile_cache_shape"] = std::vector<int64_t>{persistent_blocks, num_states, tile_size};
+        info["filtered_value_cache_shape"] = std::vector<int64_t>{persistent_blocks, num_states};
         info["row_sums_shape"] = std::vector<int64_t>{num_states};
         total_bytes += persistent_blocks * num_states * tile_size * static_cast<int64_t>(sizeof(float));
+        total_bytes += persistent_blocks * num_states * static_cast<int64_t>(sizeof(float));
         total_bytes += num_states * static_cast<int64_t>(sizeof(float));
     }
 
@@ -1914,6 +1918,10 @@ py::dict causal_machine_scan_create_workspace(
             torch::kFloat32,
             info["row_sums_shape"].cast<std::vector<int64_t>>());
     } else if (normalized_mode == "tiled_backward") {
+        workspace["filtered_value_cache"] = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            info["filtered_value_cache_shape"].cast<std::vector<int64_t>>());
         workspace["latent_cache_staging"] = make_cuda_workspace_tensor(
             device_index, torch::kFloat32, info["latent_cache_staging_shape"].cast<std::vector<int64_t>>());
         workspace["grad_latent_accum_staging"] = make_cuda_workspace_tensor(
@@ -1931,6 +1939,10 @@ py::dict causal_machine_scan_create_workspace(
             device_index,
             torch::kFloat32,
             info["masked_transition_tile_cache_shape"].cast<std::vector<int64_t>>());
+        workspace["filtered_value_cache"] = make_cuda_workspace_tensor(
+            device_index,
+            torch::kFloat32,
+            info["filtered_value_cache_shape"].cast<std::vector<int64_t>>());
         workspace["row_sums"] = make_cuda_workspace_tensor(
             device_index,
             torch::kFloat32,
@@ -1939,8 +1951,6 @@ py::dict causal_machine_scan_create_workspace(
     workspace["config"] = info;
     return workspace;
 }
-
-}  // namespace
 
 torch::Tensor pad_first_dim(const torch::Tensor& tensor, int64_t target_size, double fill_value) {
     if (tensor.size(0) == target_size) {

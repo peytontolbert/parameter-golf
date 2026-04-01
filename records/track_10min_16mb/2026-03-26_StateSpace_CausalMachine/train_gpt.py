@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+import warnings
 import zlib
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -80,9 +81,12 @@ DEFAULT_CAUSAL_MACHINE_ONLINE_TEACHER_EMA = 0.95
 DEFAULT_VOCAB_SIZE = 1024
 USE_CAUSAL_MACHINE_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUDA_SCAN", "1")))
 USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN", "1")))
+ALLOW_CAUSAL_MACHINE_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_CUDA_TRAINING", "1")))
+ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING", "1")))
 USE_MUON_CUDA = bool(int(os.environ.get("USE_MUON_CUDA", "1")))
 PROFILE_MUON_STEP = bool(int(os.environ.get("PROFILE_MUON_STEP", "0")))
 MUON_CUDA_BUCKET_POLICY = os.environ.get("MUON_CUDA_BUCKET_POLICY", "auto").strip().lower()
+MUON_CUDA_ERROR_MODE = os.environ.get("MUON_CUDA_ERROR_MODE", "warn").strip().lower()
 # Historical env name retained for compatibility. This gates the prepacked
 # transition-table fast path, which now runs dedicated int8 / FP8 CUDA kernels
 # instead of dequantizing back to the float path.
@@ -100,6 +104,11 @@ _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
 _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR: Exception | None = None
 _MUON_CUDA = None
 _MUON_CUDA_ERROR: Exception | None = None
+_MUON_CUDA_WARNED_FAILURE_KEYS: set[str] = set()
+
+
+def _allow_cuda_training_kernels(allow_training: bool) -> bool:
+    return (not torch.is_grad_enabled()) or bool(allow_training)
 
 
 def _torch_dynamo_disable_if_available(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -109,7 +118,11 @@ def _torch_dynamo_disable_if_available(fn: Callable[..., Any]) -> Callable[..., 
     disable = getattr(dynamo, "disable", None)
     if disable is None:
         return fn
-    return disable(fn)
+    wrapped = disable(fn)
+    for attr in ("cache_clear", "cache_info", "cache_parameters"):
+        if hasattr(fn, attr):
+            setattr(wrapped, attr, getattr(fn, attr))
+    return wrapped
 
 
 def _parse_cuda_arch_list(raw: str) -> list[str]:
@@ -322,6 +335,9 @@ def _load_causal_machine_latent_scan_cuda_extension(source_dir: Path, build_dir:
 
 
 def _load_muon_cuda_extension(source_dir: Path, build_dir: Path):
+    extra_cuda_cflags = ["-O3", "-std=c++17", *_causal_machine_cuda_arch_flags()]
+    if bool(int(os.environ.get("MUON_CUDA_USE_FAST_MATH", "0"))):
+        extra_cuda_cflags.insert(1, "--use_fast_math")
     return load_cpp_extension(
         name="muon_cuda_ext",
         sources=[
@@ -329,7 +345,7 @@ def _load_muon_cuda_extension(source_dir: Path, build_dir: Path):
             str(source_dir / "muon_kernel.cu"),
         ],
         extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17", *_causal_machine_cuda_arch_flags()],
+        extra_cuda_cflags=extra_cuda_cflags,
         extra_ldflags=["-lcublasLt"],
         build_directory=str(build_dir),
         verbose=False,
@@ -4182,6 +4198,11 @@ def get_or_update_scan_transition_prepack(
     packed_kind = _structured_scan_packed_kind()
     low_precision_recipe = _default_structured_scan_low_precision_recipe()
     gradients_enabled = torch.is_grad_enabled()
+    # Training-time structured scan should stay on the fused CUDA path, but the
+    # packed low-precision transition tables are materially less stable than the
+    # full-precision fused kernel. Keep packing for eval/inference only.
+    if gradients_enabled:
+        return None
     source_version = int(getattr(source_logits, "_version", -1))
     dest_version = int(getattr(dest_logits, "_version", -1))
     if (
@@ -4657,6 +4678,7 @@ def structured_scan_fallback(
     use_masked_cuda_tiled_backend = (
         backend == "cuda_tiled"
         and USE_CAUSAL_MACHINE_CUDA_SCAN
+        and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
         and local_logits.is_cuda
         and (runtime_config is None or runtime_config.allow_cuda)
         and not track_transition_kl
@@ -4695,6 +4717,7 @@ def structured_scan_fallback(
     use_cuda_tiled_backend = (
         backend == "cuda_tiled"
         and USE_CAUSAL_MACHINE_CUDA_SCAN
+        and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
         and local_logits.is_cuda
         and (runtime_config is None or runtime_config.allow_cuda)
         and not track_transition_kl
@@ -7130,6 +7153,11 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "matrix_lr": 0.0623,
     "other_matrix_lr_mult": 0.5,
     "scalar_lr": 0.035,
+    "state_space_scalar_lr": 0.006,
+    "state_space_beta2": 0.98,
+    "state_space_matrix_weight_decay": 0.01,
+    "early_state_space_matrix_lr_scale": 0.35,
+    "early_state_space_scalar_lr_scale": 0.50,
     "tied_embed_lr": 0.004,
     "force_fp16_tied_embed_export": True,
     "shared_tail_output_gate": False,
@@ -7528,9 +7556,15 @@ class Hyperparameters:
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["tied_embed_lr"]))))
-    tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    tied_embed_warmup_mult = float(os.environ.get("TIED_EMBED_WARMUP_MULT", "0.3"))
-    tied_embed_warmup_steps = int(os.environ.get("TIED_EMBED_WARMUP_STEPS", "40"))
+    tied_embed_init_std = float(
+        os.environ.get("TIED_EMBED_INIT_STD", str(float(LOCAL_PROXY_PRESET_COMMON["tied_embed_init_std"])))
+    )
+    tied_embed_warmup_mult = float(
+        os.environ.get("TIED_EMBED_WARMUP_MULT", str(float(LOCAL_PROXY_PRESET_COMMON["tied_embed_warmup_mult"])))
+    )
+    tied_embed_warmup_steps = int(
+        os.environ.get("TIED_EMBED_WARMUP_STEPS", str(int(LOCAL_PROXY_PRESET_COMMON["tied_embed_warmup_steps"])))
+    )
     token_weight_decay = float(os.environ.get("TOKEN_WEIGHT_DECAY", str(float(LOCAL_PROXY_RECIPE_COMMON["token_weight_decay"]))))
     matrix_lr = float(os.environ.get("MATRIX_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["matrix_lr"]))))
     mlp_matrix_lr_mult = float(os.environ.get("MLP_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["mlp_matrix_lr_mult"]))))
@@ -7538,6 +7572,27 @@ class Hyperparameters:
         os.environ.get("OTHER_MATRIX_LR_MULT", str(float(LOCAL_PROXY_RECIPE_COMMON["other_matrix_lr_mult"])))
     )
     scalar_lr = float(os.environ.get("SCALAR_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["scalar_lr"]))))
+    state_space_matrix_lr = float(
+        os.environ.get(
+            "STATE_SPACE_MATRIX_LR",
+            str(
+                float(LOCAL_PROXY_RECIPE_COMMON["matrix_lr"])
+                * float(LOCAL_PROXY_RECIPE_COMMON["other_matrix_lr_mult"])
+            ),
+        )
+    )
+    state_space_scalar_lr = float(
+        os.environ.get("STATE_SPACE_SCALAR_LR", str(float(LOCAL_PROXY_RECIPE_COMMON["state_space_scalar_lr"])))
+    )
+    state_space_beta2 = float(
+        os.environ.get("STATE_SPACE_BETA2", str(float(LOCAL_PROXY_RECIPE_COMMON["state_space_beta2"])))
+    )
+    state_space_matrix_weight_decay = float(
+        os.environ.get(
+            "STATE_SPACE_MATRIX_WEIGHT_DECAY",
+            str(float(LOCAL_PROXY_RECIPE_COMMON["state_space_matrix_weight_decay"])),
+        )
+    )
     use_muon = bool(int(os.environ.get("USE_MUON", "1")))
     muon_cuda_graph_mode = os.environ.get("MUON_CUDA_GRAPH_MODE", "auto").strip().lower()
     head_weight_decay = float(os.environ.get("HEAD_WEIGHT_DECAY", str(float(LOCAL_PROXY_RECIPE_COMMON["head_weight_decay"]))))
@@ -7552,11 +7607,14 @@ class Hyperparameters:
     early_muon_attn_lr_scale = float(os.environ.get("EARLY_MUON_ATTN_LR_SCALE", "1.0"))
     early_muon_mlp_lr_scale = float(os.environ.get("EARLY_MUON_MLP_LR_SCALE", "1.0"))
     early_muon_other_lr_scale = float(os.environ.get("EARLY_MUON_OTHER_LR_SCALE", "1.0"))
+    early_state_space_matrix_lr_scale = float(os.environ.get("EARLY_STATE_SPACE_MATRIX_LR_SCALE", "1.0"))
+    early_state_space_scalar_lr_scale = float(os.environ.get("EARLY_STATE_SPACE_SCALAR_LR_SCALE", "1.0"))
     early_muon_wd_scale = float(os.environ.get("EARLY_MUON_WD_SCALE", "1.0"))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.25))
+    grad_sanitize_clamp_abs = float(os.environ.get("GRAD_SANITIZE_CLAMP_ABS", "0.0"))
 
     def __init__(self):
         if self.muon_cuda_graph_mode not in {"auto", "on", "off"}:
@@ -7589,6 +7647,10 @@ class Hyperparameters:
             "matrix_lr": "MATRIX_LR",
             "other_matrix_lr_mult": "OTHER_MATRIX_LR_MULT",
             "scalar_lr": "SCALAR_LR",
+            "state_space_matrix_lr": "STATE_SPACE_MATRIX_LR",
+            "state_space_scalar_lr": "STATE_SPACE_SCALAR_LR",
+            "state_space_beta2": "STATE_SPACE_BETA2",
+            "state_space_matrix_weight_decay": "STATE_SPACE_MATRIX_WEIGHT_DECAY",
             "use_muon": "USE_MUON",
             "muon_cuda_graph_mode": "MUON_CUDA_GRAPH_MODE",
             "muon_momentum": "MUON_MOMENTUM",
@@ -7600,9 +7662,12 @@ class Hyperparameters:
             "early_muon_attn_lr_scale": "EARLY_MUON_ATTN_LR_SCALE",
             "early_muon_mlp_lr_scale": "EARLY_MUON_MLP_LR_SCALE",
             "early_muon_other_lr_scale": "EARLY_MUON_OTHER_LR_SCALE",
+            "early_state_space_matrix_lr_scale": "EARLY_STATE_SPACE_MATRIX_LR_SCALE",
+            "early_state_space_scalar_lr_scale": "EARLY_STATE_SPACE_SCALAR_LR_SCALE",
             "early_muon_wd_scale": "EARLY_MUON_WD_SCALE",
             "warmdown_iters": "WARMDOWN_ITERS",
             "grad_clip_norm": "GRAD_CLIP_NORM",
+            "grad_sanitize_clamp_abs": "GRAD_SANITIZE_CLAMP_ABS",
             "muon_weight_decay": "MUON_WEIGHT_DECAY",
             "mid_aux_loss_coeff": "MID_AUX_LOSS_COEFF",
             "mid_aux_enable_step": "MID_AUX_ENABLE_STEP",
@@ -7722,10 +7787,15 @@ class Hyperparameters:
                 "muon_momentum": 0.96,
                 "muon_momentum_warmup_start": 0.80,
                 "muon_momentum_warmup_steps": 250,
-                "muon_weight_decay": 0.03,
+                "muon_weight_decay": 0.02,
                 "other_matrix_lr_mult": 0.5,
-                "early_phase_steps": 600,
-                "early_muon_other_lr_scale": 0.5,
+                "early_phase_steps": 1200,
+                "early_muon_attn_lr_scale": 0.35,
+                "early_muon_mlp_lr_scale": 0.45,
+                "early_muon_other_lr_scale": 0.35,
+                "early_state_space_matrix_lr_scale": 0.35,
+                "early_state_space_scalar_lr_scale": 0.50,
+                "early_muon_wd_scale": 0.5,
             },
             "graph_first": {
                 "use_muon": False,
@@ -7773,11 +7843,14 @@ class Hyperparameters:
         if self.training_preset not in preset_aliases:
             valid = ", ".join(sorted(preset_aliases))
             raise ValueError(f"Unknown TRAINING_PRESET={self.training_preset!r}; expected one of: {valid}")
-        # Explicit schema env vars win over legacy preset aliases.
+        # Explicit env vars win over preset aliases, but raw class defaults should
+        # not block the preset from applying.
+        env_overrides = self._env_override_map()
         for attr, value in preset_aliases[self.training_preset].items():
-            env_name = attr.upper()
-            if env_name not in os.environ and not getattr(self, attr):
-                setattr(self, attr, value)
+            env_name = env_overrides.get(attr, attr.upper())
+            if env_name in os.environ:
+                continue
+            setattr(self, attr, value)
         self._apply_policy_schema()
 
     def _resolve_attention_config(self) -> None:
@@ -7829,15 +7902,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps
+    work_dtype = torch.float32 if G.dtype == torch.float32 else torch.bfloat16
+    X = G.to(dtype=work_dtype)
+    X /= G.float().norm().to(dtype=work_dtype) + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
+    disable_tf32 = work_dtype == torch.float32 and X.is_cuda and torch.backends.cuda.matmul.allow_tf32
+    prev_allow_tf32 = torch.backends.cuda.matmul.allow_tf32 if disable_tf32 else None
+    if disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for _ in range(steps):
+            A = X @ X.T
+            B = b * A + c * A @ A
+            X = a * X + B @ X
+    finally:
+        if prev_allow_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = prev_allow_tf32
     return X.T if transposed else X
 
 
@@ -7856,7 +7938,7 @@ def _muon_python_step_param(
         p.mul_(1.0 - lr * weight_decay)
     buf = state.get("momentum_buffer")
     if buf is None:
-        buf = torch.zeros_like(g)
+        buf = torch.zeros_like(g, dtype=torch.float32 if g.dtype != torch.float32 else g.dtype)
         state["momentum_buffer"] = buf
     buf.mul_(momentum).add_(g)
     effective_g = g.add(buf, alpha=momentum) if nesterov else buf
@@ -7917,6 +7999,40 @@ def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
     return 3
 
 
+def _muon_family_workspace_dtype(shape: tuple[int, int], family_code: int) -> torch.dtype:
+    raw = os.environ.get("MUON_FAMILY_WORKSPACE_DTYPE", "auto").strip().lower()
+    if raw in {"float", "float32", "fp32"}:
+        return torch.float32
+    if raw in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if raw not in {"", "auto"}:
+        raise ValueError(
+            "MUON_FAMILY_WORKSPACE_DTYPE must be one of auto, float32, or bfloat16; "
+            f"got {raw!r}"
+        )
+    # Keep the full family workspace path on fp32 NS state by default. The
+    # fused prepare/apply kernels remain active, but the actual Newton-Schulz
+    # recurrence now keeps a uniform high-precision state across square and
+    # rectangular buckets alike. bf16 remains available as an explicit opt-in.
+    return torch.float32
+
+
+def _handle_muon_cuda_failure(stage: str, exc: Exception) -> None:
+    mode = MUON_CUDA_ERROR_MODE if MUON_CUDA_ERROR_MODE in {"fallback", "warn", "raise"} else "warn"
+    if mode == "raise":
+        raise RuntimeError(f"Muon CUDA failure during {stage}") from exc
+    if mode == "fallback":
+        return
+    message = (
+        f"Muon CUDA failure during {stage}; falling back to Python Muon. "
+        f"Set MUON_CUDA_ERROR_MODE=raise to hard-fail. Original error: {exc!r}"
+    )
+    if message in _MUON_CUDA_WARNED_FAILURE_KEYS:
+        return
+    _MUON_CUDA_WARNED_FAILURE_KEYS.add(message)
+    warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+
 def _make_cuda_pointer_tensor(tensors: list[Tensor], device: torch.device) -> Tensor:
     ptrs_cpu = torch.tensor([int(t.data_ptr()) for t in tensors], dtype=torch.int64, device="cpu")
     return ptrs_cpu.to(device=device, dtype=torch.int64, non_blocking=False)
@@ -7929,6 +8045,134 @@ def _muon_square_backend_name(code: int) -> str:
         3: "hybrid",
     }
     return mapping.get(int(code), "cublas")
+
+
+def _is_standard_attention_muon_matrix_name(name: str) -> bool:
+    # Restrict Muon to the standard self-attention projections. State-space
+    # mixer matrices live under ".attn." too, but they behave more like
+    # structured transition/output heads than vanilla attention weights.
+    return name.endswith((".attn.c_q.weight", ".attn.c_k.weight", ".attn.c_v.weight", ".attn.proj.weight"))
+
+
+_STATE_SPACE_PARAM_NAME_PATTERNS = (
+    ".attn.prefix_down.",
+    ".attn.decoder_hidden.",
+    ".attn.state_head.",
+    ".attn.transition_context_in.",
+    ".attn.transition_context_out.",
+    ".attn.latent_in.",
+    ".attn.latent_gate_in.",
+    ".attn.latent_out.",
+    ".attn.hidden_gate.",
+    ".attn.transition_gate_proj.",
+    ".attn.transition_pred_scale_proj.",
+    ".attn.belief_out.",
+    ".attn.future_sketch_head.",
+    ".attn.output_scale",
+    ".attn.output_gate",
+    ".attn.latent_output_gate",
+    ".attn.latent_decay_logits",
+    ".attn.transition_gate",
+    ".attn.transition_source_logits",
+    ".attn.transition_dest_logits",
+    ".attn.transition_stay_logits",
+    ".attn.emit_delta_scale",
+)
+
+
+def _is_state_space_param_name(name: str) -> bool:
+    if "causal_machine_" in name:
+        return True
+    return any(pattern in name for pattern in _STATE_SPACE_PARAM_NAME_PATTERNS)
+
+
+def _first_nonfinite_param_name(module: nn.Module) -> str | None:
+    for name, param in module.named_parameters():
+        if not torch.isfinite(param.detach()).all():
+            return name
+    return None
+
+
+def _first_nonfinite_grad_info(module: nn.Module) -> tuple[str, str] | None:
+    for name, param in module.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        if not torch.isfinite(grad.detach()).all():
+            return name, objective_module_group(name)
+    return None
+
+
+def _largest_grad_abs_info(module: nn.Module) -> tuple[str, str, float] | None:
+    largest: tuple[str, str, float] | None = None
+    for name, param in module.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_detached = grad.detach()
+        local_max = float(grad_detached.abs().amax().item())
+        if largest is None or local_max > largest[2]:
+            largest = (name, objective_module_group(name), local_max)
+    return largest
+
+
+def _stable_clip_grad_norm_noncapturable_(module: nn.Module, max_norm: float) -> Tensor:
+    total_norm_sq: Tensor | None = None
+    grad_tensors: list[Tensor] = []
+    grad_devices: list[tuple[torch.device, torch.dtype]] = []
+    fallback_device: torch.device | None = None
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_detached = grad.detach()
+        fallback_device = grad_detached.device
+        if not torch.isfinite(grad_detached).all():
+            return torch.full((), float("nan"), device=grad_detached.device, dtype=torch.float32)
+        local_norm = torch.linalg.vector_norm(grad_detached, ord=2, dtype=torch.float64)
+        local_norm_sq = local_norm * local_norm
+        total_norm_sq = local_norm_sq if total_norm_sq is None else total_norm_sq + local_norm_sq
+        grad_tensors.append(grad)
+        grad_devices.append((grad.device, grad.dtype))
+    if total_norm_sq is None:
+        return torch.zeros((), device=fallback_device or torch.device("cpu"), dtype=torch.float32)
+    total_norm = total_norm_sq.sqrt()
+    if torch.isfinite(total_norm):
+        clip_scale = torch.clamp(
+            torch.as_tensor(max_norm, device=total_norm.device, dtype=torch.float64) / (total_norm + 1e-6),
+            max=1.0,
+        )
+        for grad, (device, dtype) in zip(grad_tensors, grad_devices, strict=True):
+            grad.mul_(clip_scale.to(device=device, dtype=dtype))
+    return total_norm.to(dtype=torch.float32)
+
+
+def _sanitize_gradients_(module: nn.Module, clamp_abs: float) -> tuple[int, int]:
+    sanitized_tensors = 0
+    sanitized_values = 0
+    clamp_limit = max(float(clamp_abs), 0.0)
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_detached = grad.detach()
+        needs_nonfinite_fix = not torch.isfinite(grad_detached).all()
+        needs_value_clamp = False
+        if clamp_limit > 0.0:
+            needs_value_clamp = bool((grad_detached.abs() > clamp_limit).any().item())
+        if not needs_nonfinite_fix and not needs_value_clamp:
+            continue
+        grad32 = grad_detached.float()
+        if needs_nonfinite_fix:
+            sanitized_values += int((~torch.isfinite(grad32)).sum().item())
+            grad32 = torch.nan_to_num(grad32, nan=0.0, posinf=clamp_limit, neginf=-clamp_limit)
+        if clamp_limit > 0.0:
+            if not needs_nonfinite_fix and needs_value_clamp:
+                sanitized_values += int((grad32.abs() > clamp_limit).sum().item())
+            grad32.clamp_(min=-clamp_limit, max=clamp_limit)
+        grad.copy_(grad32.to(dtype=grad.dtype))
+        sanitized_tensors += 1
+    return sanitized_tensors, sanitized_values
 
 
 class Muon(torch.optim.Optimizer):
@@ -7965,6 +8209,15 @@ class Muon(torch.optim.Optimizer):
         self._static_group_buckets: dict[int, list[dict[str, Any]]] = {}
         if self._capturable_requested:
             self._init_capturable_group_tensors()
+
+    def _invalidate_cuda_runtime_state(self) -> None:
+        # Cached bucket workspaces alias optimizer state tensors. Any state-dict
+        # restore or graph-mode transition must drop them so the next step
+        # rebinds the live optimizer state instead of replaying stale momentum.
+        self._cuda_bucket_workspaces.clear()
+        self._graph_capture_ready = False
+        self._graph_capture_disable_reason = ""
+        self._static_group_buckets = {}
 
     def _init_capturable_group_tensors(self) -> None:
         for group in self.param_groups:
@@ -8003,6 +8256,13 @@ class Muon(torch.optim.Optimizer):
         if self._graph_capture_ready and set_to_none:
             set_to_none = False
         super().zero_grad(set_to_none=set_to_none)
+
+    def load_state_dict(self, state_dict):
+        result = super().load_state_dict(state_dict)
+        if self._capturable_requested:
+            self._init_capturable_group_tensors()
+        self._invalidate_cuda_runtime_state()
+        return result
 
     def supports_full_step_cuda_graph(self) -> bool:
         return bool(self._graph_capture_ready)
@@ -8087,22 +8347,25 @@ class Muon(torch.optim.Optimizer):
         states_bucket = [item[2] for item in bucket_items]
         shape = tuple(int(v) for v in params_bucket[0].shape)
         device = params_bucket[0].device
+        family_code = _muon_bucket_family_code(shape)
+        workspace_dtype = _muon_family_workspace_dtype(shape, family_code)
         key = (
             device.index if device.index is not None else -1,
             params_bucket[0].dtype,
             len(bucket_items),
             shape[0],
             shape[1],
+            family_code,
+            workspace_dtype,
             *(id(param) for param in params_bucket),
         )
         workspace = self._cuda_bucket_workspaces.get(key)
         grads_bucket = [item[1] for item in bucket_items]
+        ext = self._load_cuda_ext_or_none()
         if workspace is None:
-            family_code = _muon_bucket_family_code(shape)
             transpose_input = family_code == 1
             ns_rows = shape[1] if transpose_input else shape[0]
             ns_cols = shape[0] if transpose_input else shape[1]
-            ext = self._load_cuda_ext_or_none()
             effective_batch = torch.empty(
                 (len(bucket_items), shape[0], shape[1]),
                 device=device,
@@ -8121,12 +8384,12 @@ class Muon(torch.optim.Optimizer):
             ns_input_batch = torch.empty(
                 (len(bucket_items), ns_rows, ns_cols),
                 device=device,
-                dtype=torch.bfloat16,
+                dtype=workspace_dtype,
             )
             gram_batch = torch.empty(
                 (len(bucket_items), ns_rows, ns_rows),
                 device=device,
-                dtype=torch.bfloat16,
+                dtype=workspace_dtype,
             )
             gram_sq_batch = torch.empty_like(gram_batch)
             next_x_batch = torch.empty_like(ns_input_batch)
@@ -8159,6 +8422,7 @@ class Muon(torch.optim.Optimizer):
                 "grad_tensor_ids": tuple(id(grad) for grad in grads_bucket),
                 "grad_data_ptrs": tuple(int(grad.data_ptr()) for grad in grads_bucket),
                 "square_backend": square_backend,
+                "workspace_dtype": str(workspace_dtype).replace("torch.", ""),
                 "momentum_views": momentum_views,
             }
             self._cuda_bucket_workspaces[key] = workspace
@@ -8172,6 +8436,11 @@ class Muon(torch.optim.Optimizer):
                 workspace["grad_ptrs"] = _make_cuda_pointer_tensor(grads_bucket, device)
                 workspace["grad_tensor_ids"] = grad_tensor_ids
                 workspace["grad_data_ptrs"] = grad_data_ptrs
+        if family_code == 0 and ext is not None and hasattr(ext, "describe_square_backend"):
+            current_square_backend = _muon_square_backend_name(int(ext.describe_square_backend(workspace["ns_input_batch"])))
+            if workspace.get("square_backend") != current_square_backend and hasattr(ext, "prewarm_square_backend"):
+                ext.prewarm_square_backend(workspace["ns_input_batch"])
+            workspace["square_backend"] = current_square_backend
         return workspace
 
     def _record_square_backend_stats(
@@ -8318,7 +8587,8 @@ class Muon(torch.optim.Optimizer):
             if USE_MUON_CUDA:
                 try:
                     muon_ext = load_muon_cuda()
-                except Exception:
+                except Exception as exc:
+                    _handle_muon_cuda_failure("extension_load", exc)
                     muon_ext = None
             if muon_ext is not None:
                 total_stats["extension_available"] = True
@@ -8330,7 +8600,7 @@ class Muon(torch.optim.Optimizer):
                 state = self.state[p]
                 buf = state.get("momentum_buffer")
                 if buf is None:
-                    buf = torch.zeros_like(g)
+                    buf = torch.zeros_like(g, dtype=torch.float32 if g.dtype != torch.float32 else g.dtype)
                     state["momentum_buffer"] = buf
                 item = (p, g, state)
                 if (
@@ -8391,7 +8661,8 @@ class Muon(torch.optim.Optimizer):
                         total_stats["cuda_ms"] = float(total_stats["cuda_ms"]) + (
                             (time.perf_counter() - bucket_started_at) * 1000.0
                         )
-                except Exception:
+                except Exception as exc:
+                    _handle_muon_cuda_failure("bucket_exec", exc)
                     total_stats["cuda_failure_count"] = int(total_stats["cuda_failure_count"]) + 1
                     fallback_items.extend(bucket_items)
 
@@ -8908,6 +9179,8 @@ def objective_module_group(name: str) -> str:
         return "embed_head_shared"
     if "lm_head" in name:
         return "head"
+    if _is_state_space_param_name(name):
+        return "state_space"
     if ".attn." in name:
         return "attn"
     if ".mlp." in name or "mlp_" in name:
@@ -9020,7 +9293,9 @@ MIXED_PRECISION_KEEP_FP16_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+# Keep genuinely small control tensors in float, but quantize medium-sized
+# state-space projections by default so the submission stays under the size cap.
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", "32768"))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
@@ -10993,11 +11268,93 @@ class CastedLinear(nn.Linear):
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    # Keep numerically sensitive parameters in fp32 even when the model body runs
+    # in bf16. Tied embeddings share the output-head role and need the same fp32
+    # storage treatment as CastedLinear weights.
+    keep_tied_embed_fp32 = bool(getattr(module, "tie_embeddings", False))
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+            keep_fp32 = (
+                param.ndim < 2
+                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                or (keep_tied_embed_fp32 and name == "tok_emb.weight")
+            )
+            if keep_fp32 and param.dtype != torch.float32:
                 param.data = param.data.float()
+
+
+def _current_cuda_autocast_dtype() -> torch.dtype | None:
+    if not torch.is_autocast_enabled():
+        return None
+    get_dtype = getattr(torch, "get_autocast_dtype", None)
+    if callable(get_dtype):
+        return get_dtype("cuda")
+    return torch.get_autocast_gpu_dtype()
+
+
+def _sanitize_output_head_tensor(t: Tensor, clamp_abs: float) -> Tensor:
+    t32 = torch.nan_to_num(t.float(), nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
+    if math.isfinite(clamp_abs) and clamp_abs > 0.0:
+        t32 = t32.clamp(min=-clamp_abs, max=clamp_abs)
+    return t32
+
+
+_RESIDUAL_STREAM_CLAMP_ABS = max(float(os.environ.get("RESIDUAL_STREAM_CLAMP_ABS", "256.0")), 0.0)
+_CONTROL_SCALE_CLAMP_ABS = max(float(os.environ.get("CONTROL_SCALE_CLAMP_ABS", "4.0")), 0.0)
+_Q_GAIN_MIN = max(float(os.environ.get("Q_GAIN_MIN", "0.25")), 0.0)
+_Q_GAIN_MAX = max(float(os.environ.get("Q_GAIN_MAX", "2.0")), _Q_GAIN_MIN)
+_STATE_MIXER_OUTPUT_SCALE_MAX = max(float(os.environ.get("STATE_MIXER_OUTPUT_SCALE_MAX", "4.0")), 0.0)
+_STATE_MIXER_EMIT_SCALE_MAX = max(float(os.environ.get("STATE_MIXER_EMIT_SCALE_MAX", "2.0")), 0.0)
+_CAUSAL_MACHINE_LOGIT_SCALE_MAX = max(float(os.environ.get("CAUSAL_MACHINE_LOGIT_SCALE_MAX", "4.0")), 0.0)
+
+
+def _sanitize_residual_stream_tensor(t: Tensor) -> Tensor:
+    clamp_abs = float(_RESIDUAL_STREAM_CLAMP_ABS)
+    if clamp_abs <= 0.0:
+        return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+    sanitized = torch.nan_to_num(t.float(), nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
+    sanitized = sanitized.clamp(min=-clamp_abs, max=clamp_abs)
+    return sanitized.to(dtype=t.dtype)
+
+
+def _bounded_signed_control_tensor(t: Tensor, clamp_abs: float, *, dtype: torch.dtype | None = None) -> Tensor:
+    if clamp_abs <= 0.0:
+        bounded = torch.nan_to_num(t.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        bounded = torch.nan_to_num(t.float(), nan=0.0, posinf=clamp_abs, neginf=-clamp_abs)
+        bounded = clamp_abs * torch.tanh(bounded / clamp_abs)
+    if dtype is not None:
+        bounded = bounded.to(dtype=dtype)
+    return bounded
+
+
+def _bounded_positive_control_tensor(
+    t: Tensor,
+    min_val: float,
+    max_val: float,
+    *,
+    dtype: torch.dtype | None = None,
+    nan_value: float | None = None,
+) -> Tensor:
+    safe_nan = min_val if nan_value is None else float(nan_value)
+    if max_val <= 0.0:
+        bounded = torch.nan_to_num(t.float(), nan=safe_nan, posinf=safe_nan, neginf=min_val).clamp_min(min_val)
+    else:
+        bounded = torch.nan_to_num(t.float(), nan=safe_nan, posinf=max_val, neginf=min_val)
+        bounded = max_val * torch.tanh(bounded / max_val)
+        bounded = bounded.clamp(min=min_val, max=max_val)
+    if dtype is not None:
+        bounded = bounded.to(dtype=dtype)
+    return bounded
+
+
+def _normalized_resid_mix(mix_param: Tensor, *, dtype: torch.dtype) -> Tensor:
+    mix = torch.nan_to_num(mix_param.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+    denom = mix.sum(dim=0, keepdim=True)
+    fallback = torch.zeros_like(mix)
+    fallback[0].fill_(1.0)
+    mix = torch.where(denom > 1.0e-6, mix / denom.clamp_min(1.0e-6), fallback)
+    return mix.to(dtype=dtype)
 
 
 class Rotary(nn.Module):
@@ -11212,13 +11569,26 @@ class CausalSelfAttention(nn.Module):
         cos, sin, scale = self.rotary(seqlen, x.device, q.dtype)
         q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
         k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
-        q_gain = self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_gain = _bounded_positive_control_tensor(
+            self.q_gain,
+            _Q_GAIN_MIN,
+            _Q_GAIN_MAX,
+            dtype=q.dtype,
+            nan_value=1.0,
+        )[None, :, None, None]
         if q_gain_delta is not None:
             q_gain_delta = q_gain_delta.to(dtype=q.dtype)
             if q_gain_delta.ndim == 2:
                 q_gain = q_gain * (1.0 + q_gain_delta[:, :, None, None])
             else:
                 q_gain = q_gain * (1.0 + q_gain_delta.permute(0, 2, 1)[:, :, :, None])
+            q_gain = _bounded_positive_control_tensor(
+                q_gain,
+                _Q_GAIN_MIN,
+                _Q_GAIN_MAX,
+                dtype=q.dtype,
+                nan_value=1.0,
+            )
         q = q * q_gain
         return q, k, v
 
@@ -11243,13 +11613,26 @@ class CausalSelfAttention(nn.Module):
         sin = sin[..., position : position + 1, :]
         q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
         k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
-        q_gain = self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        q_gain = _bounded_positive_control_tensor(
+            self.q_gain,
+            _Q_GAIN_MIN,
+            _Q_GAIN_MAX,
+            dtype=q.dtype,
+            nan_value=1.0,
+        )[None, :, None, None]
         if q_gain_delta is not None:
             q_gain_delta = q_gain_delta.to(dtype=q.dtype)
             if q_gain_delta.ndim == 2:
                 q_gain = q_gain * (1.0 + q_gain_delta[:, :, None, None])
             else:
                 q_gain = q_gain * (1.0 + q_gain_delta.permute(0, 2, 1)[:, :, :, None])
+            q_gain = _bounded_positive_control_tensor(
+                q_gain,
+                _Q_GAIN_MIN,
+                _Q_GAIN_MAX,
+                dtype=q.dtype,
+                nan_value=1.0,
+            )
         q = q * q_gain
         return q, k, v
 
@@ -11379,16 +11762,22 @@ class Block(nn.Module):
         q_gain_delta: Tensor | None = None,
         norm_condition: Tensor | None = None,
     ) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_simple(attn_normed, q_gain_delta=q_gain_delta)
-        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        )
         mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
         mlp_normed = mlp_normed * norm_scale
-        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        )
         return x
 
     def forward_simple_step(
@@ -11404,9 +11793,9 @@ class Block(nn.Module):
             raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
         if cache.attention_cache is None:
             cache.attention_cache = AttentionStepCache()
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_step(
@@ -11415,10 +11804,16 @@ class Block(nn.Module):
             position=position,
             q_gain_delta=q_gain_delta,
         )
-        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        )
         mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
         mlp_normed = mlp_normed * norm_scale
-        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        )
         return x
 
     def init_step_cache(self, max_len: int | None = None) -> BlockStepCache:
@@ -11609,6 +12004,7 @@ class CausalStateMixer(nn.Module):
         decay = _bounded_latent_decay(self.latent_decay_logits)
         use_cuda_latent_scan = bool(
             USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING)
             and state_hidden.is_cuda
             and drive_hidden.size(-1) > 0
         )
@@ -11772,6 +12168,7 @@ class CausalStateMixer(nn.Module):
         transition_context = transition_context.to(dtype=local_logits.dtype)
         use_cuda_latent_replace = bool(
             USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING)
             and local_logits.is_cuda
             and prior_logits.is_cuda
             and transition_context.is_cuda
@@ -11820,6 +12217,7 @@ class CausalStateMixer(nn.Module):
         transition_context = transition_context.to(dtype=local_logits.dtype)
         use_cuda_latent_replace = bool(
             USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING)
             and local_logits.is_cuda
             and prior_logits.is_cuda
             and transition_context.is_cuda
@@ -11961,6 +12359,7 @@ class CausalStateMixer(nn.Module):
             )
             if (
                 USE_CAUSAL_MACHINE_CUDA_SCAN
+                and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
                 and _structured_runtime_supports_sparse_cuda(runtime_config)
             )
             else None
@@ -12014,6 +12413,7 @@ class CausalStateMixer(nn.Module):
         )
         use_masked_cuda = (
             USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
             and _structured_runtime_supports_masked_cuda(runtime_config)
             and _can_use_causal_machine_masked_scan_cuda(
                 local_logits.device,
@@ -12043,7 +12443,11 @@ class CausalStateMixer(nn.Module):
             )
             _enforce_structured_scan_cuda_contract(self.last_kernel_info, context="state mixer structured scan")
             return state_log_beliefs.to(dtype=local_logits.dtype), final_log_belief, None
-        if USE_CAUSAL_MACHINE_CUDA_SCAN and kernel_config.backend == "cuda":
+        if (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
+            and kernel_config.backend == "cuda"
+        ):
             state_log_beliefs, final_log_belief = causal_machine_scan_cuda(
                 local_logits,
                 self.transition_source_logits,
@@ -12165,6 +12569,7 @@ class CausalStateMixer(nn.Module):
             )
             if (
                 USE_CAUSAL_MACHINE_CUDA_SCAN
+                and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
                 and _structured_runtime_supports_sparse_cuda(runtime_config)
             )
             else None
@@ -12219,6 +12624,7 @@ class CausalStateMixer(nn.Module):
         )
         use_masked_cuda = (
             USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
             and _structured_runtime_supports_masked_cuda(runtime_config)
             and _can_use_causal_machine_masked_scan_cuda(
                 local_logits.device,
@@ -12366,7 +12772,11 @@ class CausalStateMixer(nn.Module):
             )
             return state_log_beliefs
         packed_transition_tables = self._get_packed_transition_tables(local_logits.device)
-        if USE_CAUSAL_MACHINE_CUDA_SCAN and kernel_config.backend == "cuda":
+        if (
+            USE_CAUSAL_MACHINE_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
+            and kernel_config.backend == "cuda"
+        ):
             state_log_beliefs, _final_log_belief = causal_machine_scan_cuda(
                 local_logits,
                 self.transition_source_logits,
@@ -12426,11 +12836,23 @@ class CausalStateMixer(nn.Module):
         return state_log_beliefs
 
     def _decode(self, state_hidden: Tensor, state_log_beliefs: Tensor) -> Tensor:
-        scale = F.softplus(self.output_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        scale = _bounded_positive_control_tensor(
+            F.softplus(self.output_scale),
+            0.0,
+            _STATE_MIXER_OUTPUT_SCALE_MAX,
+            dtype=state_hidden.dtype,
+            nan_value=1.0,
+        ).to(device=state_hidden.device, dtype=state_hidden.dtype)
         gate = torch.sigmoid(self.output_gate).to(device=state_hidden.device, dtype=state_hidden.dtype)
         belief_features = self.belief_out(state_log_beliefs.exp().to(dtype=state_hidden.dtype))
         hidden_gate = torch.tanh(self.hidden_gate(state_hidden))
-        emit_scale = F.softplus(self.emit_delta_scale).to(device=state_hidden.device, dtype=state_hidden.dtype)
+        emit_scale = _bounded_positive_control_tensor(
+            F.softplus(self.emit_delta_scale),
+            0.0,
+            _STATE_MIXER_EMIT_SCALE_MAX,
+            dtype=state_hidden.dtype,
+            nan_value=0.0,
+        ).to(device=state_hidden.device, dtype=state_hidden.dtype)
         return scale * gate * belief_features * (1.0 + emit_scale * hidden_gate)
 
     def forward_simple(self, x: Tensor, runtime_config: StructuredScanRuntimeConfig | None = None) -> Tensor:
@@ -12624,17 +13046,23 @@ class StateSpaceBlock(nn.Module):
         norm_condition: Tensor | None = None,
     ) -> Tensor:
         del q_gain_delta
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_simple(attn_normed)
         self.last_aux = dict(self.attn.last_aux)
-        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        )
         mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
         mlp_normed = mlp_normed * norm_scale
-        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        )
         self.last_aux["block_hidden"] = x
         return x
 
@@ -12652,17 +13080,23 @@ class StateSpaceBlock(nn.Module):
             raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
         if cache.state_cache is None:
             cache.state_cache = CausalMachineCache()
-        mix = self.resid_mix.to(dtype=x.dtype)
+        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_step(attn_normed, cache.state_cache)
         self.last_aux = {}
-        x = x * self.residual_alpha + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        )
         mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
         mlp_normed = mlp_normed * norm_scale
-        x = x * self.residual_alpha + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        x = _sanitize_residual_stream_tensor(
+            x * self.residual_alpha
+            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        )
         return x
 
     def init_step_cache(self, max_len: int | None = None) -> BlockStepCache:
@@ -13244,7 +13678,9 @@ class GPT(nn.Module):
 
     def _mid_aux_logits(self, x: Tensor) -> Tensor:
         x = self.final_norm(x, condition=None) if isinstance(self.final_norm, AdaptiveRMSNorm) else self.final_norm(x)
-        logits_proj = self._apply_output_head(self.mid_aux_head, x)
+        head_input_clip = max(float(self.logit_softcap) * 4.0, 64.0)
+        logits_proj = self._apply_output_head(self.mid_aux_head, _sanitize_output_head_tensor(x, head_input_clip).to(dtype=x.dtype))
+        logits_proj = _sanitize_output_head_tensor(logits_proj, float(self.logit_softcap) * 8.0)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def _compute_causal_machine_state_features(self, x: Tensor) -> Tensor:
@@ -13306,7 +13742,12 @@ class GPT(nn.Module):
     def _compute_causal_machine_emit_log_probs(self, device: torch.device, dtype: torch.dtype) -> Tensor:
         emit_logits = self.causal_machine_log_probs.to(device=device, dtype=torch.float32)
         if self.causal_machine_emit_delta is not None and self.causal_machine_emit_delta_scale is not None:
-            emit_delta_scale = F.softplus(self.causal_machine_emit_delta_scale.float())
+            emit_delta_scale = _bounded_positive_control_tensor(
+                F.softplus(self.causal_machine_emit_delta_scale.float()),
+                0.0,
+                _STATE_MIXER_EMIT_SCALE_MAX,
+                nan_value=0.0,
+            )
             emit_logits = emit_logits + emit_delta_scale * self.causal_machine_emit_delta.float()
         return F.log_softmax(emit_logits, dim=-1).to(dtype=dtype)
 
@@ -13369,6 +13810,7 @@ class GPT(nn.Module):
         initial_state = torch.zeros((drive.size(0), self.causal_machine_latent_rank), device=drive.device, dtype=torch.float32)
         use_cuda_latent_scan = bool(
             USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING)
             and drive.is_cuda
             and drive.size(-1) > 0
         )
@@ -13646,6 +14088,7 @@ class GPT(nn.Module):
             )
             if (
                 self.use_causal_machine_cuda_scan
+                and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
                 and self.supports_incremental_backbone_cache()
                 and _structured_runtime_supports_sparse_cuda(runtime_config)
             )
@@ -13690,6 +14133,7 @@ class GPT(nn.Module):
         )
         use_masked_cuda = (
             self.use_causal_machine_cuda_scan
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
             and self.supports_incremental_backbone_cache()
             and _structured_runtime_supports_masked_cuda(runtime_config)
             and _can_use_causal_machine_masked_scan_cuda(
@@ -13738,6 +14182,7 @@ class GPT(nn.Module):
             )
         elif (
             self.use_causal_machine_cuda_scan
+            and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_CUDA_TRAINING)
             and self.supports_incremental_backbone_cache()
             and kernel_config.backend == "cuda"
         ):
@@ -13860,7 +14305,13 @@ class GPT(nn.Module):
             emit_probs,
         ).reshape(state_probs.size(0), state_probs.size(1), emit_probs.size(-1))
         raw_machine_logits = mixed_probs.clamp_min(1e-30).log().to(dtype=x.dtype)
-        scale = F.softplus(self.causal_machine_scale).to(device=x.device, dtype=x.dtype)
+        scale = _bounded_positive_control_tensor(
+            F.softplus(self.causal_machine_scale),
+            0.0,
+            _CAUSAL_MACHINE_LOGIT_SCALE_MAX,
+            dtype=x.dtype,
+            nan_value=1.0,
+        ).to(device=x.device, dtype=x.dtype)
         gate = torch.sigmoid(self.causal_machine_gate).to(device=x.device, dtype=x.dtype)
         return scale * gate * raw_machine_logits, state_log_beliefs, raw_machine_logits, local_state_log_probs
 
@@ -14136,7 +14587,11 @@ class GPT(nn.Module):
 
     def _embed_token_ids_unique(self, token_ids: Tensor) -> Tensor:
         embed_weight = self._embedding_weight()
-        return F.embedding(token_ids, embed_weight)
+        embedded = F.embedding(token_ids, embed_weight)
+        autocast_dtype = _current_cuda_autocast_dtype() if embedded.is_cuda else None
+        if autocast_dtype is not None and embedded.dtype != autocast_dtype:
+            embedded = embedded.to(dtype=autocast_dtype)
+        return embedded
 
     def _build_norm_condition(
         self,
@@ -14186,14 +14641,16 @@ class GPT(nn.Module):
 
         for i in range(self.num_encoder_layers):
             x = self.blocks[i].forward_simple(x, x0, norm_condition=norm_condition)
+            x = _sanitize_residual_stream_tensor(x)
             if i == mid_idx:
                 h_mid = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop()
+                x = _sanitize_residual_stream_tensor(x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop())
             bi = self.num_encoder_layers + i
             x = self.blocks[bi].forward_simple(x, x0, norm_condition=norm_condition)
+            x = _sanitize_residual_stream_tensor(x)
             if bi == mid_idx:
                 h_mid = x
         x = self._apply_shared_tail(x, x0, norm_condition=norm_condition)
@@ -14246,13 +14703,14 @@ class GPT(nn.Module):
                 position=backbone_cache.position,
                 norm_condition=norm_condition,
             )
+            x = _sanitize_residual_stream_tensor(x)
             if i == mid_idx:
                 h_mid = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop()
+                x = _sanitize_residual_stream_tensor(x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop())
             x = self.blocks[bi].forward_simple_step(
                 x,
                 x0,
@@ -14260,6 +14718,7 @@ class GPT(nn.Module):
                 position=backbone_cache.position,
                 norm_condition=norm_condition,
             )
+            x = _sanitize_residual_stream_tensor(x)
             if bi == mid_idx:
                 h_mid = x
         x = self._apply_shared_tail(x, x0, norm_condition=norm_condition)
@@ -14289,14 +14748,16 @@ class GPT(nn.Module):
         mid_idx = len(self.blocks) // 2
         for i in range(self.num_encoder_layers):
             x = self.blocks[i].forward_simple(x, x0, norm_condition=norm_condition)
+            x = _sanitize_residual_stream_tensor(x)
             if i == mid_idx:
                 h_mid = x
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop()
+                x = _sanitize_residual_stream_tensor(x + self._skip_scale(i, x.dtype)[None, None, :] * skips.pop())
             bi = self.num_encoder_layers + i
             x = self.blocks[bi].forward_simple(x, x0, norm_condition=norm_condition)
+            x = _sanitize_residual_stream_tensor(x)
             if bi == mid_idx:
                 h_mid = x
         x = self._apply_shared_tail(x, x0, norm_condition=norm_condition)
@@ -14311,17 +14772,24 @@ class GPT(nn.Module):
         x: Tensor,
         causal_machine_logits: Tensor | None = None,
     ) -> Tensor:
+        head_input_clip = max(float(self.logit_softcap) * 4.0, 64.0)
+        logit_clip = float(self.logit_softcap) * 8.0
         if self.tie_embeddings:
-            embed_weight = self._embedding_weight()
-            logits_proj = F.linear(x.to(dtype=embed_weight.dtype), embed_weight)
+            embed_weight = self._embedding_weight().float()
+            logits_proj = F.linear(_sanitize_output_head_tensor(x, head_input_clip), embed_weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self._apply_output_head(self.lm_head, x)
+            logits_proj = self._apply_output_head(
+                self.lm_head,
+                _sanitize_output_head_tensor(x, head_input_clip).to(dtype=x.dtype),
+            )
+        logits_proj = _sanitize_output_head_tensor(logits_proj, logit_clip)
         if self.output_logit_bias is not None:
-            logits_proj = logits_proj + self.output_logit_bias.to(device=logits_proj.device, dtype=logits_proj.dtype)
+            logits_proj = logits_proj + self.output_logit_bias.to(device=logits_proj.device, dtype=torch.float32)
         if causal_machine_logits is not None:
-            logits_proj = logits_proj + causal_machine_logits.to(dtype=logits_proj.dtype)
+            logits_proj = logits_proj + _sanitize_output_head_tensor(causal_machine_logits, logit_clip)
+        logits_proj = _sanitize_output_head_tensor(logits_proj, logit_clip)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def _needs_global_causal_machine_teacher(self) -> bool:
@@ -14884,40 +15352,40 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
+    # - standard attention projection matrices + MLP matrices use MATRIX_LR via Muon
+    # - state-space matrices use dedicated AdamW hyperparameters
+    # - state-space scalars/logits use dedicated Adam hyperparameters
+    # - remaining non-MLP/non-attention matrices use Adam at the "other matrix" LR
+    # - remaining vectors/scalars use SCALAR_LR via Adam
     embed_params = [base_model.tok_emb.weight]
     block_named_params = (
         [(f"blocks.{name}", p) for name, p in base_model.blocks.named_parameters()]
         + [(f"shared_blocks.{name}", p) for name, p in base_model.shared_blocks.named_parameters()]
     )
-    attn_matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and ".attn." in name
-    ]
-    mlp_matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and ".mlp." in name
-    ]
-    other_matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2
-        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and ".attn." not in name
-        and ".mlp." not in name
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    state_space_matrix_params: list[Tensor] = []
+    state_space_scalar_params: list[Tensor] = []
+    attn_matrix_params: list[Tensor] = []
+    mlp_matrix_params: list[Tensor] = []
+    other_matrix_params: list[Tensor] = []
+    scalar_params: list[Tensor] = []
+    for name, p in block_named_params:
+        is_control = p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if _is_state_space_param_name(name):
+            if p.ndim == 2 and not is_control:
+                state_space_matrix_params.append(p)
+            else:
+                state_space_scalar_params.append(p)
+            continue
+        if p.ndim == 2 and not is_control and _is_standard_attention_muon_matrix_name(name):
+            attn_matrix_params.append(p)
+            continue
+        if p.ndim == 2 and not is_control and ".mlp." in name:
+            mlp_matrix_params.append(p)
+            continue
+        if p.ndim == 2 and not is_control:
+            other_matrix_params.append(p)
+            continue
+        scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.shared_tail_gate is not None:
@@ -14934,6 +15402,9 @@ def main() -> None:
     optimizer_muon_attn: torch.optim.Optimizer | None = None
     optimizer_muon_mlp: torch.optim.Optimizer | None = None
     optimizer_muon_other: torch.optim.Optimizer | None = None
+    optimizer_state_space_matrix: torch.optim.Optimizer | None = None
+    optimizer_state_space_scalar: torch.optim.Optimizer | None = None
+    optimizer_other_matrix: torch.optim.Optimizer | None = None
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -14944,7 +15415,8 @@ def main() -> None:
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
     muon_optimizers: list[torch.optim.Optimizer] = []
-    graph_capturable = bool(args.use_cuda_graphs and not distributed)
+    muon_graph_capture_enabled = bool(args.use_cuda_graphs and not distributed and args.muon_cuda_graph_mode != "off")
+    graph_capturable = muon_graph_capture_enabled
     if args.use_muon and attn_matrix_params:
         optimizer_muon_attn = Muon(
             attn_matrix_params,
@@ -14976,22 +15448,36 @@ def main() -> None:
             group["base_lr"] = mlp_matrix_lr
         muon_optimizers.append(optimizer_muon_mlp)
         optimizers.append(optimizer_muon_mlp)
-    if args.use_muon and other_matrix_params:
-        other_matrix_lr = args.matrix_lr * args.other_matrix_lr_mult
-        optimizer_muon_other = Muon(
-            other_matrix_params,
-            lr=other_matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-            backend_steps_light=args.muon_backend_steps_light,
-            backend_refresh_interval=args.muon_backend_refresh_interval,
-            weight_decay=args.muon_weight_decay,
+    if state_space_matrix_params:
+        optimizer_state_space_matrix = torch.optim.AdamW(
+            [{"params": state_space_matrix_params, "lr": args.state_space_matrix_lr, "base_lr": args.state_space_matrix_lr}],
+            betas=(args.beta1, args.state_space_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.state_space_matrix_weight_decay,
+            fused=True,
             capturable=graph_capturable,
         )
-        for group in optimizer_muon_other.param_groups:
-            group["base_lr"] = other_matrix_lr
-        muon_optimizers.append(optimizer_muon_other)
-        optimizers.append(optimizer_muon_other)
+        optimizers.append(optimizer_state_space_matrix)
+    if state_space_scalar_params:
+        optimizer_state_space_scalar = torch.optim.Adam(
+            [{"params": state_space_scalar_params, "lr": args.state_space_scalar_lr, "base_lr": args.state_space_scalar_lr}],
+            betas=(args.beta1, args.state_space_beta2),
+            eps=args.adam_eps,
+            fused=True,
+            capturable=graph_capturable,
+        )
+        optimizers.append(optimizer_state_space_scalar)
+    if other_matrix_params:
+        other_matrix_lr = args.matrix_lr * args.other_matrix_lr_mult
+        optimizer_other_matrix = torch.optim.Adam(
+            [{"params": other_matrix_params, "lr": other_matrix_lr, "base_lr": other_matrix_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.muon_weight_decay,
+            fused=True,
+            capturable=graph_capturable,
+        )
+        optimizers.append(optimizer_other_matrix)
     if not args.use_muon and attn_matrix_params:
         optimizer_attn_matrix = torch.optim.Adam(
             [{"params": attn_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
@@ -15013,16 +15499,6 @@ def main() -> None:
             capturable=graph_capturable,
         )
         optimizers.append(optimizer_mlp_matrix)
-    if not args.use_muon and other_matrix_params:
-        optimizer_other_matrix = torch.optim.Adam(
-            [{"params": other_matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            weight_decay=args.muon_weight_decay,
-            fused=True,
-            capturable=graph_capturable,
-        )
-        optimizers.append(optimizer_other_matrix)
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -15046,6 +15522,16 @@ def main() -> None:
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     positional_mode = "rope_only"
     log0(f"positional_mode:{positional_mode} train_seq_len:{args.train_seq_len} iterations:{args.iterations}")
+    log0(
+        "matrix_param_split:"
+        f" muon_attn:{len(attn_matrix_params)}"
+        f" muon_mlp:{len(mlp_matrix_params)}"
+        f" adam_state_space_matrix:{len(state_space_matrix_params)}"
+        f" adam_state_space_scalar:{len(state_space_scalar_params)}"
+        f" adam_other_matrix:{len(other_matrix_params)}"
+        f" scalar_other:{len(scalar_params)}",
+        console=False,
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -15066,7 +15552,11 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=set_to_none)
 
-    muon_graph_capture_ready = all(opt.prepare_cuda_graph_capture() for opt in muon_optimizers) if muon_optimizers else False
+    muon_graph_capture_ready = (
+        all(opt.prepare_cuda_graph_capture() for opt in muon_optimizers)
+        if muon_optimizers and muon_graph_capture_enabled
+        else False
+    )
     muon_graph_capture_forced_off = bool(muon_optimizers) and args.muon_cuda_graph_mode == "off"
     muon_graph_capture_forced_on = bool(muon_optimizers) and args.muon_cuda_graph_mode == "on"
     graph_full_step_supported = (not distributed) and (
@@ -15178,6 +15668,32 @@ def main() -> None:
         if args.early_phase_steps <= 0:
             return 0.0
         return 1.0 - min(max(step, 0) / max(args.early_phase_steps, 1), 1.0)
+
+    def apply_optimizer_schedule(step: int, scale: float) -> None:
+        early_frac = early_phase_frac(step)
+        attn_lr_scale = 1.0 + early_frac * (args.early_muon_attn_lr_scale - 1.0)
+        mlp_lr_scale = 1.0 + early_frac * (args.early_muon_mlp_lr_scale - 1.0)
+        other_lr_scale = 1.0 + early_frac * (args.early_muon_other_lr_scale - 1.0)
+        state_space_matrix_lr_scale = 1.0 + early_frac * (args.early_state_space_matrix_lr_scale - 1.0)
+        state_space_scalar_lr_scale = 1.0 + early_frac * (args.early_state_space_scalar_lr_scale - 1.0)
+        muon_wd_scale = 1.0 + early_frac * (args.early_muon_wd_scale - 1.0)
+        token_scale = scale * tied_embed_lr_mul(step)
+        for opt in optimizers:
+            scaled_lr = token_scale if opt is optimizer_tok else scale
+            if opt is optimizer_muon_attn:
+                scaled_lr *= attn_lr_scale
+            elif opt is optimizer_muon_mlp:
+                scaled_lr *= mlp_lr_scale
+            elif opt is optimizer_muon_other or opt is optimizer_other_matrix:
+                scaled_lr *= other_lr_scale
+            elif opt is optimizer_state_space_matrix:
+                scaled_lr *= state_space_matrix_lr_scale
+            elif opt is optimizer_state_space_scalar:
+                scaled_lr *= state_space_scalar_lr_scale
+            for group in opt.param_groups:
+                _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
+                if opt is optimizer_muon_attn or opt is optimizer_muon_mlp or opt is optimizer_muon_other:
+                    _set_group_scalar(group, "weight_decay", args.muon_weight_decay * muon_wd_scale)
 
     def next_train_microbatch() -> tuple[Tensor, Tensor, Tensor | None]:
         x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -15307,11 +15823,7 @@ def main() -> None:
         for warmup_step in range(args.warmup_steps):
             current_train_step = warmup_step
             warmup_scale = lr_mul(warmup_step, 0.0)
-            token_scale = warmup_scale * tied_embed_lr_mul(warmup_step)
-            for opt in optimizers:
-                scaled_lr = token_scale if opt is optimizer_tok else warmup_scale
-                for group in opt.param_groups:
-                    _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
+            apply_optimizer_schedule(warmup_step, warmup_scale)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -15402,6 +15914,8 @@ def main() -> None:
     muon_cuda_tensor_count_total = 0
     muon_fallback_tensor_count_total = 0
     muon_cuda_failure_count_total = 0
+    sanitized_grad_events_total = 0
+    sanitized_grad_values_total = 0
     last_validation_time_ms = 0.0
 
     step = 0
@@ -15505,26 +16019,7 @@ def main() -> None:
         for opt in muon_optimizers:
             for group in opt.param_groups:
                 _set_group_scalar(group, "momentum", muon_momentum)
-
-        early_frac = early_phase_frac(step)
-        attn_lr_scale = 1.0 + early_frac * (args.early_muon_attn_lr_scale - 1.0)
-        mlp_lr_scale = 1.0 + early_frac * (args.early_muon_mlp_lr_scale - 1.0)
-        other_lr_scale = 1.0 + early_frac * (args.early_muon_other_lr_scale - 1.0)
-        muon_wd_scale = 1.0 + early_frac * (args.early_muon_wd_scale - 1.0)
-
-        token_scale = scale * tied_embed_lr_mul(step)
-        for opt in optimizers:
-            scaled_lr = token_scale if opt is optimizer_tok else scale
-            if opt is optimizer_muon_attn:
-                scaled_lr *= attn_lr_scale
-            elif opt is optimizer_muon_mlp:
-                scaled_lr *= mlp_lr_scale
-            elif opt is optimizer_muon_other:
-                scaled_lr *= other_lr_scale
-            for group in opt.param_groups:
-                _set_group_lr(group, float(group["base_lr"]) * scaled_lr)
-                if opt is optimizer_muon_attn or opt is optimizer_muon_mlp or opt is optimizer_muon_other:
-                    _set_group_scalar(group, "weight_decay", args.muon_weight_decay * muon_wd_scale)
+        apply_optimizer_schedule(step, scale)
 
         step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
         used_cuda_graph = False
@@ -15568,15 +16063,45 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 loss = compute_training_loss(x, y, loss_mask)
+                if not torch.isfinite(loss.detach()):
+                    raise RuntimeError(f"non-finite training loss detected at step {step} micro_step {micro_step}")
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
             train_loss /= grad_accum_steps
 
+            if args.grad_sanitize_clamp_abs > 0:
+                sanitized_tensors, sanitized_values = _sanitize_gradients_(base_model, args.grad_sanitize_clamp_abs)
+                if sanitized_tensors > 0:
+                    sanitized_grad_events_total += sanitized_tensors
+                    sanitized_grad_values_total += sanitized_values
+                    log0(
+                        f"grad_sanitized step:{step} tensors:{sanitized_tensors} "
+                        f"values:{sanitized_values} clamp_abs:{float(args.grad_sanitize_clamp_abs):.1f}"
+                    )
             if args.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+                grad_norm = _stable_clip_grad_norm_noncapturable_(base_model, args.grad_clip_norm)
+                if not torch.isfinite(grad_norm.detach()):
+                    first_bad_grad = _first_nonfinite_grad_info(base_model)
+                    if first_bad_grad is not None:
+                        bad_name, bad_group = first_bad_grad
+                        raise RuntimeError(
+                            f"non-finite gradient norm detected at step {step}: "
+                            f"{bad_name} group:{bad_group}"
+                        )
+                    largest_grad = _largest_grad_abs_info(base_model)
+                    if largest_grad is not None:
+                        bad_name, bad_group, bad_abs = largest_grad
+                        raise RuntimeError(
+                            f"non-finite gradient norm detected at step {step}: "
+                            f"largest_finite_grad {bad_name} group:{bad_group} max_abs:{bad_abs:.4e}"
+                        )
+                    raise RuntimeError(f"non-finite gradient norm detected at step {step}")
             optimizer_step_started_at = time.perf_counter()
             for opt in optimizers:
                 opt.step()
+            first_bad_param = _first_nonfinite_param_name(base_model)
+            if first_bad_param is not None:
+                raise RuntimeError(f"non-finite parameter detected after optimizer step {step}: {first_bad_param}")
             optimizer_step_time_ms = (time.perf_counter() - optimizer_step_started_at) * 1000.0
             optimizer_step_time_ms_total += optimizer_step_time_ms
             if PROFILE_MUON_STEP:
@@ -15605,6 +16130,11 @@ def main() -> None:
         )
         if should_log_train:
             muon_log_suffix = ""
+            if sanitized_grad_events_total > 0:
+                muon_log_suffix += (
+                    f" grad_sanitized_total:{sanitized_grad_events_total}"
+                    f" grad_sanitized_values:{sanitized_grad_values_total}"
+                )
             if PROFILE_MUON_STEP:
                 muon_tensor_total = muon_cuda_tensor_count_total + muon_fallback_tensor_count_total
                 muon_fallback_frac = (
@@ -15612,7 +16142,7 @@ def main() -> None:
                     if muon_tensor_total > 0
                     else 0.0
                 )
-                muon_log_suffix = (
+                muon_log_suffix += (
                     f" opt_step_avg:{optimizer_step_time_ms_total / step:.2f}ms"
                     f" muon_avg:{muon_step_time_ms_total / step:.2f}ms"
                     f" muon_cuda_avg:{muon_cuda_time_ms_total / step:.2f}ms"

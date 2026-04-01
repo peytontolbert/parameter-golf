@@ -501,7 +501,7 @@ __device__ __forceinline__ void latent_backward_chunk_bfloat162(
 template <typename scalar_t, typename work_t>
 __global__ __launch_bounds__(kThreads) void latent_chunk_summary_kernel(
     const scalar_t* __restrict__ drive,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -530,7 +530,7 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_summary_kernel(
 template <typename scalar_t, typename work_t>
 __global__ __launch_bounds__(kThreads) void latent_chunk_summary_persistent_kernel(
     const scalar_t* __restrict__ drive,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -616,49 +616,37 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_prefix_scan_ke
     int total_batches,
     int num_chunks,
     int rank_dim,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ chunk_prev,
     scalar_t* __restrict__ final_state) {
+    const int current_batch = blockIdx.x;
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
-    if (r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || r >= rank_dim || tid >= kChunkScanThreads) {
         return;
     }
 
     using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
-    __shared__ int current_batch;
-    while (true) {
-        if (tid == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
+    AffineScanValue current = affine_scan_identity();
+    if (tid < num_chunks) {
+        const int idx = (current_batch * num_chunks + tid) * rank_dim + r;
+        current.mul = load_as_float(chunk_mul + idx);
+        current.add = load_as_float(chunk_add + idx);
+    }
 
-        AffineScanValue current = affine_scan_identity();
-        if (tid < num_chunks) {
-            const int idx = (current_batch * num_chunks + tid) * rank_dim + r;
-            current.mul = load_as_float(chunk_mul + idx);
-            current.add = load_as_float(chunk_add + idx);
-        }
+    AffineScanValue prefix = affine_scan_identity();
+    BlockScan(scan_storage).ExclusiveScan(current, prefix, affine_scan_identity(), AffineScanOp{});
+    const AffineScanValue inclusive = AffineScanOp{}(prefix, current);
 
-        AffineScanValue prefix = affine_scan_identity();
-        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
-        const AffineScanValue inclusive = AffineScanOp{}(prefix, current);
-
-        const float init = load_as_float(initial_state + current_batch * rank_dim + r);
-        if (tid < num_chunks) {
-            const float prev = prefix.mul * init + prefix.add;
-            chunk_prev[(current_batch * num_chunks + tid) * rank_dim + r] = store_from_float<work_t>(prev);
-            if (tid == num_chunks - 1) {
-                const float final_val = inclusive.mul * init + inclusive.add;
-                final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(final_val);
-            }
+    const float init = load_as_float(initial_state + current_batch * rank_dim + r);
+    if (tid < num_chunks) {
+        const float prev = prefix.mul * init + prefix.add;
+        chunk_prev[(current_batch * num_chunks + tid) * rank_dim + r] = store_from_float<work_t>(prev);
+        if (tid == num_chunks - 1) {
+            const float final_val = inclusive.mul * init + inclusive.add;
+            final_state[current_batch * rank_dim + r] = store_from_float<scalar_t>(final_val);
         }
-        __syncthreads();
     }
 }
 
@@ -670,41 +658,29 @@ __global__ __launch_bounds__(kThreads) void latent_group_summary_kernel(
     int in_chunks,
     int rank_dim,
     int out_chunks,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ out_mul,
     work_t* __restrict__ out_add) {
+    const int current_batch = blockIdx.x;
     const int group_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
-    if (group_id >= out_chunks || r >= rank_dim) {
+    if (current_batch >= total_batches || group_id >= out_chunks || r >= rank_dim) {
         return;
     }
 
-    __shared__ int current_batch;
-    while (true) {
-        if (threadIdx.x == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
-
-        const int group_start = group_id * kChunkScanThreads;
-        const int group_len = min(kChunkScanThreads, in_chunks - group_start);
-        float mul = 1.0f;
-        float add = 0.0f;
-        for (int i = 0; i < group_len; ++i) {
-            const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
-            const float cur_mul = load_as_float(in_mul + idx);
-            const float cur_add = load_as_float(in_add + idx);
-            add = cur_mul * add + cur_add;
-            mul *= cur_mul;
-        }
-        const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
-        out_mul[out_idx] = store_from_float<work_t>(mul);
-        out_add[out_idx] = store_from_float<work_t>(add);
-        __syncthreads();
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+    float mul = 1.0f;
+    float add = 0.0f;
+    for (int i = 0; i < group_len; ++i) {
+        const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
+        const float cur_mul = load_as_float(in_mul + idx);
+        const float cur_add = load_as_float(in_add + idx);
+        add = cur_mul * add + cur_add;
+        mul *= cur_mul;
     }
+    const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
+    out_mul[out_idx] = store_from_float<work_t>(mul);
+    out_add[out_idx] = store_from_float<work_t>(add);
 }
 
 template <typename work_t>
@@ -716,46 +692,34 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_prefix_s
     int num_chunks,
     int rank_dim,
     int num_groups,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ chunk_prev) {
+    const int current_batch = blockIdx.x;
     const int group_id = blockIdx.y;
     const int r = blockIdx.z;
     const int tid = threadIdx.x;
-    if (group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
         return;
     }
 
     using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
-    __shared__ int current_batch;
-    while (true) {
-        if (tid == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+    AffineScanValue current = affine_scan_identity();
+    if (tid < group_len) {
+        const int idx = (current_batch * num_chunks + (group_start + tid)) * rank_dim + r;
+        current.mul = load_as_float(chunk_mul + idx);
+        current.add = load_as_float(chunk_add + idx);
+    }
 
-        const int group_start = group_id * kChunkScanThreads;
-        const int group_len = min(kChunkScanThreads, num_chunks - group_start);
-        AffineScanValue current = affine_scan_identity();
-        if (tid < group_len) {
-            const int idx = (current_batch * num_chunks + (group_start + tid)) * rank_dim + r;
-            current.mul = load_as_float(chunk_mul + idx);
-            current.add = load_as_float(chunk_add + idx);
-        }
+    AffineScanValue prefix = affine_scan_identity();
+    BlockScan(scan_storage).ExclusiveScan(current, prefix, affine_scan_identity(), AffineScanOp{});
 
-        AffineScanValue prefix = affine_scan_identity();
-        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
-
-        if (tid < group_len) {
-            const float group_seed = load_as_float(group_prev + ((current_batch * num_groups + group_id) * rank_dim + r));
-            const float prev = prefix.mul * group_seed + prefix.add;
-            chunk_prev[(current_batch * num_chunks + (group_start + tid)) * rank_dim + r] = store_from_float<work_t>(prev);
-        }
-        __syncthreads();
+    if (tid < group_len) {
+        const float group_seed = load_as_float(group_prev + ((current_batch * num_groups + group_id) * rank_dim + r));
+        const float prev = prefix.mul * group_seed + prefix.add;
+        chunk_prev[(current_batch * num_chunks + (group_start + tid)) * rank_dim + r] = store_from_float<work_t>(prev);
     }
 }
 
@@ -767,47 +731,35 @@ __global__ __launch_bounds__(kThreads) void latent_group_summary_reverse_kernel(
     int in_chunks,
     int rank_dim,
     int out_chunks,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ out_mul,
     work_t* __restrict__ out_add) {
+    const int current_batch = blockIdx.x;
     const int group_id = blockIdx.y;
     const int r = blockIdx.z * blockDim.x + threadIdx.x;
-    if (group_id >= out_chunks || r >= rank_dim) {
+    if (current_batch >= total_batches || group_id >= out_chunks || r >= rank_dim) {
         return;
     }
 
-    __shared__ int current_batch;
-    while (true) {
-        if (threadIdx.x == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
-
-        const int group_start = group_id * kChunkScanThreads;
-        const int group_len = min(kChunkScanThreads, in_chunks - group_start);
-        float mul = 1.0f;
-        float add = 0.0f;
-        for (int i = group_len - 1; i >= 0; --i) {
-            const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
-            const float cur_mul = load_as_float(in_mul + idx);
-            const float cur_add = load_as_float(in_add + idx);
-            add = cur_mul * add + cur_add;
-            mul *= cur_mul;
-        }
-        const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
-        out_mul[out_idx] = store_from_float<work_t>(mul);
-        out_add[out_idx] = store_from_float<work_t>(add);
-        __syncthreads();
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, in_chunks - group_start);
+    float mul = 1.0f;
+    float add = 0.0f;
+    for (int i = group_len - 1; i >= 0; --i) {
+        const int idx = (current_batch * in_chunks + (group_start + i)) * rank_dim + r;
+        const float cur_mul = load_as_float(in_mul + idx);
+        const float cur_add = load_as_float(in_add + idx);
+        add = cur_mul * add + cur_add;
+        mul *= cur_mul;
     }
+    const int out_idx = (current_batch * out_chunks + group_id) * rank_dim + r;
+    out_mul[out_idx] = store_from_float<work_t>(mul);
+    out_add[out_idx] = store_from_float<work_t>(add);
 }
 
 template <typename scalar_t, typename work_t, bool StoreStates>
 __global__ __launch_bounds__(kThreads) void latent_chunk_finalize_kernel(
     const scalar_t* __restrict__ drive,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     const work_t* __restrict__ chunk_prev,
     int seq_len,
     int rank_dim,
@@ -839,7 +791,7 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_finalize_kernel(
 template <typename scalar_t, typename work_t, bool StoreStates>
 __global__ __launch_bounds__(kThreads) void latent_chunk_finalize_persistent_kernel(
     const scalar_t* __restrict__ drive,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     const work_t* __restrict__ chunk_prev,
     int seq_len,
     int rank_dim,
@@ -935,7 +887,7 @@ template <typename scalar_t, typename work_t, bool UseStateGrad>
 __global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -967,7 +919,7 @@ template <typename scalar_t, typename work_t, bool UseStateGrad>
 __global__ __launch_bounds__(kThreads) void latent_chunk_backward_summary_persistent_kernel(
     const scalar_t* __restrict__ grad_states,
     const scalar_t* __restrict__ grad_prior_states,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     int seq_len,
     int rank_dim,
     int num_chunks,
@@ -1017,45 +969,33 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_reverse_prefix
     int total_batches,
     int num_chunks,
     int rank_dim,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ chunk_carry) {
+    const int current_batch = blockIdx.x;
     const int r = blockIdx.y;
     const int tid = threadIdx.x;
-    if (r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || r >= rank_dim || tid >= kChunkScanThreads) {
         return;
     }
 
     using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
-    __shared__ int current_batch;
-    while (true) {
-        if (tid == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
+    AffineScanValue current = affine_scan_identity();
+    if (tid < num_chunks) {
+        const int rev = num_chunks - 1 - tid;
+        const int idx = (current_batch * num_chunks + rev) * rank_dim + r;
+        current.mul = load_as_float(chunk_mul + idx);
+        current.add = load_as_float(chunk_add + idx);
+    }
 
-        AffineScanValue current = affine_scan_identity();
-        if (tid < num_chunks) {
-            const int rev = num_chunks - 1 - tid;
-            const int idx = (current_batch * num_chunks + rev) * rank_dim + r;
-            current.mul = load_as_float(chunk_mul + idx);
-            current.add = load_as_float(chunk_add + idx);
-        }
+    AffineScanValue prefix = affine_scan_identity();
+    BlockScan(scan_storage).ExclusiveScan(current, prefix, affine_scan_identity(), AffineScanOp{});
 
-        AffineScanValue prefix = affine_scan_identity();
-        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
-
-        const float final_grad = load_as_float(grad_final_state + current_batch * rank_dim + r);
-        if (tid < num_chunks) {
-            const int rev = num_chunks - 1 - tid;
-            const float carry = prefix.mul * final_grad + prefix.add;
-            chunk_carry[(current_batch * num_chunks + rev) * rank_dim + r] = store_from_float<work_t>(carry);
-        }
-        __syncthreads();
+    const float final_grad = load_as_float(grad_final_state + current_batch * rank_dim + r);
+    if (tid < num_chunks) {
+        const int rev = num_chunks - 1 - tid;
+        const float carry = prefix.mul * final_grad + prefix.add;
+        chunk_carry[(current_batch * num_chunks + rev) * rank_dim + r] = store_from_float<work_t>(carry);
     }
 }
 
@@ -1068,49 +1008,37 @@ __global__ __launch_bounds__(kChunkScanThreads) void latent_chunk_group_reverse_
     int num_chunks,
     int rank_dim,
     int num_groups,
-    int32_t* __restrict__ work_queue_counter,
     work_t* __restrict__ chunk_carry) {
+    const int current_batch = blockIdx.x;
     const int group_id = blockIdx.y;
     const int r = blockIdx.z;
     const int tid = threadIdx.x;
-    if (group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
+    if (current_batch >= total_batches || group_id >= num_groups || r >= rank_dim || tid >= kChunkScanThreads) {
         return;
     }
 
     using BlockScan = cub::BlockScan<AffineScanValue, kChunkScanThreads>;
     __shared__ typename BlockScan::TempStorage scan_storage;
 
-    __shared__ int current_batch;
-    while (true) {
-        if (tid == 0) {
-            current_batch = atomicAdd(work_queue_counter, 1);
-        }
-        __syncthreads();
-        if (current_batch >= total_batches) {
-            break;
-        }
+    const int group_start = group_id * kChunkScanThreads;
+    const int group_len = min(kChunkScanThreads, num_chunks - group_start);
+    AffineScanValue current = affine_scan_identity();
+    if (tid < group_len) {
+        const int rev_local = group_len - 1 - tid;
+        const int idx = (current_batch * num_chunks + (group_start + rev_local)) * rank_dim + r;
+        current.mul = load_as_float(chunk_mul + idx);
+        current.add = load_as_float(chunk_add + idx);
+    }
 
-        const int group_start = group_id * kChunkScanThreads;
-        const int group_len = min(kChunkScanThreads, num_chunks - group_start);
-        AffineScanValue current = affine_scan_identity();
-        if (tid < group_len) {
-            const int rev_local = group_len - 1 - tid;
-            const int idx = (current_batch * num_chunks + (group_start + rev_local)) * rank_dim + r;
-            current.mul = load_as_float(chunk_mul + idx);
-            current.add = load_as_float(chunk_add + idx);
-        }
+    AffineScanValue prefix = affine_scan_identity();
+    BlockScan(scan_storage).ExclusiveScan(current, prefix, affine_scan_identity(), AffineScanOp{});
 
-        AffineScanValue prefix = affine_scan_identity();
-        BlockScan(scan_storage).ExclusiveScan(current, prefix, AffineScanOp{}, affine_scan_identity());
-
-        if (tid < group_len) {
-            const int rev_local = group_len - 1 - tid;
-            const int actual_chunk = group_start + rev_local;
-            const float group_seed = load_as_float(group_carry + ((current_batch * num_groups + group_id) * rank_dim + r));
-            const float carry = prefix.mul * group_seed + prefix.add;
-            chunk_carry[(current_batch * num_chunks + actual_chunk) * rank_dim + r] = store_from_float<work_t>(carry);
-        }
-        __syncthreads();
+    if (tid < group_len) {
+        const int rev_local = group_len - 1 - tid;
+        const int actual_chunk = group_start + rev_local;
+        const float group_seed = load_as_float(group_carry + ((current_batch * num_groups + group_id) * rank_dim + r));
+        const float carry = prefix.mul * group_seed + prefix.add;
+        chunk_carry[(current_batch * num_chunks + actual_chunk) * rank_dim + r] = store_from_float<work_t>(carry);
     }
 }
 
@@ -1121,7 +1049,7 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_backward_finalize_kerne
     const scalar_t* __restrict__ states,
     const scalar_t* __restrict__ prior_states,
     const scalar_t* __restrict__ initial_state,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     const work_t* __restrict__ chunk_carry,
     int seq_len,
     int rank_dim,
@@ -1170,7 +1098,7 @@ __global__ __launch_bounds__(kThreads) void latent_chunk_backward_finalize_persi
     const scalar_t* __restrict__ states,
     const scalar_t* __restrict__ prior_states,
     const scalar_t* __restrict__ initial_state,
-    const work_t* __restrict__ decay,
+    const scalar_t* __restrict__ decay,
     const work_t* __restrict__ chunk_carry,
     int seq_len,
     int rank_dim,
@@ -1883,14 +1811,8 @@ void latent_prefix_scan_dispatch(
     torch::Tensor& chunk_prev,
     torch::Tensor& final_state) {
     if (num_chunks <= kChunkScanThreads) {
-        const int worker_blocks = occupancy_persistent_worker_blocks(
-            latent_chunk_prefix_scan_kernel<scalar_t, work_t>,
-            chunk_mul.get_device(),
-            batch_size,
-            kChunkScanThreads);
-        auto work_queue_counter = make_device_work_queue_counter(chunk_mul);
         const dim3 scan_grid(
-            static_cast<unsigned int>(worker_blocks),
+            static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(rank_dim));
         latent_chunk_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
             chunk_mul.data_ptr<work_t>(),
@@ -1899,7 +1821,6 @@ void latent_prefix_scan_dispatch(
             batch_size,
             num_chunks,
             rank_dim,
-            work_queue_counter.data_ptr<int32_t>(),
             chunk_prev.data_ptr<work_t>(),
             final_state.data_ptr<scalar_t>());
         return;
@@ -1913,14 +1834,8 @@ void latent_prefix_scan_dispatch(
     auto group_final = torch::empty_like(initial_state);
     const dim3 block(kThreads);
     const int rank_tiles = static_cast<int>((rank_dim + kThreads - 1) / kThreads);
-    const int summary_worker_blocks = occupancy_persistent_worker_blocks(
-        latent_group_summary_kernel<work_t>,
-        chunk_mul.get_device(),
-        batch_size * num_groups,
-        kThreads);
-    auto summary_queue_counter = make_device_work_queue_counter(chunk_mul);
     const dim3 summary_grid(
-        static_cast<unsigned int>(summary_worker_blocks),
+        static_cast<unsigned int>(batch_size),
         static_cast<unsigned int>(num_groups),
         static_cast<unsigned int>(rank_tiles));
     latent_group_summary_kernel<work_t><<<summary_grid, block, 0, stream>>>(
@@ -1930,7 +1845,6 @@ void latent_prefix_scan_dispatch(
         num_chunks,
         rank_dim,
         num_groups,
-        summary_queue_counter.data_ptr<int32_t>(),
         group_mul.data_ptr<work_t>(),
         group_add.data_ptr<work_t>());
     latent_prefix_scan_dispatch<scalar_t, work_t>(
@@ -1943,14 +1857,8 @@ void latent_prefix_scan_dispatch(
         stream,
         group_prev,
         group_final);
-    const int group_scan_worker_blocks = occupancy_persistent_worker_blocks(
-        latent_chunk_group_prefix_scan_kernel<work_t>,
-        chunk_mul.get_device(),
-        batch_size * num_groups,
-        kChunkScanThreads);
-    auto group_scan_queue_counter = make_device_work_queue_counter(chunk_mul);
     const dim3 group_scan_grid(
-        static_cast<unsigned int>(group_scan_worker_blocks),
+        static_cast<unsigned int>(batch_size),
         static_cast<unsigned int>(num_groups),
         static_cast<unsigned int>(rank_dim));
     latent_chunk_group_prefix_scan_kernel<work_t><<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
@@ -1961,7 +1869,6 @@ void latent_prefix_scan_dispatch(
         num_chunks,
         rank_dim,
         num_groups,
-        group_scan_queue_counter.data_ptr<int32_t>(),
         chunk_prev.data_ptr<work_t>());
     final_state.copy_(group_final);
 }
@@ -1977,14 +1884,8 @@ void latent_reverse_prefix_scan_dispatch(
     cudaStream_t stream,
     torch::Tensor& chunk_carry) {
     if (num_chunks <= kChunkScanThreads) {
-        const int worker_blocks = occupancy_persistent_worker_blocks(
-            latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t>,
-            chunk_mul.get_device(),
-            batch_size,
-            kChunkScanThreads);
-        auto work_queue_counter = make_device_work_queue_counter(chunk_mul);
         const dim3 scan_grid(
-            static_cast<unsigned int>(worker_blocks),
+            static_cast<unsigned int>(batch_size),
             static_cast<unsigned int>(rank_dim));
         latent_chunk_reverse_prefix_scan_kernel<scalar_t, work_t><<<scan_grid, kChunkScanThreads, 0, stream>>>(
             chunk_mul.data_ptr<work_t>(),
@@ -1993,7 +1894,6 @@ void latent_reverse_prefix_scan_dispatch(
             batch_size,
             num_chunks,
             rank_dim,
-            work_queue_counter.data_ptr<int32_t>(),
             chunk_carry.data_ptr<work_t>());
         return;
     }
@@ -2005,14 +1905,8 @@ void latent_reverse_prefix_scan_dispatch(
     auto group_carry = torch::empty({batch_size, num_groups, rank_dim}, summary_opts);
     const dim3 block(kThreads);
     const int rank_tiles = static_cast<int>((rank_dim + kThreads - 1) / kThreads);
-    const int summary_worker_blocks = occupancy_persistent_worker_blocks(
-        latent_group_summary_reverse_kernel<work_t>,
-        chunk_mul.get_device(),
-        batch_size * num_groups,
-        kThreads);
-    auto summary_queue_counter = make_device_work_queue_counter(chunk_mul);
     const dim3 summary_grid(
-        static_cast<unsigned int>(summary_worker_blocks),
+        static_cast<unsigned int>(batch_size),
         static_cast<unsigned int>(num_groups),
         static_cast<unsigned int>(rank_tiles));
     latent_group_summary_reverse_kernel<work_t><<<summary_grid, block, 0, stream>>>(
@@ -2022,7 +1916,6 @@ void latent_reverse_prefix_scan_dispatch(
         num_chunks,
         rank_dim,
         num_groups,
-        summary_queue_counter.data_ptr<int32_t>(),
         group_mul.data_ptr<work_t>(),
         group_add.data_ptr<work_t>());
     latent_reverse_prefix_scan_dispatch<scalar_t, work_t>(
@@ -2034,14 +1927,8 @@ void latent_reverse_prefix_scan_dispatch(
         rank_dim,
         stream,
         group_carry);
-    const int group_scan_worker_blocks = occupancy_persistent_worker_blocks(
-        latent_chunk_group_reverse_prefix_scan_kernel<work_t>,
-        chunk_mul.get_device(),
-        batch_size * num_groups,
-        kChunkScanThreads);
-    auto group_scan_queue_counter = make_device_work_queue_counter(chunk_mul);
     const dim3 group_scan_grid(
-        static_cast<unsigned int>(group_scan_worker_blocks),
+        static_cast<unsigned int>(batch_size),
         static_cast<unsigned int>(num_groups),
         static_cast<unsigned int>(rank_dim));
     latent_chunk_group_reverse_prefix_scan_kernel<work_t><<<group_scan_grid, kChunkScanThreads, 0, stream>>>(
@@ -2052,7 +1939,6 @@ void latent_reverse_prefix_scan_dispatch(
         num_chunks,
         rank_dim,
         num_groups,
-        group_scan_queue_counter.data_ptr<int32_t>(),
         chunk_carry.data_ptr<work_t>());
 }
 
@@ -2081,12 +1967,18 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_scan_forward_cuda", [&] {
         const bool use_half2 = allow_half2;
         const bool use_bfloat162 = allow_bfloat162;
-        const bool use_vec2 = use_half2 || use_bfloat162;
-        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        // Long low-precision recurrent scans are numerically fragile. Route
+        // them through the chunked prefix-scan path so the recurrent carries
+        // stay bounded to 64-token chunks and chunk seeds are accumulated in
+        // float workspace.
+        const bool use_single_kernel = seq_len <= single_kernel_max_seq_len;
+        const bool use_float_workspace = use_half2 || use_bfloat162;
+        const bool use_vec2_launch = use_half2 || (use_bfloat162 && use_single_kernel);
+        const int rank_items = use_vec2_launch ? (rank_dim / 2) : rank_dim;
         const int launch_threads = latent_launch_threads(rank_items);
         const dim3 block(static_cast<unsigned int>(launch_threads));
         const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
-        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+        if (use_single_kernel) {
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_scan_forward_kernel_half2<true>,
@@ -2146,13 +2038,19 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     final_state.data_ptr<scalar_t>());
             }
         } else {
-            const auto workspace_dtype = use_half2 ? torch::kFloat32 : drive.scalar_type();
+            const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::Forward, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
             const int total_chunk_tasks = batch_size * num_chunks;
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_chunk_summary_persistent_kernel_half2,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : use_float_workspace
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel<scalar_t, float>,
                     drive.get_device(),
                     total_chunk_tasks,
                     launch_threads)
@@ -2169,6 +2067,17 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                 latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
                     reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else if (use_float_workspace) {
+                latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
                     seq_len,
                     rank_dim,
                     num_chunks,
@@ -2199,6 +2108,17 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     stream,
                     chunk_prev,
                     final_state);
+            } else if (use_float_workspace) {
+                latent_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
             } else {
                 latent_prefix_scan_dispatch<scalar_t, scalar_t>(
                     chunk_mul,
@@ -2211,7 +2131,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     chunk_prev,
                     final_state);
             }
-            if (!use_half2) {
+            if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, true><<<persistent_grid, block, 0, stream>>>(
                     drive.data_ptr<scalar_t>(),
@@ -2224,7 +2144,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     work_queue_counter.data_ptr<int32_t>(),
                     prior_states.data_ptr<scalar_t>(),
                     states.data_ptr<scalar_t>());
-            } else {
+            } else if (use_half2) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel_half2<true><<<persistent_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
@@ -2237,6 +2157,19 @@ std::vector<torch::Tensor> causal_machine_latent_scan_forward_cuda(
                     work_queue_counter.data_ptr<int32_t>(),
                     reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
                     reinterpret_cast<c10::Half*>(states.data_ptr<scalar_t>()));
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel<scalar_t, float, true><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_prev.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>());
             }
         }
     });
@@ -2266,12 +2199,16 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, drive.scalar_type(), "latent_prior_scan_forward_cuda", [&] {
         const bool use_half2 = allow_half2;
         const bool use_bfloat162 = allow_bfloat162;
-        const bool use_vec2 = use_half2 || use_bfloat162;
-        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        // Match the main latent scan path: only use the fully sequential
+        // kernel on short sequences, even for low-precision activations.
+        const bool use_single_kernel = seq_len <= single_kernel_max_seq_len;
+        const bool use_float_workspace = use_half2 || use_bfloat162;
+        const bool use_vec2_launch = use_half2 || (use_bfloat162 && use_single_kernel);
+        const int rank_items = use_vec2_launch ? (rank_dim / 2) : rank_dim;
         const int launch_threads = latent_launch_threads(rank_items);
         const dim3 block(static_cast<unsigned int>(launch_threads));
         const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
-        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+        if (use_single_kernel) {
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_scan_forward_kernel_half2<false>,
@@ -2330,13 +2267,19 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     final_state.data_ptr<scalar_t>());
             }
         } else {
-            const auto workspace_dtype = use_half2 ? torch::kFloat32 : drive.scalar_type();
+            const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : drive.scalar_type();
             auto [chunk_mul, chunk_add, chunk_prev] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::ForwardPrior, drive, batch_size, num_chunks, rank_dim, workspace_dtype);
             const int total_chunk_tasks = batch_size * num_chunks;
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_chunk_summary_persistent_kernel_half2,
+                    drive.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : use_float_workspace
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_summary_persistent_kernel<scalar_t, float>,
                     drive.get_device(),
                     total_chunk_tasks,
                     launch_threads)
@@ -2353,6 +2296,17 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                 latent_chunk_summary_persistent_kernel_half2<<<persistent_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
                     reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else if (use_float_workspace) {
+                latent_chunk_summary_persistent_kernel<scalar_t, float><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
                     seq_len,
                     rank_dim,
                     num_chunks,
@@ -2383,6 +2337,17 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     stream,
                     chunk_prev,
                     final_state);
+            } else if (use_float_workspace) {
+                latent_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    initial_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_prev,
+                    final_state);
             } else {
                 latent_prefix_scan_dispatch<scalar_t, scalar_t>(
                     chunk_mul,
@@ -2395,7 +2360,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     chunk_prev,
                     final_state);
             }
-            if (!use_half2) {
+            if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel<scalar_t, scalar_t, false><<<persistent_grid, block, 0, stream>>>(
                     drive.data_ptr<scalar_t>(),
@@ -2408,7 +2373,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     work_queue_counter.data_ptr<int32_t>(),
                     prior_states.data_ptr<scalar_t>(),
                     nullptr);
-            } else {
+            } else if (use_half2) {
                 work_queue_counter.zero_();
                 latent_chunk_finalize_persistent_kernel_half2<false><<<persistent_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(drive.data_ptr<scalar_t>()),
@@ -2420,6 +2385,19 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_forward_cuda(
                     total_chunk_tasks,
                     work_queue_counter.data_ptr<int32_t>(),
                     reinterpret_cast<c10::Half*>(prior_states.data_ptr<scalar_t>()),
+                    nullptr);
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_finalize_persistent_kernel<scalar_t, float, false><<<persistent_grid, block, 0, stream>>>(
+                    drive.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_prev.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    prior_states.data_ptr<scalar_t>(),
                     nullptr);
             }
         }
@@ -2454,12 +2432,16 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, states.scalar_type(), "latent_scan_backward_cuda", [&] {
         const bool use_half2 = allow_half2;
         const bool use_bfloat162 = allow_bfloat162;
-        const bool use_vec2 = use_half2 || use_bfloat162;
-        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        // The fused backward recurrence is especially sensitive to precision
+        // loss; keep long sequences on the chunked float-workspace path.
+        const bool use_single_kernel = seq_len <= single_kernel_max_seq_len;
+        const bool use_float_workspace = use_half2 || use_bfloat162;
+        const bool use_vec2_launch = use_half2 || (use_bfloat162 && use_single_kernel);
+        const int rank_items = use_vec2_launch ? (rank_dim / 2) : rank_dim;
         const int launch_threads = latent_launch_threads(rank_items);
         const dim3 block(static_cast<unsigned int>(launch_threads));
         const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
-        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+        if (use_single_kernel) {
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_scan_backward_kernel_half2<true, true>,
@@ -2530,13 +2512,19 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     grad_initial_state.data_ptr<scalar_t>());
             }
         } else {
-            const auto workspace_dtype = use_half2 ? torch::kFloat32 : states.scalar_type();
+            const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::Backward, states, batch_size, num_chunks, rank_dim, workspace_dtype);
             const int total_chunk_tasks = batch_size * num_chunks;
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_chunk_backward_summary_persistent_kernel_half2<true>,
+                    states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : use_float_workspace
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true>,
                     states.get_device(),
                     total_chunk_tasks,
                     launch_threads)
@@ -2554,6 +2542,18 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
                     reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
                     reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else if (use_float_workspace) {
+                latent_chunk_backward_summary_persistent_kernel<scalar_t, float, true><<<persistent_grid, block, 0, stream>>>(
+                    grad_states.data_ptr<scalar_t>(),
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
                     seq_len,
                     rank_dim,
                     num_chunks,
@@ -2584,6 +2584,16 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     rank_dim,
                     stream,
                     chunk_carry);
+            } else if (use_float_workspace) {
+                latent_reverse_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
             } else {
                 latent_reverse_prefix_scan_dispatch<scalar_t, scalar_t>(
                     chunk_mul,
@@ -2595,7 +2605,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     stream,
                     chunk_carry);
             }
-            if (!use_half2) {
+            if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, true, true><<<persistent_grid, block, 0, stream>>>(
                     grad_states.data_ptr<scalar_t>(),
@@ -2613,7 +2623,7 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     grad_drive.data_ptr<scalar_t>(),
                     grad_decay.data_ptr<float>(),
                     grad_initial_state.data_ptr<scalar_t>());
-            } else {
+            } else if (use_half2) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel_half2<true, true><<<persistent_grid, block, 0, stream>>>(
                     reinterpret_cast<const c10::Half*>(grad_states.data_ptr<scalar_t>()),
@@ -2631,6 +2641,24 @@ std::vector<torch::Tensor> causal_machine_latent_scan_backward_cuda(
                     reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
                     grad_decay.data_ptr<float>(),
                     reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel<scalar_t, float, true, true><<<persistent_grid, block, 0, stream>>>(
+                    grad_states.data_ptr<scalar_t>(),
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    states.data_ptr<scalar_t>(),
+                    nullptr,
+                    initial_state.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_carry.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
             }
         }
     });
@@ -2663,12 +2691,15 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
     AT_DISPATCH_FLOATING_TYPES_AND2(torch::kHalf, torch::kBFloat16, prior_states.scalar_type(), "latent_prior_scan_backward_cuda", [&] {
         const bool use_half2 = allow_half2;
         const bool use_bfloat162 = allow_bfloat162;
-        const bool use_vec2 = use_half2 || use_bfloat162;
-        const int rank_items = use_vec2 ? (rank_dim / 2) : rank_dim;
+        // Keep prior-only backward aligned with the main latent backward path.
+        const bool use_single_kernel = seq_len <= single_kernel_max_seq_len;
+        const bool use_float_workspace = use_half2 || use_bfloat162;
+        const bool use_vec2_launch = use_half2 || (use_bfloat162 && use_single_kernel);
+        const int rank_items = use_vec2_launch ? (rank_dim / 2) : rank_dim;
         const int launch_threads = latent_launch_threads(rank_items);
         const dim3 block(static_cast<unsigned int>(launch_threads));
         const int rank_tiles = static_cast<int>((rank_items + launch_threads - 1) / launch_threads);
-        if (use_vec2 || seq_len <= single_kernel_max_seq_len) {
+        if (use_single_kernel) {
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_scan_backward_kernel_half2<false, false>,
@@ -2738,13 +2769,19 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     grad_initial_state.data_ptr<scalar_t>());
             }
         } else {
-            const auto workspace_dtype = use_half2 ? torch::kFloat32 : prior_states.scalar_type();
+            const auto workspace_dtype = use_float_workspace ? torch::kFloat32 : prior_states.scalar_type();
             auto [chunk_mul, chunk_add, chunk_carry] = get_or_create_latent_workspace(
                 LatentWorkspaceTag::BackwardPrior, prior_states, batch_size, num_chunks, rank_dim, workspace_dtype);
             const int total_chunk_tasks = batch_size * num_chunks;
             const int worker_blocks = use_half2
                 ? occupancy_persistent_worker_blocks(
                     latent_chunk_backward_summary_persistent_kernel_half2<false>,
+                    prior_states.get_device(),
+                    total_chunk_tasks,
+                    launch_threads)
+                : use_float_workspace
+                ? occupancy_persistent_worker_blocks(
+                    latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false>,
                     prior_states.get_device(),
                     total_chunk_tasks,
                     launch_threads)
@@ -2762,6 +2799,18 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     nullptr,
                     reinterpret_cast<const c10::Half*>(grad_prior_states.data_ptr<scalar_t>()),
                     reinterpret_cast<const c10::Half*>(decay.data_ptr<scalar_t>()),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    chunk_mul.data_ptr<float>(),
+                    chunk_add.data_ptr<float>());
+            } else if (use_float_workspace) {
+                latent_chunk_backward_summary_persistent_kernel<scalar_t, float, false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
                     seq_len,
                     rank_dim,
                     num_chunks,
@@ -2792,6 +2841,16 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     rank_dim,
                     stream,
                     chunk_carry);
+            } else if (use_float_workspace) {
+                latent_reverse_prefix_scan_dispatch<scalar_t, float>(
+                    chunk_mul,
+                    chunk_add,
+                    grad_final_state,
+                    batch_size,
+                    num_chunks,
+                    rank_dim,
+                    stream,
+                    chunk_carry);
             } else {
                 latent_reverse_prefix_scan_dispatch<scalar_t, scalar_t>(
                     chunk_mul,
@@ -2803,7 +2862,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     stream,
                     chunk_carry);
             }
-            if (!use_half2) {
+            if (!use_half2 && !use_float_workspace) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel<scalar_t, scalar_t, false, false><<<persistent_grid, block, 0, stream>>>(
                     nullptr,
@@ -2821,7 +2880,7 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     grad_drive.data_ptr<scalar_t>(),
                     grad_decay.data_ptr<float>(),
                     grad_initial_state.data_ptr<scalar_t>());
-            } else {
+            } else if (use_half2) {
                 work_queue_counter.zero_();
                 latent_chunk_backward_finalize_persistent_kernel_half2<false, false><<<persistent_grid, block, 0, stream>>>(
                     nullptr,
@@ -2839,6 +2898,24 @@ std::vector<torch::Tensor> causal_machine_latent_prior_scan_backward_cuda(
                     reinterpret_cast<c10::Half*>(grad_drive.data_ptr<scalar_t>()),
                     grad_decay.data_ptr<float>(),
                     reinterpret_cast<c10::Half*>(grad_initial_state.data_ptr<scalar_t>()));
+            } else {
+                work_queue_counter.zero_();
+                latent_chunk_backward_finalize_persistent_kernel<scalar_t, float, false, false><<<persistent_grid, block, 0, stream>>>(
+                    nullptr,
+                    grad_prior_states.data_ptr<scalar_t>(),
+                    nullptr,
+                    prior_states.data_ptr<scalar_t>(),
+                    initial_state.data_ptr<scalar_t>(),
+                    decay.data_ptr<scalar_t>(),
+                    chunk_carry.data_ptr<float>(),
+                    seq_len,
+                    rank_dim,
+                    num_chunks,
+                    total_chunk_tasks,
+                    work_queue_counter.data_ptr<int32_t>(),
+                    grad_drive.data_ptr<scalar_t>(),
+                    grad_decay.data_ptr<float>(),
+                    grad_initial_state.data_ptr<scalar_t>());
             }
         }
     });
@@ -2945,7 +3022,9 @@ __device__ __forceinline__ float latent_replace_block_reduce_sum(float value, fl
         }
         __syncthreads();
     }
-    return shared[0];
+    const float reduced = shared[0];
+    __syncthreads();
+    return reduced;
 }
 
 template <int kBlockThreads>
@@ -2958,7 +3037,9 @@ __device__ __forceinline__ float latent_replace_block_reduce_max(float value, fl
         }
         __syncthreads();
     }
-    return shared[0];
+    const float reduced = shared[0];
+    __syncthreads();
+    return reduced;
 }
 
 template <typename scalar_t>

@@ -77,6 +77,10 @@ void muon_prewarm_square_backend_cuda(const torch::Tensor& x);
 
 namespace {
 
+bool is_supported_muon_workspace_dtype(torch::ScalarType dtype) {
+    return dtype == torch::kFloat || dtype == torch::kBFloat16;
+}
+
 void check_pointer_tensor(
     const torch::Tensor& ptrs,
     int64_t expected_size,
@@ -128,7 +132,9 @@ void check_grouped_inputs(
         TORCH_CHECK(
             g.scalar_type() == torch::kFloat || g.scalar_type() == torch::kBFloat16 || g.scalar_type() == torch::kHalf,
             "grouped grads must use float, bf16, or fp16");
-        TORCH_CHECK(m.scalar_type() == p.scalar_type(), "momentum buffer dtype must match param dtype");
+        TORCH_CHECK(
+            m.scalar_type() == torch::kFloat || m.scalar_type() == p.scalar_type(),
+            "momentum buffer dtype must be float32 or match param dtype");
     }
 }
 
@@ -370,10 +376,13 @@ void muon_grouped_step_family_workspace(
     TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "effective_batch must be float32");
     TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "momentum_batch must be float32");
     TORCH_CHECK(norms.scalar_type() == torch::kFloat, "norms must be float32");
-    TORCH_CHECK(ns_input_batch.scalar_type() == torch::kBFloat16, "ns_input_batch must be bf16");
-    TORCH_CHECK(gram_batch.scalar_type() == torch::kBFloat16, "gram_batch must be bf16");
-    TORCH_CHECK(gram_sq_batch.scalar_type() == torch::kBFloat16, "gram_sq_batch must be bf16");
-    TORCH_CHECK(next_x_batch.scalar_type() == torch::kBFloat16, "next_x_batch must be bf16");
+    const auto workspace_dtype = ns_input_batch.scalar_type();
+    TORCH_CHECK(
+        is_supported_muon_workspace_dtype(workspace_dtype),
+        "ns_input_batch must be float32 or bf16");
+    TORCH_CHECK(gram_batch.scalar_type() == workspace_dtype, "gram_batch dtype must match ns_input_batch");
+    TORCH_CHECK(gram_sq_batch.scalar_type() == workspace_dtype, "gram_sq_batch dtype must match ns_input_batch");
+    TORCH_CHECK(next_x_batch.scalar_type() == workspace_dtype, "next_x_batch dtype must match ns_input_batch");
     TORCH_CHECK(std::isfinite(lr), "lr must be finite");
     TORCH_CHECK(std::isfinite(momentum), "momentum must be finite");
     TORCH_CHECK(std::isfinite(weight_decay), "weight_decay must be finite");
@@ -477,10 +486,13 @@ void muon_grouped_step_family_workspace_capturable(
     TORCH_CHECK(effective_batch.scalar_type() == torch::kFloat, "effective_batch must be float32");
     TORCH_CHECK(momentum_batch.scalar_type() == torch::kFloat, "momentum_batch must be float32");
     TORCH_CHECK(norms.scalar_type() == torch::kFloat, "norms must be float32");
-    TORCH_CHECK(ns_input_batch.scalar_type() == torch::kBFloat16, "ns_input_batch must be bf16");
-    TORCH_CHECK(gram_batch.scalar_type() == torch::kBFloat16, "gram_batch must be bf16");
-    TORCH_CHECK(gram_sq_batch.scalar_type() == torch::kBFloat16, "gram_sq_batch must be bf16");
-    TORCH_CHECK(next_x_batch.scalar_type() == torch::kBFloat16, "next_x_batch must be bf16");
+    const auto workspace_dtype = ns_input_batch.scalar_type();
+    TORCH_CHECK(
+        is_supported_muon_workspace_dtype(workspace_dtype),
+        "ns_input_batch must be float32 or bf16");
+    TORCH_CHECK(gram_batch.scalar_type() == workspace_dtype, "gram_batch dtype must match ns_input_batch");
+    TORCH_CHECK(gram_sq_batch.scalar_type() == workspace_dtype, "gram_sq_batch dtype must match ns_input_batch");
+    TORCH_CHECK(next_x_batch.scalar_type() == workspace_dtype, "next_x_batch dtype must match ns_input_batch");
     check_pointer_tensor(param_ptrs, bucket_size, ref_device, "param_ptrs");
     check_pointer_tensor(grad_ptrs, bucket_size, ref_device, "grad_ptrs");
     TORCH_CHECK(lr.is_cuda() && lr.scalar_type() == torch::kFloat && lr.numel() == 1, "lr must be a CUDA float32 scalar tensor");
