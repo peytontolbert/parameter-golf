@@ -22,8 +22,9 @@ import time
 import uuid
 import warnings
 import zlib
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -85,6 +86,7 @@ ALLOW_CAUSAL_MACHINE_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHI
 ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING", "1")))
 USE_MUON_CUDA = bool(int(os.environ.get("USE_MUON_CUDA", "1")))
 PROFILE_MUON_STEP = bool(int(os.environ.get("PROFILE_MUON_STEP", "0")))
+PROFILE_STATE_SPACE_BLOCKS = bool(int(os.environ.get("PROFILE_STATE_SPACE_BLOCKS", "0")))
 MUON_CUDA_BUCKET_POLICY = os.environ.get("MUON_CUDA_BUCKET_POLICY", "auto").strip().lower()
 MUON_CUDA_ERROR_MODE = os.environ.get("MUON_CUDA_ERROR_MODE", "warn").strip().lower()
 # Historical env name retained for compatibility. This gates the prepacked
@@ -109,6 +111,145 @@ _MUON_CUDA_WARNED_FAILURE_KEYS: set[str] = set()
 
 def _allow_cuda_training_kernels(allow_training: bool) -> bool:
     return (not torch.is_grad_enabled()) or bool(allow_training)
+
+
+def _start_state_space_runtime_profile(device: torch.device) -> dict[str, object] | None:
+    if not PROFILE_STATE_SPACE_BLOCKS:
+        return None
+    if device.type == "cuda":
+        try:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
+            return {
+                "clock": "cuda",
+                "device_index": int(device.index if device.index is not None else torch.cuda.current_device()),
+                "marks": {"total_start": start},
+            }
+        except Exception:
+            return None
+    return {
+        "clock": "cpu",
+        "marks": {"total_start": time.perf_counter()},
+    }
+
+
+def _mark_state_space_runtime_profile(profile: dict[str, object] | None, name: str) -> None:
+    if profile is None:
+        return
+    marks = profile.get("marks")
+    if not isinstance(marks, dict):
+        return
+    if profile.get("clock") == "cuda":
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        marks[name] = event
+    else:
+        marks[name] = time.perf_counter()
+
+
+def _state_space_runtime_profile_durations_ms(profile: dict[str, object] | None) -> dict[str, float]:
+    if not isinstance(profile, dict):
+        return {}
+    marks = profile.get("marks")
+    if not isinstance(marks, dict):
+        return {}
+    start = marks.get("total_start")
+    after_project = marks.get("after_project")
+    after_filter = marks.get("after_filter")
+    end = marks.get("total_end")
+    if start is None or end is None:
+        return {}
+    try:
+        if profile.get("clock") == "cuda":
+            project_ms = float(start.elapsed_time(after_project)) if after_project is not None else 0.0
+            filter_ms = float(after_project.elapsed_time(after_filter)) if after_project is not None and after_filter is not None else 0.0
+            decode_ms = float(after_filter.elapsed_time(end)) if after_filter is not None else 0.0
+            total_ms = float(start.elapsed_time(end))
+        else:
+            project_ms = (float(after_project) - float(start)) * 1000.0 if after_project is not None else 0.0
+            filter_ms = (float(after_filter) - float(after_project)) * 1000.0 if after_project is not None and after_filter is not None else 0.0
+            decode_ms = (float(end) - float(after_filter)) * 1000.0 if after_filter is not None else 0.0
+            total_ms = (float(end) - float(start)) * 1000.0
+    except Exception:
+        return {}
+    return {
+        "project_ms": max(project_ms, 0.0),
+        "filter_ms": max(filter_ms, 0.0),
+        "decode_ms": max(decode_ms, 0.0),
+        "total_ms": max(total_ms, 0.0),
+    }
+
+
+def _block_runtime_profile_durations_ms(profile: dict[str, object] | None) -> dict[str, float]:
+    if not isinstance(profile, dict):
+        return {}
+    marks = profile.get("marks")
+    if not isinstance(marks, dict):
+        return {}
+    start = marks.get("total_start")
+    after_core = marks.get("after_core")
+    end = marks.get("total_end")
+    if start is None or end is None:
+        return {}
+    try:
+        if profile.get("clock") == "cuda":
+            core_ms = float(start.elapsed_time(after_core)) if after_core is not None else 0.0
+            total_ms = float(start.elapsed_time(end))
+        else:
+            core_ms = (float(after_core) - float(start)) * 1000.0 if after_core is not None else 0.0
+            total_ms = (float(end) - float(start)) * 1000.0
+    except Exception:
+        return {}
+    mlp_ms = max(total_ms - core_ms, 0.0)
+    return {
+        "core_ms": max(core_ms, 0.0),
+        "mlp_ms": mlp_ms,
+        "total_ms": max(total_ms, 0.0),
+    }
+
+
+def _format_named_count_histogram(counter: Counter[str], *, max_items: int = 4) -> str:
+    if not counter:
+        return "none"
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    return ",".join(f"{name}:{count}" for name, count in items[:max_items])
+
+
+def _format_named_time_histogram(counter: Counter[str], total_ms: float, *, max_items: int = 4) -> str:
+    if not counter or total_ms <= 0.0:
+        return "none"
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    return ",".join(
+        f"{name}:{value:.2f}ms({(100.0 * value / total_ms):.1f}%)"
+        for name, value in items[:max_items]
+    )
+
+
+def _prime_block_runtime_profile_sample(
+    model: nn.Module,
+    *,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    device: torch.device,
+) -> None:
+    if batch_size <= 0 or seq_len <= 0:
+        return
+    was_training = bool(model.training)
+    sample_ids = torch.randint(0, int(vocab_size), (int(batch_size), int(seq_len)), device=device, dtype=torch.int64)
+    try:
+        model.eval()
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            forward_features = getattr(model, "_forward_features", None)
+            if callable(forward_features):
+                forward_features(sample_ids)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    finally:
+        if was_training:
+            model.train()
 
 
 def _torch_dynamo_disable_if_available(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -2419,6 +2560,17 @@ def _bounded_gate(logits: Tensor, min_env: str, max_env: str, *, default_min: fl
     return min_gate + (max_gate - min_gate) * sig
 
 
+def _inverse_bounded_latent_decay_scalar(value: float) -> float:
+    min_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MIN", 0.99)
+    max_decay = _cached_env_float("CAUSAL_MACHINE_LATENT_DECAY_MAX", 0.9995)
+    min_decay = min(max(min_decay, 1.0e-6), 0.999999)
+    max_decay = min(max(max_decay, min_decay + 1e-6), 0.999999)
+    target = min(max(float(value), min_decay + 1.0e-6), max_decay - 1.0e-6)
+    normalized = (target - min_decay) / max(max_decay - min_decay, 1.0e-6)
+    normalized = min(max(normalized, 1.0e-6), 1.0 - 1.0e-6)
+    return inverse_sigmoid_scalar(normalized)
+
+
 def _env_enabled(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "1" if default else "0").strip().lower()
     return raw not in {"", "0", "false", "no", "off"}
@@ -2498,6 +2650,7 @@ def _prepare_structured_filter_inputs(
     return effective_context, effective_gate
 
 
+@_torch_dynamo_disable_if_available
 def causal_machine_scan_cuda(
     local_logits: Tensor,
     transition_source_logits: Tensor,
@@ -2553,6 +2706,73 @@ def causal_machine_scan_cuda(
         float(score_clamp_max),
         False if clamp_active else (_structured_filter_mode() == "composable"),
         )
+
+
+class _CausalMachineBeliefDecodeCudaFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state_log_beliefs: Tensor, belief_out_weight: Tensor) -> Tensor:
+        ext = load_causal_machine_scan_cuda()
+        state_log_beliefs_in = state_log_beliefs.contiguous()
+        belief_out_weight_f32 = belief_out_weight.contiguous().float()
+        output = ext.decode_belief_projection(
+            state_log_beliefs_in,
+            belief_out_weight_f32,
+        )
+        ctx.save_for_backward(state_log_beliefs_in, belief_out_weight_f32)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor | None, Tensor | None]:
+        ext = load_causal_machine_scan_cuda()
+        state_log_beliefs, belief_out_weight = ctx.saved_tensors
+        grad_output_in = grad_output.contiguous()
+        grad_input = (
+            ext.decode_belief_projection_backward_input(
+                grad_output_in,
+                state_log_beliefs,
+                belief_out_weight,
+            )
+            if ctx.needs_input_grad[0]
+            else None
+        )
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            backward_weight = getattr(ext, "decode_belief_projection_backward_weight", None)
+            if backward_weight is not None:
+                grad_weight = backward_weight(
+                    grad_output_in,
+                    state_log_beliefs,
+                ).to(dtype=belief_out_weight.dtype)
+            else:
+                belief_probs_2d = state_log_beliefs.float().exp().reshape(-1, state_log_beliefs.size(-1))
+                grad_output_2d = grad_output_in.float().reshape(-1, grad_output_in.size(-1))
+                grad_weight = grad_output_2d.transpose(0, 1).matmul(belief_probs_2d).to(dtype=belief_out_weight.dtype)
+        return grad_input, grad_weight
+
+
+def _can_use_causal_machine_belief_decode_cuda(
+    state_log_beliefs: Tensor,
+    belief_out_weight: Tensor,
+) -> bool:
+    return bool(
+        state_log_beliefs.is_cuda
+        and belief_out_weight.is_cuda
+        and state_log_beliefs.ndim == 3
+        and belief_out_weight.ndim == 2
+        and int(state_log_beliefs.size(-1)) > 0
+        and int(state_log_beliefs.size(-1)) <= 128
+        and int(belief_out_weight.size(1)) == int(state_log_beliefs.size(-1))
+        and state_log_beliefs.dtype in {torch.float16, torch.bfloat16, torch.float32}
+        and belief_out_weight.dtype == torch.float32
+    )
+
+
+@_torch_dynamo_disable_if_available
+def causal_machine_belief_decode_cuda(
+    state_log_beliefs: Tensor,
+    belief_out_weight: Tensor,
+) -> Tensor:
+    return _CausalMachineBeliefDecodeCudaFn.apply(state_log_beliefs, belief_out_weight)
 
 
 class _CausalMachineMaskedScanCudaFn(torch.autograd.Function):
@@ -7085,10 +7305,64 @@ class AttentionStepCache:
     k: Tensor | None = None
     v: Tensor | None = None
     max_len: int | None = None
+    length: int = 0
 
     def reset(self) -> None:
         self.k = None
         self.v = None
+        self.length = 0
+
+    def append(self, k_new: Tensor, v_new: Tensor) -> tuple[Tensor, Tensor]:
+        if k_new.ndim != 4 or v_new.ndim != 4:
+            raise ValueError(
+                f"AttentionStepCache.append expects rank-4 K/V tensors, got {tuple(k_new.shape)} and {tuple(v_new.shape)}"
+            )
+        if k_new.shape != v_new.shape:
+            raise ValueError(
+                f"AttentionStepCache.append expects matching K/V shapes, got {tuple(k_new.shape)} and {tuple(v_new.shape)}"
+            )
+        max_len = int(self.max_len) if self.max_len is not None else 0
+        if max_len <= 0:
+            k_total = k_new if self.k is None else torch.cat((self.k, k_new), dim=-2)
+            v_total = v_new if self.v is None else torch.cat((self.v, v_new), dim=-2)
+            self.k = k_total.detach()
+            self.v = v_total.detach()
+            self.length = int(k_total.size(-2))
+            return self.k, self.v
+        needs_alloc = (
+            self.k is None
+            or self.v is None
+            or tuple(self.k.shape) != (int(k_new.size(0)), int(k_new.size(1)), max_len, int(k_new.size(3)))
+            or tuple(self.v.shape) != (int(v_new.size(0)), int(v_new.size(1)), max_len, int(v_new.size(3)))
+            or self.k.device != k_new.device
+            or self.v.device != v_new.device
+            or self.k.dtype != k_new.dtype
+            or self.v.dtype != v_new.dtype
+        )
+        if needs_alloc:
+            self.k = torch.empty(
+                (int(k_new.size(0)), int(k_new.size(1)), max_len, int(k_new.size(3))),
+                device=k_new.device,
+                dtype=k_new.dtype,
+            )
+            self.v = torch.empty(
+                (int(v_new.size(0)), int(v_new.size(1)), max_len, int(v_new.size(3))),
+                device=v_new.device,
+                dtype=v_new.dtype,
+            )
+            self.length = 0
+        assert self.k is not None and self.v is not None
+        if self.length < max_len:
+            write_idx = self.length
+            self.length += 1
+        else:
+            self.k[:, :, :-1, :].copy_(self.k[:, :, 1:, :])
+            self.v[:, :, :-1, :].copy_(self.v[:, :, 1:, :])
+            write_idx = max_len - 1
+            self.length = max_len
+        self.k[:, :, write_idx : write_idx + 1, :].copy_(k_new)
+        self.v[:, :, write_idx : write_idx + 1, :].copy_(v_new)
+        return self.k[:, :, : self.length, :], self.v[:, :, : self.length, :]
 
 
 @dataclass
@@ -7127,7 +7401,7 @@ LOCAL_PROXY_RECIPE_COMMON: dict[str, object] = {
     "block_pattern": "attn,attn,attn,attn,ssm,ssm,ssm,ssm,ssm,ssm",
     "causal_machine_num_states": 128,
     "causal_machine_hidden_rank": 64,
-    "causal_machine_transition_rank": 8,
+    "causal_machine_transition_rank": 16,
     "causal_machine_latent_rank": 16,
     "causal_machine_latent_mode": "replace",
     "causal_machine_scale_init": 0.35,
@@ -7261,6 +7535,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "2048"))
     competition_mode = _competition_mode_enabled()
+    lr_schedule = os.environ.get("LR_SCHEDULE", "cosine" if competition_mode else "warmdown").strip().lower()
+    lr_min_scale = float(os.environ.get("LR_MIN_SCALE", "0.10" if competition_mode else "0.0"))
     training_preset = os.environ.get("TRAINING_PRESET", "local_proxy_promotion").strip().lower()
     recipe_family = os.environ.get("RECIPE_FAMILY", "").strip().lower()
     curriculum_policy = os.environ.get("CURRICULUM_POLICY", "").strip().lower()
@@ -7617,6 +7893,9 @@ class Hyperparameters:
     grad_sanitize_clamp_abs = float(os.environ.get("GRAD_SANITIZE_CLAMP_ABS", "0.0"))
 
     def __init__(self):
+        if self.lr_schedule not in {"warmdown", "cosine"}:
+            raise ValueError(f"LR_SCHEDULE={self.lr_schedule!r} must be one of: warmdown, cosine")
+        self.lr_min_scale = min(max(float(self.lr_min_scale), 0.0), 1.0)
         if self.muon_cuda_graph_mode not in {"auto", "on", "off"}:
             raise ValueError(
                 f"MUON_CUDA_GRAPH_MODE={self.muon_cuda_graph_mode!r} must be one of: auto, on, off"
@@ -7637,6 +7916,8 @@ class Hyperparameters:
             "early_val_max_seqs": "EARLY_VAL_MAX_SEQS",
             "lr_warmup_steps": "LR_WARMUP_STEPS",
             "lr_warmup_init_scale": "LR_WARMUP_INIT_SCALE",
+            "lr_schedule": "LR_SCHEDULE",
+            "lr_min_scale": "LR_MIN_SCALE",
             "num_layers": "NUM_LAYERS",
             "mlp_hidden": "MLP_HIDDEN",
             "rope_dims": "ROPE_DIMS",
@@ -7981,11 +8262,16 @@ def _muon_prefers_cuda_bucket_for_graph_capture(
     bucket_elements = elements * int(bucket_size)
     if bucket_size < 2:
         return False
+    # Full-step graph capture cannot tolerate Python Muon fallback in just one
+    # optimizer bucket. The competition SSM blocks contribute several medium and
+    # small matrix families (for example 64x64, 128x64, and the bf16 128x16
+    # transition-source heads) that are still profitable to keep on the CUDA-side
+    # grouped path once launch overhead is amortized across captured replay.
     if rows == cols:
-        return bucket_size >= 4 and bucket_elements >= 262144
+        return bucket_size >= 4 and bucket_elements >= 16384
     if rows > cols:
-        return bucket_elements >= 262144
-    return bucket_elements >= 131072
+        return bucket_elements >= 8192
+    return bucket_elements >= 65536
 
 
 def _muon_bucket_family_code(shape: tuple[int, int]) -> int:
@@ -11543,14 +11829,14 @@ class CausalSelfAttention(nn.Module):
         self.fast_path = True
 
     @torch._dynamo.disable
-    def _flash_attn_3(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def _flash_attn_3(self, q: Tensor, k: Tensor, v: Tensor, *, causal: bool = True) -> Tensor:
         if flash_attn_3_func is None:
             raise RuntimeError("FA3 path requested but flash_attn_interface is unavailable")
         return flash_attn_3_func(
             q.transpose(1, 2).contiguous(),
             k.transpose(1, 2).contiguous(),
             v.transpose(1, 2).contiguous(),
-            causal=True,
+            causal=causal,
         ).transpose(1, 2).contiguous()
 
     def _scaled_dot_product_attention(
@@ -11684,7 +11970,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward_dense(self, q: Tensor, k: Tensor, v: Tensor, dtype: torch.dtype) -> Tensor:
         if self.use_flash_attn_3:
-            return self._flash_attn_3(q, k, v)
+            return self._flash_attn_3(q, k, v, causal=True)
         return self._scaled_dot_product_attention(q, k, v, is_causal=True)
 
     def forward(
@@ -11720,15 +12006,12 @@ class CausalSelfAttention(nn.Module):
         if seqlen != 1:
             raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
         q, k_new, v_new = self._project_qkv_step(x, position=position, q_gain_delta=q_gain_delta)
-        k_total = k_new if cache.k is None else torch.cat((cache.k, k_new), dim=-2)
-        v_total = v_new if cache.v is None else torch.cat((cache.v, v_new), dim=-2)
-        if cache.max_len is not None and cache.max_len > 0:
-            k_total = k_total[:, :, -cache.max_len :, :]
-            v_total = v_total[:, :, -cache.max_len :, :]
-        cache.k = k_total.detach()
-        cache.v = v_total.detach()
-        k_attn, v_attn = self._repeat_gqa_kv(k_total, v_total)
-        y = self._scaled_dot_product_attention(q, k_attn, v_attn, is_causal=False)
+        k_total, v_total = cache.append(k_new, v_new)
+        if self.use_flash_attn_3:
+            y = self._flash_attn_3(q, k_total, v_total, causal=False)
+        else:
+            k_attn, v_attn = self._repeat_gqa_kv(k_total, v_total)
+            y = self._scaled_dot_product_attention(q, k_attn, v_attn, is_causal=False)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -11793,6 +12076,7 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.last_aux: dict[str, Tensor | None] = {}
+        self.last_block_runtime_profile: dict[str, object] = {}
         self.fast_path = True
 
     def forward_simple(
@@ -11802,12 +12086,14 @@ class Block(nn.Module):
         q_gain_delta: Tensor | None = None,
         norm_condition: Tensor | None = None,
     ) -> Tensor:
+        block_runtime_profile = _start_state_space_runtime_profile(x.device)
         mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
         x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
         attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_simple(attn_normed, q_gain_delta=q_gain_delta)
+        _mark_state_space_runtime_profile(block_runtime_profile, "after_core")
         x = _sanitize_residual_stream_tensor(
             x * self.residual_alpha
             + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
@@ -11818,6 +12104,12 @@ class Block(nn.Module):
             x * self.residual_alpha
             + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
         )
+        _mark_state_space_runtime_profile(block_runtime_profile, "total_end")
+        if block_runtime_profile is not None:
+            block_runtime_profile = dict(block_runtime_profile)
+            block_runtime_profile["block_kind"] = "attention"
+            block_runtime_profile["core_backend"] = "flash_attn_3" if self.attn.use_flash_attn_3 else "sdpa"
+            self.last_block_runtime_profile = block_runtime_profile
         return x
 
     def forward_simple_step(
@@ -11899,7 +12191,20 @@ class CausalStateMixer(nn.Module):
         if self.latent_rank <= 0:
             latent_mode = "off"
         self.latent_mode = latent_mode
-        self.uses_structured_transition_params = not (self.latent_mode == "replace" and self.latent_rank > 0)
+        self.replace_uses_structured = _env_enabled(
+            "CAUSAL_MACHINE_BLOCK_REPLACE_STRUCTURED",
+            default=_competition_mode_enabled(),
+        )
+        self.uses_latent_replace_token_trust = bool(
+            self.latent_rank > 0
+            and self.latent_mode in {"replace", "auto"}
+            and not self.replace_uses_structured
+        )
+        self.uses_structured_transition_params = (
+            self.latent_mode != "replace"
+            or self.latent_rank <= 0
+            or self.replace_uses_structured
+        )
         self.filter_chunk_size = _resolve_structured_scan_chunk_size(train_seq_len, transition_rank)
         self.transition_context_rank = max(8, min(16, hidden_rank))
         self.track_state_ce = bool(track_state_ce)
@@ -11919,6 +12224,9 @@ class CausalStateMixer(nn.Module):
         self.transition_gate_proj._zero_init = True
         self.transition_pred_scale_proj = CastedLinear(hidden_rank, 1, bias=False)
         self.transition_pred_scale_proj._zero_init = True
+        if not self.uses_latent_replace_token_trust:
+            self.transition_gate_proj.weight.requires_grad_(False)
+            self.transition_pred_scale_proj.weight.requires_grad_(False)
         self.belief_out = CastedLinear(num_states, dim, bias=False)
         self.output_scale = nn.Parameter(torch.tensor(inverse_softplus_scalar(scale_init), dtype=torch.float32))
         self.output_gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
@@ -11929,7 +12237,7 @@ class CausalStateMixer(nn.Module):
             nn.Parameter(
                 torch.full(
                     (self.latent_rank,),
-                    fill_value=inverse_sigmoid_scalar(latent_decay_init),
+                    fill_value=_inverse_bounded_latent_decay_scalar(latent_decay_init),
                     dtype=torch.float32,
                 )
             )
@@ -11964,6 +12272,7 @@ class CausalStateMixer(nn.Module):
         self.future_sketch_dim = 0
         self.last_aux: dict[str, Tensor | None] = {}
         self.last_kernel_info: dict[str, object] = {}
+        self.last_runtime_profile: dict[str, object] = {}
         self.fast_path = True
         self._auto_mode_cache: dict[tuple[int, int, int, int, str], str] = {}
         self._packed_transition_cache: dict[str, object] = {}
@@ -12018,9 +12327,9 @@ class CausalStateMixer(nn.Module):
         return self.log_state_priors.to(device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1).contiguous()
 
     def _project_hidden(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        prev_x = torch.cat([torch.zeros_like(x[:, :1, :]), x[:, :-1, :]], dim=1)
-        delta = x - prev_x
-        state_features = x + 0.5 * delta
+        # Build 1.5 * x - 0.5 * x[t-1] directly to avoid separate prev/delta tensors.
+        state_features = x * 1.5
+        state_features[:, 1:, :].add_(x[:, :-1, :], alpha=-0.5)
         state_hidden = self.prefix_down(state_features)
         state_hidden = torch.tanh(self.decoder_hidden(state_hidden))
         local_logits = self.state_head(state_hidden)
@@ -12884,7 +13193,20 @@ class CausalStateMixer(nn.Module):
             nan_value=1.0,
         ).to(device=state_hidden.device, dtype=state_hidden.dtype)
         gate = torch.sigmoid(self.output_gate).to(device=state_hidden.device, dtype=state_hidden.dtype)
-        belief_features = self.belief_out(state_log_beliefs.exp().to(dtype=state_hidden.dtype))
+        belief_out_weight = self.belief_out.weight
+        if self.belief_out.fake_quant_bits > 0:
+            belief_out_weight = fake_quantize_tensor(belief_out_weight, self.belief_out.fake_quant_bits)
+        decode_backend = "linear"
+        if _can_use_causal_machine_belief_decode_cuda(state_log_beliefs, belief_out_weight):
+            belief_features = causal_machine_belief_decode_cuda(state_log_beliefs, belief_out_weight)
+            decode_backend = "cuda_fused_belief_projection"
+        else:
+            belief_probs = state_log_beliefs.exp()
+            if belief_probs.dtype != state_hidden.dtype:
+                belief_probs = belief_probs.to(dtype=state_hidden.dtype)
+            belief_features = self.belief_out(belief_probs)
+        if self.last_kernel_info is not None:
+            self.last_kernel_info["decode_backend"] = decode_backend
         hidden_gate = torch.tanh(self.hidden_gate(state_hidden))
         emit_scale = _bounded_positive_control_tensor(
             F.softplus(self.emit_delta_scale),
@@ -12893,14 +13215,23 @@ class CausalStateMixer(nn.Module):
             dtype=state_hidden.dtype,
             nan_value=0.0,
         ).to(device=state_hidden.device, dtype=state_hidden.dtype)
-        return scale * gate * belief_features * (1.0 + emit_scale * hidden_gate)
+        post_decode_scale = (scale * gate) * (1.0 + emit_scale * hidden_gate)
+        belief_features = belief_features * post_decode_scale
+        return belief_features
 
     def forward_simple(self, x: Tensor, runtime_config: StructuredScanRuntimeConfig | None = None) -> Tensor:
         batch_size = int(x.size(0))
+        runtime_profile = _start_state_space_runtime_profile(x.device)
         state_hidden, local_logits, transition_context = self._project_hidden(x)
+        _mark_state_space_runtime_profile(runtime_profile, "after_project")
         latent_mode = self._resolved_latent_mode(int(x.size(1)), x.device)
         self.last_kernel_info = {}
-        if latent_mode == "replace":
+        self.last_runtime_profile = {}
+        if latent_mode in {"additive", "replace"} and (latent_mode != "replace" or self.replace_uses_structured):
+            latent_logits = self._compute_latent_logits_sequence(state_hidden)
+            if latent_logits is not None:
+                local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
+        if latent_mode == "replace" and not self.replace_uses_structured:
             state_log_beliefs, _, prior_log_beliefs = self._latent_replace_sequence_beliefs(
                 local_logits,
                 transition_context,
@@ -12913,10 +13244,6 @@ class CausalStateMixer(nn.Module):
                 "uses_paged_cache": False,
             }
         else:
-            if latent_mode == "additive":
-                latent_logits = self._compute_latent_logits_sequence(state_hidden)
-                if latent_logits is not None:
-                    local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
             initial_log_belief = self._initial_log_belief(batch_size, x.device, torch.float32)
             state_log_beliefs, _, prior_log_beliefs = self._filter_sequence(
                 local_logits,
@@ -12924,6 +13251,7 @@ class CausalStateMixer(nn.Module):
                 initial_log_belief,
                 runtime_config=runtime_config,
             )
+        _mark_state_space_runtime_profile(runtime_profile, "after_filter")
         future_sketch_pred = (
             self.future_sketch_head(state_hidden)
             if self.track_future_sketch and self.future_sketch_head is not None
@@ -12936,7 +13264,18 @@ class CausalStateMixer(nn.Module):
             "future_sketch_pred": future_sketch_pred,
             "block_hidden": None,
         }
-        return self._decode(state_hidden, state_log_beliefs)
+        decoded = self._decode(state_hidden, state_log_beliefs)
+        _mark_state_space_runtime_profile(runtime_profile, "total_end")
+        if runtime_profile is not None:
+            runtime_profile = dict(runtime_profile)
+            runtime_profile["mode"] = "sequence"
+            runtime_profile["seq_len"] = int(x.size(1))
+            runtime_profile["path"] = str(self.last_kernel_info.get("path", ""))
+            runtime_profile["kernel_family"] = str(
+                self.last_kernel_info.get("kernel_family", self.last_kernel_info.get("family", ""))
+            )
+            self.last_runtime_profile = runtime_profile
+        return decoded
 
     def forward_step(
         self,
@@ -12946,9 +13285,12 @@ class CausalStateMixer(nn.Module):
     ) -> Tensor:
         if x.size(1) != 1:
             raise ValueError(f"forward_step expects seq_len=1, got {tuple(x.shape)}")
+        runtime_profile = _start_state_space_runtime_profile(x.device)
         state_hidden, local_logits, transition_context = self._project_hidden(x)
+        _mark_state_space_runtime_profile(runtime_profile, "after_project")
         latent_mode = self._resolved_latent_mode(1, x.device)
         self.last_kernel_info = {}
+        self.last_runtime_profile = {}
         if runtime_config is not None and runtime_config.use_paged_cache and cache.paged_log_beliefs is None:
             runtime_config = _resolve_structured_scan_runtime_config(
                 runtime_config,
@@ -12980,7 +13322,11 @@ class CausalStateMixer(nn.Module):
             and not _structured_runtime_supports_fused_paged_step(runtime_config)
         ):
             cache.restore_latest_from_paged()
-        if latent_mode == "replace":
+        if latent_mode in {"additive", "replace"} and (latent_mode != "replace" or self.replace_uses_structured):
+            latent_logits = self._compute_latent_logits_step(state_hidden, cache)
+            if latent_logits is not None:
+                local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
+        if latent_mode == "replace" and not self.replace_uses_structured:
             state_log_beliefs, _prior_log_beliefs = self._latent_replace_step_beliefs(
                 local_logits,
                 transition_context,
@@ -12995,17 +13341,24 @@ class CausalStateMixer(nn.Module):
                 "paged_cache_write_backend": str(cache.last_paged_write_backend),
             }
         else:
-            if latent_mode == "additive":
-                latent_logits = self._compute_latent_logits_step(state_hidden, cache)
-                if latent_logits is not None:
-                    local_logits = local_logits + latent_logits.to(dtype=local_logits.dtype)
             state_log_beliefs = self._filter_step(
                 local_logits,
                 transition_context,
                 cache,
                 runtime_config=runtime_config,
             )
+        _mark_state_space_runtime_profile(runtime_profile, "after_filter")
         decoded = self._decode(state_hidden, state_log_beliefs)
+        _mark_state_space_runtime_profile(runtime_profile, "total_end")
+        if runtime_profile is not None:
+            runtime_profile = dict(runtime_profile)
+            runtime_profile["mode"] = "step"
+            runtime_profile["seq_len"] = 1
+            runtime_profile["path"] = str(self.last_kernel_info.get("path", ""))
+            runtime_profile["kernel_family"] = str(
+                self.last_kernel_info.get("kernel_family", self.last_kernel_info.get("family", ""))
+            )
+            self.last_runtime_profile = runtime_profile
         if runtime_config is not None and runtime_config.use_paged_cache and runtime_config.paged_resident_only:
             cache.drop_resident_state()
         return decoded
@@ -13076,6 +13429,7 @@ class StateSpaceBlock(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.last_block_runtime_profile: dict[str, object] = {}
         self.fast_path = True
 
     def forward_simple(
@@ -13086,6 +13440,7 @@ class StateSpaceBlock(nn.Module):
         norm_condition: Tensor | None = None,
     ) -> Tensor:
         del q_gain_delta
+        block_runtime_profile = _start_state_space_runtime_profile(x.device)
         mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
         norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
         x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
@@ -13093,6 +13448,7 @@ class StateSpaceBlock(nn.Module):
         attn_normed = attn_normed * norm_scale
         attn_out = self.attn.forward_simple(attn_normed)
         self.last_aux = dict(self.attn.last_aux)
+        _mark_state_space_runtime_profile(block_runtime_profile, "after_core")
         x = _sanitize_residual_stream_tensor(
             x * self.residual_alpha
             + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
@@ -13104,6 +13460,15 @@ class StateSpaceBlock(nn.Module):
             + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
         )
         self.last_aux["block_hidden"] = x
+        _mark_state_space_runtime_profile(block_runtime_profile, "total_end")
+        if block_runtime_profile is not None:
+            block_runtime_profile = dict(block_runtime_profile)
+            block_runtime_profile["block_kind"] = "ssm"
+            block_runtime_profile["core_backend"] = str(self.attn.last_kernel_info.get("path", "unset"))
+            block_runtime_profile["kernel_family"] = str(
+                self.attn.last_kernel_info.get("kernel_family", self.attn.last_kernel_info.get("family", "unset"))
+            )
+            self.last_block_runtime_profile = block_runtime_profile
         return x
 
     def forward_simple_step(
@@ -13423,7 +13788,7 @@ class GPT(nn.Module):
             nn.Parameter(
                 torch.full(
                     (self.causal_machine_latent_rank,),
-                    fill_value=inverse_sigmoid_scalar(self.causal_machine_latent_decay_init),
+                    fill_value=_inverse_bounded_latent_decay_scalar(self.causal_machine_latent_decay_init),
                     dtype=torch.float32,
                 )
             )
@@ -14807,6 +15172,263 @@ class GPT(nn.Module):
             return x, h_mid, pre_final
         return x, h_mid
 
+    def summarize_state_space_block_runtime(self) -> dict[str, object]:
+        state_blocks = [block for block in self.blocks if isinstance(block, StateSpaceBlock)]
+        path_counts: Counter[str] = Counter()
+        family_counts: Counter[str] = Counter()
+        path_ms: Counter[str] = Counter()
+        family_ms: Counter[str] = Counter()
+        profiled_blocks = 0
+        stage_totals = {
+            "project_ms": 0.0,
+            "filter_ms": 0.0,
+            "decode_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        cuda_profile_device: int | None = None
+        block_profiles: list[tuple[str, str, dict[str, object]]] = []
+        for block in state_blocks:
+            info = block.attn.last_kernel_info if isinstance(block.attn.last_kernel_info, dict) else {}
+            path = str(info.get("path", "unset"))
+            family = str(info.get("kernel_family", info.get("family", "unset")))
+            if not family:
+                family = "unset"
+            path_counts[path] += 1
+            family_counts[family] += 1
+            profile = block.attn.last_runtime_profile if isinstance(block.attn.last_runtime_profile, dict) else None
+            if profile:
+                block_profiles.append((path, family, profile))
+                if cuda_profile_device is None and profile.get("clock") == "cuda":
+                    cuda_profile_device = int(profile.get("device_index", 0))
+        if cuda_profile_device is not None:
+            with torch.cuda.device(cuda_profile_device):
+                torch.cuda.synchronize()
+        for path, family, profile in block_profiles:
+            durations = _state_space_runtime_profile_durations_ms(profile)
+            if not durations:
+                continue
+            profiled_blocks += 1
+            total_ms = float(durations.get("total_ms", 0.0))
+            stage_totals["project_ms"] += float(durations.get("project_ms", 0.0))
+            stage_totals["filter_ms"] += float(durations.get("filter_ms", 0.0))
+            stage_totals["decode_ms"] += float(durations.get("decode_ms", 0.0))
+            stage_totals["total_ms"] += total_ms
+            path_ms[path] += total_ms
+            family_ms[family] += total_ms
+        return {
+            "block_count": len(state_blocks),
+            "profiled_block_count": profiled_blocks,
+            "path_counts": path_counts,
+            "family_counts": family_counts,
+            "path_ms": path_ms,
+            "family_ms": family_ms,
+            "stage_totals": stage_totals,
+        }
+
+    def summarize_block_runtime_comparison(self) -> dict[str, object]:
+        kind_counts: Counter[str] = Counter()
+        backend_counts: Counter[str] = Counter()
+        kind_ms: Counter[str] = Counter()
+        backend_ms: Counter[str] = Counter()
+        stage_totals = {
+            "core_ms": 0.0,
+            "mlp_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        profiled_blocks = 0
+        cuda_profile_device: int | None = None
+        block_profiles: list[dict[str, object]] = []
+        for block in self.blocks:
+            profile = getattr(block, "last_block_runtime_profile", None)
+            if not isinstance(profile, dict) or not profile:
+                continue
+            block_profiles.append(profile)
+            if cuda_profile_device is None and profile.get("clock") == "cuda":
+                cuda_profile_device = int(profile.get("device_index", 0))
+        if cuda_profile_device is not None:
+            with torch.cuda.device(cuda_profile_device):
+                torch.cuda.synchronize()
+        for profile in block_profiles:
+            durations = _block_runtime_profile_durations_ms(profile)
+            if not durations:
+                continue
+            profiled_blocks += 1
+            kind = str(profile.get("block_kind", "unset"))
+            backend = str(profile.get("core_backend", "unset"))
+            backend_key = f"{kind}.{backend}"
+            kind_counts[kind] += 1
+            backend_counts[backend_key] += 1
+            total_ms = float(durations.get("total_ms", 0.0))
+            kind_ms[kind] += total_ms
+            backend_ms[backend_key] += total_ms
+            stage_totals["core_ms"] += float(durations.get("core_ms", 0.0))
+            stage_totals["mlp_ms"] += float(durations.get("mlp_ms", 0.0))
+            stage_totals["total_ms"] += total_ms
+        return {
+            "block_count": len(self.blocks),
+            "profiled_block_count": profiled_blocks,
+            "kind_counts": kind_counts,
+            "backend_counts": backend_counts,
+            "kind_ms": kind_ms,
+            "backend_ms": backend_ms,
+            "stage_totals": stage_totals,
+        }
+
+    def summarize_block_backend_contract(self) -> dict[str, object]:
+        attention_backend_counts: Counter[str] = Counter()
+        ssm_path_counts: Counter[str] = Counter()
+        ssm_decode_counts: Counter[str] = Counter()
+        layout: list[str] = []
+        attention_blocks = 0
+        ssm_blocks = 0
+        fused_attention_blocks = 0
+        fused_ssm_blocks = 0
+        for idx, block in enumerate(self.blocks):
+            if isinstance(block, StateSpaceBlock):
+                ssm_blocks += 1
+                info = block.attn.last_kernel_info if isinstance(block.attn.last_kernel_info, dict) else {}
+                path = str(info.get("path", "unset"))
+                decode_backend = str(info.get("decode_backend", "unset"))
+                ssm_path_counts[path] += 1
+                ssm_decode_counts[decode_backend] += 1
+                layout.append(f"{idx}:ssm.{path}+{decode_backend}")
+                if path.startswith("cuda_") and decode_backend == "cuda_fused_belief_projection":
+                    fused_ssm_blocks += 1
+                continue
+            attention_blocks += 1
+            backend = "flash_attn_3" if block.attn.use_flash_attn_3 else "sdpa"
+            attention_backend_counts[backend] += 1
+            layout.append(f"{idx}:attn.{backend}")
+            if backend == "flash_attn_3":
+                fused_attention_blocks += 1
+        return {
+            "layout": layout,
+            "attention_blocks": attention_blocks,
+            "ssm_blocks": ssm_blocks,
+            "attention_backend_counts": attention_backend_counts,
+            "ssm_path_counts": ssm_path_counts,
+            "ssm_decode_counts": ssm_decode_counts,
+            "fused_attention_blocks": fused_attention_blocks,
+            "fused_ssm_blocks": fused_ssm_blocks,
+        }
+
+    def format_block_backend_contract_summary(self) -> str | None:
+        summary = self.summarize_block_backend_contract()
+        layout = summary.get("layout")
+        attention_backend_counts = summary.get("attention_backend_counts")
+        ssm_path_counts = summary.get("ssm_path_counts")
+        ssm_decode_counts = summary.get("ssm_decode_counts")
+        if (
+            not isinstance(layout, list)
+            or not isinstance(attention_backend_counts, Counter)
+            or not isinstance(ssm_path_counts, Counter)
+            or not isinstance(ssm_decode_counts, Counter)
+        ):
+            return None
+        return " ".join(
+            [
+                "block_backend:"
+                f" attn_blocks:{int(summary.get('attention_blocks', 0))}"
+                f" ssm_blocks:{int(summary.get('ssm_blocks', 0))}"
+                f" attn:{_format_named_count_histogram(attention_backend_counts)}",
+                f"ssm_path:{_format_named_count_histogram(ssm_path_counts)}",
+                f"ssm_decode:{_format_named_count_histogram(ssm_decode_counts)}",
+                f"layout:{'|'.join(str(item) for item in layout)}",
+            ]
+        )
+
+    def block_backend_contract_issues(self) -> list[str]:
+        summary = self.summarize_block_backend_contract()
+        issues: list[str] = []
+        attention_blocks = int(summary.get("attention_blocks", 0))
+        ssm_blocks = int(summary.get("ssm_blocks", 0))
+        fused_attention_blocks = int(summary.get("fused_attention_blocks", 0))
+        fused_ssm_blocks = int(summary.get("fused_ssm_blocks", 0))
+        attention_backend_counts = summary.get("attention_backend_counts")
+        ssm_path_counts = summary.get("ssm_path_counts")
+        ssm_decode_counts = summary.get("ssm_decode_counts")
+        if attention_blocks > 0 and fused_attention_blocks != attention_blocks:
+            backend_hist = (
+                _format_named_count_histogram(attention_backend_counts)
+                if isinstance(attention_backend_counts, Counter)
+                else "unknown"
+            )
+            issues.append(f"attention_blocks_not_fully_fused:{backend_hist}")
+        if ssm_blocks > 0 and fused_ssm_blocks != ssm_blocks:
+            path_hist = _format_named_count_histogram(ssm_path_counts) if isinstance(ssm_path_counts, Counter) else "unknown"
+            decode_hist = _format_named_count_histogram(ssm_decode_counts) if isinstance(ssm_decode_counts, Counter) else "unknown"
+            issues.append(f"ssm_blocks_not_fully_fused:path={path_hist}:decode={decode_hist}")
+        return issues
+
+    def format_block_runtime_comparison_summary(self) -> str | None:
+        summary = self.summarize_block_runtime_comparison()
+        block_count = int(summary.get("block_count", 0))
+        profiled_block_count = int(summary.get("profiled_block_count", 0))
+        kind_counts = summary.get("kind_counts")
+        kind_ms = summary.get("kind_ms")
+        backend_ms = summary.get("backend_ms")
+        stage_totals = summary.get("stage_totals")
+        if (
+            block_count <= 0
+            or profiled_block_count <= 0
+            or not isinstance(kind_counts, Counter)
+            or not isinstance(kind_ms, Counter)
+            or not isinstance(backend_ms, Counter)
+            or not isinstance(stage_totals, dict)
+        ):
+            return None
+        total_ms = float(stage_totals.get("total_ms", 0.0))
+        if total_ms <= 0.0:
+            return None
+        core_ms = float(stage_totals.get("core_ms", 0.0))
+        mlp_ms = float(stage_totals.get("mlp_ms", 0.0))
+        return " ".join(
+            [
+                "block_runtime:"
+                f" blocks:{block_count}"
+                f" profiled:{profiled_block_count}"
+                f" kinds:{_format_named_count_histogram(kind_counts)}",
+                "kind_time:"
+                f"{_format_named_time_histogram(kind_ms, total_ms)}",
+                "stage_share:"
+                f" core:{core_ms:.2f}ms({100.0 * core_ms / total_ms:.1f}%)"
+                f" mlp:{mlp_ms:.2f}ms({100.0 * mlp_ms / total_ms:.1f}%)",
+                f"backend_time:{_format_named_time_histogram(backend_ms, total_ms)}",
+            ]
+        )
+
+    def format_state_space_block_runtime_summary(self) -> str | None:
+        summary = self.summarize_state_space_block_runtime()
+        block_count = int(summary.get("block_count", 0))
+        if block_count <= 0:
+            return None
+        path_counts = summary.get("path_counts")
+        family_counts = summary.get("family_counts")
+        if not isinstance(path_counts, Counter) or not isinstance(family_counts, Counter):
+            return None
+        parts = [
+            "ssm_runtime:"
+            f" blocks:{block_count}"
+            f" paths:{_format_named_count_histogram(path_counts)}"
+            f" families:{_format_named_count_histogram(family_counts)}"
+        ]
+        stage_totals = summary.get("stage_totals")
+        path_ms = summary.get("path_ms")
+        if isinstance(stage_totals, dict) and isinstance(path_ms, Counter):
+            total_ms = float(stage_totals.get("total_ms", 0.0))
+            if total_ms > 0.0:
+                project_ms = float(stage_totals.get("project_ms", 0.0))
+                filter_ms = float(stage_totals.get("filter_ms", 0.0))
+                decode_ms = float(stage_totals.get("decode_ms", 0.0))
+                parts.append(
+                    "stage_share:"
+                    f" project:{project_ms:.2f}ms({100.0 * project_ms / total_ms:.1f}%)"
+                    f" filter:{filter_ms:.2f}ms({100.0 * filter_ms / total_ms:.1f}%)"
+                    f" decode:{decode_ms:.2f}ms({100.0 * decode_ms / total_ms:.1f}%)"
+                )
+                parts.append(f"path_time:{_format_named_time_histogram(path_ms, total_ms)}")
+        return " ".join(parts)
+
     def _project_logits(
         self,
         x: Tensor,
@@ -14847,6 +15469,11 @@ class GPT(nn.Module):
     def _needs_teacher_future_sketch(self) -> bool:
         return self.causal_machine_future_sketch_loss_coeff > 0.0 or self._needs_global_causal_machine_teacher()
 
+    def _clear_state_space_block_aux(self) -> None:
+        for block in self.blocks:
+            if isinstance(block, StateSpaceBlock):
+                block.last_aux = {}
+
     def forward(
         self,
         input_ids: Tensor,
@@ -14857,112 +15484,115 @@ class GPT(nn.Module):
         logit_var_loss_coeff: float = 0.0,
         mid_aux_loss_coeff: float | Tensor = 0.01,
     ) -> Tensor:
-        features, h_mid = self._forward_features(input_ids)
-        if self._needs_global_causal_machine_outputs():
-            causal_machine_logits, causal_machine_state_log_beliefs, causal_machine_raw_logits, causal_machine_local_state_log_probs = self._compute_causal_machine_outputs(
-                features
-            )
-        else:
-            causal_machine_logits = None
-            causal_machine_state_log_beliefs = None
-            causal_machine_raw_logits = None
-            causal_machine_local_state_log_probs = None
-        logits = self._project_logits(
-            features,
-            causal_machine_logits=causal_machine_logits,
-        )
-        loss = self._loss_from_logits(
-            logits,
-            target_ids,
-            loss_mask=loss_mask,
-            label_smoothing=label_smoothing,
-            z_loss_coeff=z_loss_coeff,
-            logit_var_loss_coeff=logit_var_loss_coeff,
-        )
-        teacher_future_sketch = (
-            self._compute_causal_machine_future_sketch(target_ids) if self._needs_teacher_future_sketch() else None
-        )
-        teacher_state_ids = (
-            self._compute_causal_machine_teacher_state_ids(
-                target_ids,
-                features_3d=teacher_future_sketch,
-            )
-            if self._needs_global_causal_machine_teacher()
-            else None
-        )
-        if causal_machine_raw_logits is not None:
-            if self.causal_machine_next_token_loss_coeff > 0.0:
-                state_ce = F.cross_entropy(
-                    causal_machine_raw_logits.reshape(-1, causal_machine_raw_logits.size(-1)).float(),
-                    target_ids.reshape(-1),
-                    reduction="none",
-                    label_smoothing=label_smoothing,
-                ).view_as(target_ids)
-                if loss_mask is None:
-                    state_next_token_loss = state_ce.mean()
-                else:
-                    state_next_token_loss = (state_ce * loss_mask.to(dtype=state_ce.dtype)).sum() / loss_mask.sum().clamp_min(1.0)
-                loss = loss + self.causal_machine_next_token_loss_coeff * state_next_token_loss.to(dtype=loss.dtype)
-            if teacher_state_ids is not None:
-                mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
-                teacher_log_probs = self.causal_machine_log_probs[teacher_state_ids].to(device=logits.device, dtype=torch.float32)
-                student_log_probs = causal_machine_raw_logits.float()
-                teacher_probs = teacher_log_probs.exp()
-                teacher_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
-                if mask is None:
-                    teacher_loss = teacher_kl.mean()
-                else:
-                    teacher_loss = (teacher_kl * mask).sum() / mask.sum().clamp_min(1.0)
-                loss = loss + self.causal_machine_teacher_loss_coeff * teacher_loss.to(dtype=loss.dtype)
-                if causal_machine_local_state_log_probs is not None:
-                    state_ce = F.nll_loss(
-                        causal_machine_local_state_log_probs.reshape(-1, causal_machine_local_state_log_probs.size(-1)).float(),
-                        teacher_state_ids.reshape(-1),
-                        reduction="none",
-                    ).view_as(target_ids)
-                    if mask is None:
-                        state_loss = state_ce.mean()
-                    else:
-                        state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
-                    loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
-        state_space_backbone_loss = self._compute_state_space_backbone_loss(
-            target_ids,
-            loss_mask,
-            teacher_state_ids=teacher_state_ids,
-            teacher_future_sketch=teacher_future_sketch,
-        )
-        if state_space_backbone_loss is not None:
-            loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
-        mid_aux_coeff_tensor: Tensor | None = None
-        mid_aux_coeff_value: float | None = None
-        if torch.is_tensor(mid_aux_loss_coeff):
-            mid_aux_coeff_tensor = mid_aux_loss_coeff
-        else:
-            mid_aux_coeff_value = float(mid_aux_loss_coeff)
-        if h_mid is not None and (mid_aux_coeff_tensor is not None or abs(mid_aux_coeff_value) > 0.0):
-            if h_mid.size(1) == target_ids.size(1):
-                mid_logits = self._mid_aux_logits(h_mid)
-                mid_ce = F.cross_entropy(
-                    mid_logits.reshape(-1, mid_logits.size(-1)).float(),
-                    target_ids.reshape(-1),
-                    reduction="none",
-                    label_smoothing=label_smoothing,
+        try:
+            features, h_mid = self._forward_features(input_ids)
+            if self._needs_global_causal_machine_outputs():
+                causal_machine_logits, causal_machine_state_log_beliefs, causal_machine_raw_logits, causal_machine_local_state_log_probs = self._compute_causal_machine_outputs(
+                    features
                 )
-                if loss_mask is None:
-                    mid_loss = mid_ce.mean()
-                else:
-                    mid_mask = loss_mask.reshape(-1).to(dtype=mid_ce.dtype)
-                    mid_loss = (mid_ce * mid_mask).sum() / mid_mask.sum().clamp_min(1.0)
-                if mid_aux_coeff_tensor is None:
-                    mid_aux_coeff_tensor = torch.tensor(
-                        float(mid_aux_coeff_value),
-                        device=mid_loss.device,
-                        dtype=mid_loss.dtype,
+            else:
+                causal_machine_logits = None
+                causal_machine_state_log_beliefs = None
+                causal_machine_raw_logits = None
+                causal_machine_local_state_log_probs = None
+            logits = self._project_logits(
+                features,
+                causal_machine_logits=causal_machine_logits,
+            )
+            loss = self._loss_from_logits(
+                logits,
+                target_ids,
+                loss_mask=loss_mask,
+                label_smoothing=label_smoothing,
+                z_loss_coeff=z_loss_coeff,
+                logit_var_loss_coeff=logit_var_loss_coeff,
+            )
+            teacher_future_sketch = (
+                self._compute_causal_machine_future_sketch(target_ids) if self._needs_teacher_future_sketch() else None
+            )
+            teacher_state_ids = (
+                self._compute_causal_machine_teacher_state_ids(
+                    target_ids,
+                    features_3d=teacher_future_sketch,
+                )
+                if self._needs_global_causal_machine_teacher()
+                else None
+            )
+            if causal_machine_raw_logits is not None:
+                if self.causal_machine_next_token_loss_coeff > 0.0:
+                    state_ce = F.cross_entropy(
+                        causal_machine_raw_logits.reshape(-1, causal_machine_raw_logits.size(-1)).float(),
+                        target_ids.reshape(-1),
+                        reduction="none",
+                        label_smoothing=label_smoothing,
+                    ).view_as(target_ids)
+                    if loss_mask is None:
+                        state_next_token_loss = state_ce.mean()
+                    else:
+                        state_next_token_loss = (state_ce * loss_mask.to(dtype=state_ce.dtype)).sum() / loss_mask.sum().clamp_min(1.0)
+                    loss = loss + self.causal_machine_next_token_loss_coeff * state_next_token_loss.to(dtype=loss.dtype)
+                if teacher_state_ids is not None:
+                    mask = None if loss_mask is None else loss_mask.to(dtype=torch.float32)
+                    teacher_log_probs = self.causal_machine_log_probs[teacher_state_ids].to(device=logits.device, dtype=torch.float32)
+                    student_log_probs = causal_machine_raw_logits.float()
+                    teacher_probs = teacher_log_probs.exp()
+                    teacher_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+                    if mask is None:
+                        teacher_loss = teacher_kl.mean()
+                    else:
+                        teacher_loss = (teacher_kl * mask).sum() / mask.sum().clamp_min(1.0)
+                    loss = loss + self.causal_machine_teacher_loss_coeff * teacher_loss.to(dtype=loss.dtype)
+                    if causal_machine_local_state_log_probs is not None:
+                        state_ce = F.nll_loss(
+                            causal_machine_local_state_log_probs.reshape(-1, causal_machine_local_state_log_probs.size(-1)).float(),
+                            teacher_state_ids.reshape(-1),
+                            reduction="none",
+                        ).view_as(target_ids)
+                        if mask is None:
+                            state_loss = state_ce.mean()
+                        else:
+                            state_loss = (state_ce * mask).sum() / mask.sum().clamp_min(1.0)
+                        loss = loss + self.causal_machine_state_loss_coeff * state_loss.to(dtype=loss.dtype)
+            state_space_backbone_loss = self._compute_state_space_backbone_loss(
+                target_ids,
+                loss_mask,
+                teacher_state_ids=teacher_state_ids,
+                teacher_future_sketch=teacher_future_sketch,
+            )
+            if state_space_backbone_loss is not None:
+                loss = loss + state_space_backbone_loss.to(dtype=loss.dtype)
+            mid_aux_coeff_tensor: Tensor | None = None
+            mid_aux_coeff_value: float | None = None
+            if torch.is_tensor(mid_aux_loss_coeff):
+                mid_aux_coeff_tensor = mid_aux_loss_coeff
+            else:
+                mid_aux_coeff_value = float(mid_aux_loss_coeff)
+            if h_mid is not None and (mid_aux_coeff_tensor is not None or abs(mid_aux_coeff_value) > 0.0):
+                if h_mid.size(1) == target_ids.size(1):
+                    mid_logits = self._mid_aux_logits(h_mid)
+                    mid_ce = F.cross_entropy(
+                        mid_logits.reshape(-1, mid_logits.size(-1)).float(),
+                        target_ids.reshape(-1),
+                        reduction="none",
+                        label_smoothing=label_smoothing,
                     )
-                else:
-                    mid_aux_coeff_tensor = mid_aux_coeff_tensor.to(device=mid_loss.device, dtype=mid_loss.dtype)
-                loss = loss + mid_aux_coeff_tensor * mid_loss
-        return loss
+                    if loss_mask is None:
+                        mid_loss = mid_ce.mean()
+                    else:
+                        mid_mask = loss_mask.reshape(-1).to(dtype=mid_ce.dtype)
+                        mid_loss = (mid_ce * mid_mask).sum() / mid_mask.sum().clamp_min(1.0)
+                    if mid_aux_coeff_tensor is None:
+                        mid_aux_coeff_tensor = torch.tensor(
+                            float(mid_aux_coeff_value),
+                            device=mid_loss.device,
+                            dtype=mid_loss.dtype,
+                        )
+                    else:
+                        mid_aux_coeff_tensor = mid_aux_coeff_tensor.to(device=mid_loss.device, dtype=mid_loss.dtype)
+                    loss = loss + mid_aux_coeff_tensor * mid_loss
+            return loss
+        finally:
+            self._clear_state_space_block_aux()
 
     def forward_logits(
         self,
@@ -15172,6 +15802,8 @@ def main() -> None:
             f"got TRAIN_BATCH_TOKENS={args.train_batch_tokens}, WORLD_SIZE={world_size}, "
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
+    local_train_batch_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
+    local_train_batch_size = local_train_batch_tokens // args.train_seq_len
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
@@ -15367,6 +15999,38 @@ def main() -> None:
             log0(f"init_model_missing:{','.join(missing_keys[:12])}")
         if unexpected_keys:
             log0(f"init_model_unexpected:{','.join(unexpected_keys[:12])}")
+    should_prime_block_backend_sample = bool(
+        args.use_causal_machine_backbone
+        and (
+            PROFILE_STATE_SPACE_BLOCKS
+            or (_require_fused_cuda_path_contract() and _competition_mode_enabled())
+        )
+    )
+    if should_prime_block_backend_sample:
+        _prime_block_runtime_profile_sample(
+            base_model,
+            batch_size=local_train_batch_size,
+            seq_len=int(args.train_seq_len),
+            vocab_size=int(args.vocab_size),
+            device=device,
+        )
+        block_backend_summary = base_model.format_block_backend_contract_summary()
+        if block_backend_summary:
+            log0(block_backend_summary)
+        block_runtime_summary = base_model.format_block_runtime_comparison_summary()
+        if block_runtime_summary:
+            log0(block_runtime_summary)
+        block_backend_issues = base_model.block_backend_contract_issues()
+        if (
+            _require_fused_cuda_path_contract()
+            and _competition_mode_enabled()
+            and args.use_causal_machine_backbone
+            and block_backend_issues
+        ):
+            raise RuntimeError(
+                "competition-mode mixed block pattern requires fused backends for every configured block; "
+                + "; ".join(block_backend_issues)
+            )
     enable_model_compile = args.enable_torch_compile
     if enable_model_compile:
         _preload_compiled_runtime_extensions(args)
@@ -15378,12 +16042,48 @@ def main() -> None:
         )
     if enable_model_compile:
         pass
+    allow_ddp_full_step_cuda_graphs = _env_enabled(
+        "ALLOW_DDP_FULL_STEP_CUDA_GRAPHS",
+        default=_competition_mode_enabled(),
+    )
+    use_muon_for_state_space_matrices = bool(
+        args.use_muon and _env_enabled("USE_MUON_FOR_STATE_SPACE_MATRICES", default=_competition_mode_enabled())
+    )
+    ddp_static_graph = bool(distributed and allow_ddp_full_step_cuda_graphs)
+    graph_execution_stream: torch.cuda.Stream | None = (
+        torch.cuda.Stream(device=device)
+        if distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs
+        else None
+    )
+    compile_options: dict[str, object] | None = None
+    if enable_model_compile and distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs:
+        # Inductor's pad_mm benchmark launches real GPU work during compile. That
+        # is incompatible with the first-call-inside-capture pattern used by the
+        # DDP full-step graph experiment.
+        compile_options = {
+            "shape_padding": False,
+        }
     compiled_model = (
-        torch.compile(base_model, dynamic=False, fullgraph=False)
+        torch.compile(base_model, dynamic=False, fullgraph=False, options=compile_options)
         if enable_model_compile
         else base_model
     )
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if distributed:
+        ddp_context = torch.cuda.stream(graph_execution_stream) if graph_execution_stream is not None else nullcontext()
+        if graph_execution_stream is not None:
+            graph_execution_stream.wait_stream(torch.cuda.current_stream(device=device))
+        with ddp_context:
+            model = DDP(
+                compiled_model,
+                device_ids=[local_rank],
+                broadcast_buffers=False,
+                gradient_as_bucket_view=ddp_static_graph,
+                static_graph=ddp_static_graph,
+            )
+        if graph_execution_stream is not None:
+            torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
+    else:
+        model = compiled_model
     ema_state = init_ema_state(base_model) if args.ema_decay > 0.0 else None
     ema_state_updated = False
     cuda_graph_disable_reason = "pending_optimizer_setup"
@@ -15442,20 +16142,26 @@ def main() -> None:
     optimizer_muon_attn: torch.optim.Optimizer | None = None
     optimizer_muon_mlp: torch.optim.Optimizer | None = None
     optimizer_muon_other: torch.optim.Optimizer | None = None
+    optimizer_muon_state_space_matrix: torch.optim.Optimizer | None = None
     optimizer_state_space_matrix: torch.optim.Optimizer | None = None
     optimizer_state_space_scalar: torch.optim.Optimizer | None = None
     optimizer_other_matrix: torch.optim.Optimizer | None = None
+    optimizer_capturable = bool(args.use_cuda_graphs and (not distributed or allow_ddp_full_step_cuda_graphs))
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.token_weight_decay,
         fused=True,
-        capturable=bool(args.use_cuda_graphs and not distributed),
+        capturable=optimizer_capturable,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok]
     muon_optimizers: list[torch.optim.Optimizer] = []
-    muon_graph_capture_enabled = bool(args.use_cuda_graphs and not distributed and args.muon_cuda_graph_mode != "off")
+    muon_graph_capture_enabled = bool(
+        args.use_cuda_graphs
+        and (not distributed or allow_ddp_full_step_cuda_graphs)
+        and args.muon_cuda_graph_mode != "off"
+    )
     graph_capturable = muon_graph_capture_enabled
     if args.use_muon and attn_matrix_params:
         optimizer_muon_attn = Muon(
@@ -15488,7 +16194,22 @@ def main() -> None:
             group["base_lr"] = mlp_matrix_lr
         muon_optimizers.append(optimizer_muon_mlp)
         optimizers.append(optimizer_muon_mlp)
-    if state_space_matrix_params:
+    if use_muon_for_state_space_matrices and state_space_matrix_params:
+        optimizer_muon_state_space_matrix = Muon(
+            state_space_matrix_params,
+            lr=args.state_space_matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            backend_steps_light=args.muon_backend_steps_light,
+            backend_refresh_interval=args.muon_backend_refresh_interval,
+            weight_decay=args.state_space_matrix_weight_decay,
+            capturable=graph_capturable,
+        )
+        for group in optimizer_muon_state_space_matrix.param_groups:
+            group["base_lr"] = args.state_space_matrix_lr
+        muon_optimizers.append(optimizer_muon_state_space_matrix)
+        optimizers.append(optimizer_muon_state_space_matrix)
+    elif state_space_matrix_params:
         optimizer_state_space_matrix = torch.optim.AdamW(
             [{"params": state_space_matrix_params, "lr": args.state_space_matrix_lr, "base_lr": args.state_space_matrix_lr}],
             betas=(args.beta1, args.state_space_beta2),
@@ -15562,11 +16283,42 @@ def main() -> None:
     log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     positional_mode = "rope_only"
     log0(f"positional_mode:{positional_mode} train_seq_len:{args.train_seq_len} iterations:{args.iterations}")
+    log0(f"lr_schedule:{args.lr_schedule} lr_min_scale:{args.lr_min_scale:.4f}", console=False)
+    if args.use_causal_machine_backbone:
+        log0(
+            "causal_machine_ranks:"
+            f" states:{int(args.causal_machine_num_states)}"
+            f" hidden:{int(args.causal_machine_hidden_rank)}"
+            f" transition:{int(args.causal_machine_transition_rank)}"
+            f" latent:{int(args.causal_machine_latent_rank)}"
+            f" latent_mode:{str(args.causal_machine_latent_mode)}",
+            console=False,
+        )
+        if (
+            "CAUSAL_MACHINE_TRANSITION_RANK" not in os.environ
+            and int(args.causal_machine_latent_rank) != int(args.causal_machine_transition_rank)
+            and int(args.causal_machine_latent_rank) > 0
+            and "ssm" in str(args.block_pattern).split(",")
+        ):
+            log0(
+                "causal_machine_notice:"
+                f" latent_rank:{int(args.causal_machine_latent_rank)}"
+                f" does_not_change_structured_scan_transition_rank:{int(args.causal_machine_transition_rank)}"
+                " set CAUSAL_MACHINE_TRANSITION_RANK explicitly to benchmark a different scan rank",
+            )
+        if _competition_mode_enabled() and (not bool(args.enable_torch_compile) or not bool(args.use_cuda_graphs)):
+            log0(
+                "causal_machine_notice:"
+                f" compile:{int(bool(args.enable_torch_compile))}"
+                f" cuda_graphs:{int(bool(args.use_cuda_graphs))}"
+                " competition throughput comparisons are not representative with compile or graphs disabled",
+            )
     log0(
         "matrix_param_split:"
         f" muon_attn:{len(attn_matrix_params)}"
         f" muon_mlp:{len(mlp_matrix_params)}"
-        f" adam_state_space_matrix:{len(state_space_matrix_params)}"
+        f" muon_state_space_matrix:{len(state_space_matrix_params) if use_muon_for_state_space_matrices else 0}"
+        f" adam_state_space_matrix:{0 if use_muon_for_state_space_matrices else len(state_space_matrix_params)}"
         f" adam_state_space_scalar:{len(state_space_scalar_params)}"
         f" adam_other_matrix:{len(other_matrix_params)}"
         f" scalar_other:{len(scalar_params)}",
@@ -15595,14 +16347,26 @@ def main() -> None:
                 continue
             opt.zero_grad(set_to_none=set_to_none)
 
-    muon_graph_capture_ready = (
-        all(opt.prepare_cuda_graph_capture() for opt in muon_optimizers)
-        if muon_optimizers and muon_graph_capture_enabled
-        else False
-    )
+    muon_graph_capture_statuses: list[tuple[str, bool, str]] = []
+    if muon_optimizers and muon_graph_capture_enabled:
+        muon_optimizer_labels: list[tuple[str, torch.optim.Optimizer]] = []
+        if optimizer_muon_attn is not None:
+            muon_optimizer_labels.append(("attn", optimizer_muon_attn))
+        if optimizer_muon_mlp is not None:
+            muon_optimizer_labels.append(("mlp", optimizer_muon_mlp))
+        if optimizer_muon_other is not None:
+            muon_optimizer_labels.append(("other", optimizer_muon_other))
+        if optimizer_muon_state_space_matrix is not None:
+            muon_optimizer_labels.append(("state_space_matrix", optimizer_muon_state_space_matrix))
+        for label, opt in muon_optimizer_labels:
+            ready = bool(opt.prepare_cuda_graph_capture())
+            muon_graph_capture_statuses.append((label, ready, opt.graph_capture_disable_reason()))
+        muon_graph_capture_ready = all(status[1] for status in muon_graph_capture_statuses)
+    else:
+        muon_graph_capture_ready = False
     muon_graph_capture_forced_off = bool(muon_optimizers) and args.muon_cuda_graph_mode == "off"
     muon_graph_capture_forced_on = bool(muon_optimizers) and args.muon_cuda_graph_mode == "on"
-    graph_full_step_supported = (not distributed) and (
+    graph_full_step_supported = (not distributed or allow_ddp_full_step_cuda_graphs) and (
         not muon_optimizers or (muon_graph_capture_ready and not muon_graph_capture_forced_off)
     )
     graph_step_optimizers = list(optimizers) if graph_full_step_supported else [opt for opt in optimizers if not isinstance(opt, Muon)]
@@ -15639,6 +16403,27 @@ def main() -> None:
         else:
             group[name] = float(value)
 
+    competition_mode = _competition_mode_enabled()
+    allow_ddp_partial_cuda_graphs = _env_enabled("ALLOW_DDP_PARTIAL_CUDA_GRAPHS", default=False)
+    if competition_mode and args.use_causal_machine_backbone and args.use_muon and state_space_matrix_params and not use_muon_for_state_space_matrices:
+        raise RuntimeError(
+            "competition-mode causal-machine runs require Muon for state-space matrix params; "
+            "set USE_MUON_FOR_STATE_SPACE_MATRICES=1"
+        )
+    if competition_mode and distributed and allow_ddp_partial_cuda_graphs:
+        raise RuntimeError(
+            "competition-mode DDP does not allow partial-step CUDA graph capture; "
+            "unset ALLOW_DDP_PARTIAL_CUDA_GRAPHS and use the full-step path"
+        )
+    effective_cuda_graph_warmup_steps = max(int(args.cuda_graph_warmup_steps), 0)
+    if distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs and enable_model_compile:
+        if effective_cuda_graph_warmup_steps == 0:
+            effective_cuda_graph_warmup_steps = 1
+            log0(
+                "cuda_graph_notice:"
+                " ddp_full_step_capture_forces_one_eager_warmup_step"
+                " and disables_inductor_shape_padding_for_compile_safety"
+            )
     _prepare_graphable_optimizers()
     if not args.use_cuda_graphs:
         cuda_graph_capture_mode = "disabled"
@@ -15647,8 +16432,12 @@ def main() -> None:
         cuda_graph_capture_mode = "full_step"
         cuda_graph_disable_reason = "eligible_full_step"
     elif distributed:
-        cuda_graph_capture_mode = "partial_step"
-        cuda_graph_disable_reason = "partial:distributed_full_step_unsupported"
+        if allow_ddp_partial_cuda_graphs:
+            cuda_graph_capture_mode = "partial_step"
+            cuda_graph_disable_reason = "partial:distributed_full_step_unsupported"
+        else:
+            cuda_graph_capture_mode = "disabled"
+            cuda_graph_disable_reason = "disabled:ddp_partial_step_stream_mismatch"
     elif muon_graph_capture_forced_off:
         cuda_graph_capture_mode = "partial_step"
         cuda_graph_disable_reason = "partial:muon_full_step_forced_off"
@@ -15666,8 +16455,27 @@ def main() -> None:
         cuda_graph_capture_mode = "partial_step"
         cuda_graph_disable_reason = "partial:full_step_unavailable"
     cuda_graph_eligible = partial_cuda_graph_supported and cuda_graph_capture_mode != "disabled"
+    if (
+        competition_mode
+        and distributed
+        and args.use_cuda_graphs
+        and args.enable_torch_compile
+        and args.use_muon
+        and cuda_graph_capture_mode != "full_step"
+    ):
+        reason_suffix = ""
+        if muon_graph_capture_statuses:
+            reason_suffix = " muon_status:" + ",".join(
+                f"{label}={'ok' if ready else 'off'}:{reason or 'ready'}"
+                for label, ready, reason in muon_graph_capture_statuses
+            )
+        raise RuntimeError(
+            "competition-mode DDP + Muon requires full-step CUDA graph capture; "
+            f"got cuda_graph_mode={cuda_graph_capture_mode} reason={cuda_graph_disable_reason}{reason_suffix}"
+        )
     log0(
         f"optimizer_stack:{'muon' if args.use_muon else 'adam_only'} "
+        f"state_space_matrix_optimizer:{'muon' if use_muon_for_state_space_matrices else 'adamw'} "
         f"muon_cuda_graph_mode:{args.muon_cuda_graph_mode} "
         f"cuda_graph_mode:{cuda_graph_capture_mode} "
         f"cuda_graph_full_step:{int(cuda_graph_capture_mode == 'full_step')} "
@@ -15677,7 +16485,9 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     finalization_reserve_ms = max(float(args.wallclock_finalization_reserve_ms), 0.0)
-    validation_reserve_floor_ms = max(float(args.wallclock_validation_reserve_ms), 0.0)
+    validation_reserve_floor_ms = (
+        0.0 if competition_mode else max(float(args.wallclock_validation_reserve_ms), 0.0)
+    )
 
     def remaining_wallclock_ms() -> float:
         if max_wallclock_ms is None:
@@ -15697,6 +16507,22 @@ def main() -> None:
             warmup_progress = warmup_progress ** max(float(args.lr_warmup_power), 1e-6)
             start_scale = min(max(args.lr_warmup_init_scale, 0.0), 1.0)
             scale *= start_scale + (1.0 - start_scale) * warmup_progress
+        if args.lr_schedule == "cosine":
+            decay_start_step = max(int(args.lr_warmup_steps), 0)
+            progress_terms: list[float] = []
+            if args.iterations > decay_start_step:
+                step_progress = min(
+                    max(float(step - decay_start_step) / float(max(args.iterations - decay_start_step, 1)), 0.0),
+                    1.0,
+                )
+                progress_terms.append(step_progress)
+            if max_wallclock_ms is not None and max_wallclock_ms > 0.0:
+                wallclock_budget_ms = max(max_wallclock_ms - finalization_reserve_ms, 1.0)
+                wallclock_progress = min(max(float(elapsed_ms) / wallclock_budget_ms, 0.0), 1.0)
+                progress_terms.append(wallclock_progress)
+            progress = max(progress_terms) if progress_terms else 1.0
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            scale *= float(args.lr_min_scale) + (1.0 - float(args.lr_min_scale)) * cosine
         if args.warmdown_iters <= 0:
             return scale
         if max_wallclock_ms is None:
@@ -15741,7 +16567,7 @@ def main() -> None:
                 scaled_lr *= mlp_lr_scale
             elif opt is optimizer_muon_other or opt is optimizer_other_matrix:
                 scaled_lr *= other_lr_scale
-            elif opt is optimizer_state_space_matrix:
+            elif opt is optimizer_muon_state_space_matrix or opt is optimizer_state_space_matrix:
                 scaled_lr *= state_space_matrix_lr_scale
             elif opt is optimizer_state_space_scalar:
                 scaled_lr *= state_space_scalar_lr_scale
@@ -15839,7 +16665,9 @@ def main() -> None:
         static_grad_norm = torch.zeros((), device=device, dtype=torch.float32)
         zero_grad_all(set_to_none=True)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        if graph_execution_stream is not None:
+            graph_execution_stream.wait_stream(torch.cuda.current_stream(device=device))
+        with torch.cuda.graph(graph, stream=graph_execution_stream):
             total_loss = torch.zeros((), device=device, dtype=torch.float32)
             for static_x, static_y, static_loss_mask in static_batches:
                 captured_loss = compute_training_loss(static_x, static_y, static_loss_mask)
@@ -15857,6 +16685,8 @@ def main() -> None:
                     update_ema_state(ema_state, base_model, args.ema_decay)
                 for opt in graph_step_optimizers:
                     opt.zero_grad(set_to_none=False)
+        if graph_execution_stream is not None:
+            torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
         graph_runtime.capture_count += 1
         return {
             "graph": graph,
@@ -15965,7 +16795,7 @@ def main() -> None:
     scale = lr_mul(0, end_to_end_wallclock_ms())
     cuda_graph_runner: dict[str, object] | None = None
     cuda_graph_runner_fake_quant_bits: int | None = None
-    cuda_graph_retry_step = max(args.cuda_graph_warmup_steps, 0)
+    cuda_graph_retry_step = effective_cuda_graph_warmup_steps
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     optimizer_step_time_ms_total = 0.0
@@ -16049,8 +16879,8 @@ def main() -> None:
             step < max(int(args.objective_bootstrap_steps), 0)
             or train_tokens_seen < max(int(args.objective_bootstrap_tokens), 0)
         )
-        scheduled_validation = args.val_loss_every > 0 and step % args.val_loss_every == 0
-        force_terminal_validation = last_step and stop_after_step is None
+        scheduled_validation = (not competition_mode) and args.val_loss_every > 0 and step % args.val_loss_every == 0
+        force_terminal_validation = (not competition_mode) and last_step and stop_after_step is None
         should_validate = force_terminal_validation or (scheduled_validation and not last_step)
         if should_validate and max_wallclock_ms is not None:
             reserve_needed_ms = finalization_reserve_ms + validation_reserve_ms(last_validation_time_ms)
@@ -16133,7 +16963,11 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         fake_quant_bits = args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms, scale) else 0
         base_model.set_fake_quant(fake_quant_bits)
-        graph_step_active = cuda_graph_eligible and step >= max(args.cuda_graph_warmup_steps, 0) and step >= cuda_graph_retry_step
+        graph_step_active = (
+            cuda_graph_eligible
+            and step >= effective_cuda_graph_warmup_steps
+            and step >= cuda_graph_retry_step
+        )
         if cuda_graph_runner is not None and cuda_graph_runner_fake_quant_bits != fake_quant_bits:
             cuda_graph_runner = None
             cuda_graph_runner_fake_quant_bits = None
@@ -16180,29 +17014,41 @@ def main() -> None:
                     zero_grad_all()
             else:
                 static_batches = cuda_graph_runner["static_batches"]
-                for (x, y, loss_mask), (static_x, static_y, static_loss_mask) in zip(step_batches, static_batches, strict=True):
-                    static_x.copy_(x, non_blocking=True)
-                    static_y.copy_(y, non_blocking=True)
-                    if static_loss_mask is not None and loss_mask is not None:
-                        static_loss_mask.copy_(loss_mask, non_blocking=True)
-                cuda_graph_runner["graph"].replay()
+                replay_context = torch.cuda.stream(graph_execution_stream) if graph_execution_stream is not None else nullcontext()
+                if graph_execution_stream is not None:
+                    graph_execution_stream.wait_stream(torch.cuda.current_stream(device=device))
+                with replay_context:
+                    for (x, y, loss_mask), (static_x, static_y, static_loss_mask) in zip(step_batches, static_batches, strict=True):
+                        static_x.copy_(x, non_blocking=True)
+                        static_y.copy_(y, non_blocking=True)
+                        if static_loss_mask is not None and loss_mask is not None:
+                            static_loss_mask.copy_(loss_mask, non_blocking=True)
+                    cuda_graph_runner["graph"].replay()
+                if graph_execution_stream is not None:
+                    torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
                 used_cuda_graph = True
                 train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
                 if captures_full_step:
                     ema_state_updated = ema_state_updated or ema_active
 
         if not used_cuda_graph:
-            zero_grad_all(set_to_none=True)
-            for micro_step, (x, y, loss_mask) in enumerate(step_batches):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                loss = compute_training_loss(x, y, loss_mask)
-                if not torch.isfinite(loss.detach()):
-                    raise RuntimeError(f"non-finite training loss detected at step {step} micro_step {micro_step}")
-                train_loss += loss.detach()
-                (loss * grad_scale).backward()
-            train_loss /= grad_accum_steps
-            finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=False)
+            eager_train_context = torch.cuda.stream(graph_execution_stream) if graph_execution_stream is not None else nullcontext()
+            if graph_execution_stream is not None:
+                graph_execution_stream.wait_stream(torch.cuda.current_stream(device=device))
+            with eager_train_context:
+                zero_grad_all(set_to_none=True)
+                for micro_step, (x, y, loss_mask) in enumerate(step_batches):
+                    if distributed:
+                        model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                    loss = compute_training_loss(x, y, loss_mask)
+                    if not torch.isfinite(loss.detach()):
+                        raise RuntimeError(f"non-finite training loss detected at step {step} micro_step {micro_step}")
+                    train_loss += loss.detach()
+                    (loss * grad_scale).backward()
+                train_loss /= grad_accum_steps
+                finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=False)
+            if graph_execution_stream is not None:
+                torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
         elif not captures_full_step:
             finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=True)
 
@@ -16241,6 +17087,13 @@ def main() -> None:
                 f"wallclock:{approx_wallclock_ms:.0f}ms step_avg:{approx_wallclock_ms / step:.2f}ms"
                 f"{muon_log_suffix}"
             )
+            if args.use_causal_machine_backbone:
+                block_runtime_summary = base_model.format_block_runtime_comparison_summary()
+                if block_runtime_summary:
+                    log0(block_runtime_summary)
+                ssm_runtime_summary = base_model.format_state_space_block_runtime_summary()
+                if ssm_runtime_summary:
+                    log0(ssm_runtime_summary)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = (

@@ -119,6 +119,9 @@ __device__ __forceinline__ bool can_use_sm90_bulk_matrix_slice_async(
     int cols,
     int dst_stride);
 
+__device__ __forceinline__ float load_transition_gate_value(
+    const float* __restrict__ transition_gate_ptr);
+
 template <typename T>
 __device__ __forceinline__ void enqueue_sm90_bulk_matrix_slice_async(
     T* __restrict__ dst,
@@ -296,18 +299,22 @@ size_t backward_chunk_shared_bytes(int num_states, int transition_rank, bool dir
     return (base_words + direct_words) * sizeof(float);
 }
 
-size_t forward_dense_128_rank8_shared_bytes() {
+template <int kTransitionRank>
+size_t forward_dense_128_static_rank_shared_bytes() {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
     constexpr int kNumWarps = kNumStates / kWarpSize;
     return static_cast<size_t>(
         (2 * kNumStates * kTransitionRank) + kTransitionRank + (kNumWarps * kTransitionRank)
     ) * sizeof(float);
 }
 
-size_t backward_dense_128_rank8_shared_bytes(bool direct_grad_reduce) {
+size_t forward_dense_128_rank8_shared_bytes() {
+    return forward_dense_128_static_rank_shared_bytes<8>();
+}
+
+template <int kTransitionRank>
+size_t backward_dense_128_static_rank_shared_bytes(bool direct_grad_reduce) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
     constexpr int kNumWarps = kNumStates / kWarpSize;
     const size_t base_words = static_cast<size_t>(
         (2 * kNumStates * kTransitionRank) + kTransitionRank + kNumStates + kTransitionRank + (kNumWarps * kTransitionRank)
@@ -337,13 +344,17 @@ bool can_use_direct_grad_reduce(int device_index, int num_states, int transition
     if (transition_rank <= 0 || transition_rank > num_states) {
         return false;
     }
-    // The direct in-kernel reduction path has proven numerically fragile for the
-    // smallest structured ranks used in competition training. Keep the generic
-    // kernels, but force those shapes onto the per-batch accumulation path.
+    const int max_optin_bytes = cached_max_optin_bytes(device_index);
+    // The smallest structured ranks have been the most numerically fragile in
+    // competition training. Keep the generic path for those shapes, except for
+    // the exact dense 128x16 backward specialization that has its own tuned
+    // kernel and shared-memory budget.
     if (transition_rank <= 16) {
+        if (num_states == 128 && transition_rank == 16) {
+            return backward_dense_128_static_rank_shared_bytes<16>(true) <= static_cast<size_t>(max_optin_bytes);
+        }
         return false;
     }
-    const int max_optin_bytes = cached_max_optin_bytes(device_index);
     return backward_chunk_shared_bytes(num_states, transition_rank, true) <= static_cast<size_t>(max_optin_bytes);
 }
 
@@ -958,19 +969,30 @@ bool can_use_half2_path(int device_index) {
     return cached_capability_major(device_index) >= 6;
 }
 
-template <typename scalar_t>
-bool can_use_dense_128_rank8_pair_path(int device_index) {
+template <typename scalar_t, int StaticTransitionRank>
+bool can_use_dense_128_static_rank_pair_path(int device_index) {
     (void)device_index;
+    (void)StaticTransitionRank;
     return false;
 }
 
 template <>
-bool can_use_dense_128_rank8_pair_path<c10::Half>(int device_index) {
+bool can_use_dense_128_static_rank_pair_path<c10::Half, 8>(int device_index) {
     return can_use_half2_path(device_index);
 }
 
 template <>
-bool can_use_dense_128_rank8_pair_path<c10::BFloat16>(int device_index) {
+bool can_use_dense_128_static_rank_pair_path<c10::Half, 16>(int device_index) {
+    return can_use_half2_path(device_index);
+}
+
+template <>
+bool can_use_dense_128_static_rank_pair_path<c10::BFloat16, 8>(int device_index) {
+    return cached_capability_major(device_index) >= 8;
+}
+
+template <>
+bool can_use_dense_128_static_rank_pair_path<c10::BFloat16, 16>(int device_index) {
     return cached_capability_major(device_index) >= 8;
 }
 
@@ -1977,8 +1999,8 @@ __global__ void increment_paged_lengths_kernel(
     paged_lengths[b] = updated;
 }
 
-template <typename scalar_t>
-__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_kernel(
+template <typename scalar_t, int StaticTransitionRank>
+__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_static_rank_kernel(
     scalar_t* __restrict__ paged_log_beliefs,
     scalar_t* __restrict__ paged_latent_states,
     const int64_t* __restrict__ paged_page_table,
@@ -1988,7 +2010,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_ke
     const float* __restrict__ transition_dest_probs,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ transition_stay_probs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     float score_clamp_min,
     float score_clamp_max,
     int64_t batch_size,
@@ -1999,8 +2021,9 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_ke
     scalar_t* __restrict__ beliefs,
     float* __restrict__ final_log_belief) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
+    constexpr int kTransitionRank = StaticTransitionRank;
     constexpr float kDefaultProb = 1.0f / static_cast<float>(kNumStates);
+    static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
     const int64_t b = static_cast<int64_t>(blockIdx.x);
     const int s = threadIdx.x;
     if (b >= batch_size) {
@@ -2028,6 +2051,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_ke
         kNumStates);
     __syncthreads();
 
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     const int64_t length = paged_lengths[b];
@@ -2109,8 +2133,8 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_ke
     }
 }
 
-template <typename scalar_t>
-__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_pair_kernel(
+template <typename scalar_t, int StaticTransitionRank>
+__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_static_rank_pair_kernel(
     scalar_t* __restrict__ paged_log_beliefs,
     scalar_t* __restrict__ paged_latent_states,
     const int64_t* __restrict__ paged_page_table,
@@ -2120,7 +2144,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_pa
     const float* __restrict__ transition_dest_probs,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ transition_stay_probs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     float score_clamp_min,
     float score_clamp_max,
     int64_t batch_size,
@@ -2131,9 +2155,10 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_pa
     scalar_t* __restrict__ beliefs,
     float* __restrict__ final_log_belief) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
+    constexpr int kTransitionRank = StaticTransitionRank;
     constexpr int kStatesPerThread = 2;
     constexpr float kDefaultProb = 1.0f / static_cast<float>(kNumStates);
+    static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
     const int64_t b = static_cast<int64_t>(blockIdx.x);
     const int pair_idx = threadIdx.x;
     const int state0 = pair_idx * kStatesPerThread;
@@ -2162,7 +2187,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_dense_128_rank8_pa
         kNumStates,
         kNumStates);
     __syncthreads();
-
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const FloatPair stay_prob{
         transition_stay_probs[state0],
         transition_stay_probs[state1],
@@ -2326,7 +2351,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_packed_kernel(
     const float* __restrict__ transition_dest_scales,
     const scalar_t* __restrict__ transition_context,
     const float* __restrict__ transition_stay_probs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     int transition_rank,
     int64_t batch_size,
     int64_t num_states,
@@ -2362,6 +2387,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void paged_step_packed_kernel(
         && (num_states >= kTensorCoreTile)
         && (rank >= kTensorCoreTile);
 
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     const int64_t length = paged_lengths[b];
@@ -2788,6 +2814,51 @@ bool try_set_persisting_l2_window_for_tensors(
 
 torch::Tensor make_device_work_queue_counter(const torch::Tensor& reference) {
     return torch::zeros({2}, reference.options().dtype(torch::kInt32));
+}
+
+struct ScanWorkspaceCacheKey {
+    int device_index = -1;
+    std::uintptr_t stream = 0;
+
+    bool operator==(const ScanWorkspaceCacheKey& other) const {
+        return device_index == other.device_index && stream == other.stream;
+    }
+};
+
+struct ScanWorkspaceCacheKeyHash {
+    size_t operator()(const ScanWorkspaceCacheKey& key) const {
+        const size_t device_hash = std::hash<int>{}(key.device_index);
+        const size_t stream_hash = std::hash<std::uintptr_t>{}(key.stream);
+        return device_hash ^ (stream_hash + 0x9e3779b97f4a7c15ULL + (device_hash << 6) + (device_hash >> 2));
+    }
+};
+
+std::mutex g_scan_workspace_cache_mutex;
+std::unordered_map<ScanWorkspaceCacheKey, torch::Tensor, ScanWorkspaceCacheKeyHash> g_scan_work_queue_counter_cache;
+
+torch::Tensor get_or_create_scan_work_queue_counter(const torch::Tensor& ref) {
+    const auto device_index = ref.get_device();
+    const auto stream = at::cuda::getCurrentCUDAStream(device_index).stream();
+    const ScanWorkspaceCacheKey key{
+        device_index,
+        reinterpret_cast<std::uintptr_t>(stream),
+    };
+    std::lock_guard<std::mutex> lock(g_scan_workspace_cache_mutex);
+    auto it = g_scan_work_queue_counter_cache.find(key);
+    if (it == g_scan_work_queue_counter_cache.end()) {
+        it = g_scan_work_queue_counter_cache.emplace(key, torch::Tensor()).first;
+    }
+    auto& counter = it->second;
+    if (
+        !counter.defined()
+        || counter.scalar_type() != torch::kInt32
+        || counter.device() != ref.device()
+        || counter.numel() != 2
+    ) {
+        counter = make_device_work_queue_counter(ref);
+    }
+    counter.zero_();
+    return counter;
 }
 
 template <typename T>
@@ -4267,6 +4338,7 @@ __device__ __forceinline__ float load_transition_gate_value(
     return transition_gate_ptr == nullptr ? 0.0f : transition_gate_ptr[0];
 }
 
+// Slow fallback for non-training wrappers that still read the gate on host.
 inline float transition_gate_scalar_value(const torch::Tensor& transition_gate) {
     if (!transition_gate.defined() || transition_gate.numel() == 0) {
         return 0.0f;
@@ -5573,7 +5645,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     const float* __restrict__ transition_dest_probs,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     float score_clamp_min,
     float score_clamp_max,
@@ -5632,6 +5704,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
             kNumStates);
     }
     __syncthreads();
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
 
@@ -5710,14 +5783,14 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     }
 }
 
-template <typename scalar_t, bool StoreBeliefs = true>
-__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_dense_128_rank8_kernel(
+template <typename scalar_t, int StaticTransitionRank, bool StoreBeliefs = true>
+__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_dense_128_static_rank_kernel(
     const scalar_t* __restrict__ local_logits,
     const float* __restrict__ transition_source_probs,
     const float* __restrict__ transition_dest_probs,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     float score_clamp_min,
     float score_clamp_max,
@@ -5729,7 +5802,8 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     scalar_t* __restrict__ beliefs,
     scalar_t* __restrict__ final_log_belief) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
+    constexpr int kTransitionRank = StaticTransitionRank;
+    static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
     const int s = threadIdx.x;
     __shared__ int current_batch;
 
@@ -5754,6 +5828,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
         kNumStates);
     __syncthreads();
 
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     const int sequence_tile_size = max(chunk_len, 1);
@@ -5809,14 +5884,14 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     }
 }
 
-template <typename scalar_t, bool StoreBeliefs = true>
-__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_dense_128_rank8_pair_kernel(
+template <typename scalar_t, int StaticTransitionRank, bool StoreBeliefs = true>
+__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_dense_128_static_rank_pair_kernel(
     const scalar_t* __restrict__ local_logits,
     const float* __restrict__ transition_source_probs,
     const float* __restrict__ transition_dest_probs,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     float score_clamp_min,
     float score_clamp_max,
@@ -5828,8 +5903,9 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     scalar_t* __restrict__ beliefs,
     scalar_t* __restrict__ final_log_belief) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
+    constexpr int kTransitionRank = StaticTransitionRank;
     constexpr int kStatesPerThread = 2;
+    static_assert(StaticTransitionRank > 0 && StaticTransitionRank <= kWarpSize);
     const int pair_idx = threadIdx.x;
     const int state0 = pair_idx * kStatesPerThread;
     const int state1 = state0 + 1;
@@ -5856,6 +5932,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
         kNumStates);
     __syncthreads();
 
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const FloatPair stay_prob{
         transition_stay_probs[state0],
         transition_stay_probs[state1],
@@ -5931,8 +6008,8 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     }
 }
 
-template <typename scalar_t, bool DirectGradReduce = false>
-__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk_dense_128_rank8_kernel(
+template <typename scalar_t, int StaticTransitionRank, bool DirectGradReduce = false>
+__global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk_dense_128_static_rank_kernel(
     const scalar_t* __restrict__ grad_beliefs,
     const scalar_t* __restrict__ grad_final_belief,
     const float* __restrict__ transition_source_probs,
@@ -5940,7 +6017,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     float score_clamp_min,
     float score_clamp_max,
@@ -5957,7 +6034,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     float* __restrict__ grad_transition_gate_per_batch,
     float* __restrict__ grad_transition_stay_per_batch) {
     constexpr int kNumStates = 128;
-    constexpr int kTransitionRank = 8;
+    constexpr int kTransitionRank = StaticTransitionRank;
     const int s = threadIdx.x;
     __shared__ int current_batch;
 
@@ -5986,6 +6063,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     for (int idx = s; idx < kTransitionRank * kNumStates; idx += blockDim.x) {
         dest_shared[idx] = transition_dest_probs[idx];
     }
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     __syncthreads();
@@ -6144,7 +6222,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     const float* __restrict__ transition_dest_scales,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     int transition_rank,
     int seq_len,
@@ -6173,6 +6251,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_chunk_
     tensor_core_input_t* tensor_core_rhs = tensor_core_lhs + (kTensorCoreTile * kTensorCoreTile);
     float* tensor_core_accum = reinterpret_cast<float*>(tensor_core_rhs + (kTensorCoreTile * kTensorCoreTile));
     float* tensor_core_matrix = tensor_core_accum + (kTensorCoreTile * kTensorCoreTile);
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     const bool use_tensor_core_math =
@@ -6751,7 +6830,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_masked
     const float* __restrict__ transition_dest_logits,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const bool* __restrict__ transition_mask,
     const int64_t* __restrict__ seq_lens,
@@ -6767,6 +6846,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_forward_masked
     scalar_t* __restrict__ final_log_belief) {
     const int s = threadIdx.x;
     const int num_states = static_cast<int>(blockDim.x);
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     __shared__ int current_batch;
@@ -6859,7 +6939,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_maske
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     float score_clamp_min,
@@ -6879,6 +6959,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_maske
     float* __restrict__ grad_transition_stay_per_batch) {
     const int s = threadIdx.x;
     const int num_states = static_cast<int>(blockDim.x);
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     __shared__ int current_batch;
@@ -7026,7 +7107,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_sparse
     const int32_t* __restrict__ block_col_idx,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     int num_states,
@@ -7045,6 +7126,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_sparse
     const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
     float* scratch = prev_prob + num_states;
     float* tile_stats = scratch + num_warps;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int state_tile_size = static_cast<int>(blockDim.x);
@@ -7217,7 +7299,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_spars
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     int num_states,
@@ -7241,6 +7323,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_spars
     float* grad_stay_shared = grad_mix + num_states;
     float* carry_shared = grad_stay_shared + num_states;
     float* scratch = carry_shared + num_states;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     __shared__ int current_batch;
@@ -7398,7 +7481,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_sparse
     const float* __restrict__ block_mask,
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     int num_states,
@@ -7419,6 +7502,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_forward_sparse
     const int num_warps = (static_cast<int>(blockDim.x) + kWarpSize - 1) / kWarpSize;
     float* scratch = prev_prob + num_states;
     float* tile_stats = scratch + num_warps;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const bool has_seq_lens = seq_lens != nullptr;
     const int sequence_tile_size = max(chunk_len, 1);
     const int state_tile_size = static_cast<int>(blockDim.x);
@@ -7718,7 +7802,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_spars
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     const int64_t* __restrict__ seq_lens,
     int num_states,
@@ -7739,6 +7823,7 @@ __global__ CAUSAL_MACHINE_TILED_LAUNCH_BOUNDS void causal_machine_backward_spars
     float* __restrict__ grad_transition_gate,
     float* __restrict__ grad_transition_stay) {
     const int tid = threadIdx.x;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     extern __shared__ float shared_mem[];
     float* prev_prob = shared_mem;
     float* grad_mix = prev_prob + num_states;
@@ -11287,7 +11372,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     float score_clamp_min,
     float score_clamp_max,
@@ -11356,6 +11441,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
             dest_shared[idx] = transition_dest_probs[idx];
         }
     }
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     __syncthreads();
@@ -11850,7 +11936,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     const scalar_t* __restrict__ transition_context,
     const scalar_t* __restrict__ initial_log_belief,
     const scalar_t* __restrict__ beliefs,
-    float transition_gate,
+    const float* __restrict__ transition_gate_ptr,
     const float* __restrict__ transition_stay_probs,
     int transition_rank,
     int seq_len,
@@ -11899,6 +11985,7 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     float* grad_source_batch = nullptr;
     float* grad_dest_batch = nullptr;
     float* grad_stay_batch = nullptr;
+    const float transition_gate = load_transition_gate_value(transition_gate_ptr);
     const float stay_prob = transition_stay_probs[s];
     const float one_minus_stay = 1.0f - stay_prob;
     const bool use_tensor_core_math =
@@ -12327,6 +12414,64 @@ __global__ CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS void causal_machine_backward_chunk
     }
 }
 
+template <typename scalar_t, int StaticTransitionRank, bool StoreBeliefs = true>
+void launch_forward_chunk_dense_128_static_rank(
+    const torch::Tensor& local_logits,
+    const torch::Tensor& transition_source_probs,
+    const torch::Tensor& transition_dest_probs,
+    const torch::Tensor& transition_context,
+    const torch::Tensor& initial_log_belief,
+    const torch::Tensor& transition_gate,
+    const torch::Tensor& transition_stay_probs,
+    double score_clamp_min,
+    double score_clamp_max,
+    int64_t chunk_start,
+    int64_t chunk_len,
+    const torch::Tensor& beliefs,
+    const torch::Tensor& final_log_belief) {
+    static_assert(StaticTransitionRank > 0, "dense_128 static-rank forward specialization requires a positive rank");
+    ScanKernelLaunchConfig launch_config{
+        dim3(1),
+        dim3(128),
+        8,
+        forward_dense_128_static_rank_shared_bytes<StaticTransitionRank>(),
+        local_logits.get_device(),
+        false,
+        static_cast<int>(local_logits.size(0)),
+    };
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    finalize_persistent_launch_config(
+        "causal_machine_scan forward dense_128_static_rank",
+        launch_config,
+        causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, StaticTransitionRank, StoreBeliefs>);
+    const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
+        stream,
+        launch_config.device_index,
+        {&transition_source_probs, &transition_dest_probs});
+    causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, StaticTransitionRank, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+        local_logits.data_ptr<scalar_t>(),
+        transition_source_probs.data_ptr<float>(),
+        transition_dest_probs.data_ptr<float>(),
+        transition_context.data_ptr<scalar_t>(),
+        initial_log_belief.data_ptr<scalar_t>(),
+        transition_gate.data_ptr<float>(),
+        transition_stay_probs.data_ptr<float>(),
+        static_cast<float>(score_clamp_min),
+        static_cast<float>(score_clamp_max),
+        static_cast<int>(local_logits.size(1)),
+        static_cast<int>(chunk_start),
+        static_cast<int>(chunk_len),
+        static_cast<int>(local_logits.size(0)),
+        work_queue_counter.data_ptr<int32_t>(),
+        beliefs.data_ptr<scalar_t>(),
+        final_log_belief.data_ptr<scalar_t>());
+    if (persisting_l2_window) {
+        clear_persisting_l2_window(stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename scalar_t, bool StoreBeliefs = true>
 void launch_forward_chunk_dense_128_rank8(
     const torch::Tensor& local_logits,
@@ -12343,41 +12488,41 @@ void launch_forward_chunk_dense_128_rank8(
     const torch::Tensor& beliefs,
     const torch::Tensor& final_log_belief) {
     constexpr int kVectorizedBlockThreads = 64;
-    const bool use_pair_path = can_use_dense_128_rank8_pair_path<scalar_t>(local_logits.get_device());
+    const bool use_pair_path = can_use_dense_128_static_rank_pair_path<scalar_t, 8>(local_logits.get_device());
     ScanKernelLaunchConfig launch_config{
         dim3(1),
         dim3(static_cast<unsigned int>(use_pair_path ? kVectorizedBlockThreads : 128)),
         8,
-        forward_dense_128_rank8_shared_bytes(),
+        forward_dense_128_static_rank_shared_bytes<8>(),
         local_logits.get_device(),
         false,
         static_cast<int>(local_logits.size(0)),
     };
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     if (use_pair_path) {
         finalize_persistent_launch_config(
             "causal_machine_scan forward dense_128_rank8",
             launch_config,
-            causal_machine_forward_chunk_dense_128_rank8_pair_kernel<scalar_t, StoreBeliefs>);
+            causal_machine_forward_chunk_dense_128_static_rank_pair_kernel<scalar_t, 8, StoreBeliefs>);
     } else {
         finalize_persistent_launch_config(
             "causal_machine_scan forward dense_128_rank8",
             launch_config,
-            causal_machine_forward_chunk_dense_128_rank8_kernel<scalar_t, StoreBeliefs>);
+            causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, 8, StoreBeliefs>);
     }
     const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
         stream,
         launch_config.device_index,
         {&transition_source_probs, &transition_dest_probs});
     if (use_pair_path) {
-        causal_machine_forward_chunk_dense_128_rank8_pair_kernel<scalar_t, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+        causal_machine_forward_chunk_dense_128_static_rank_pair_kernel<scalar_t, 8, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
             local_logits.data_ptr<scalar_t>(),
             transition_source_probs.data_ptr<float>(),
             transition_dest_probs.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             static_cast<float>(score_clamp_min),
             static_cast<float>(score_clamp_max),
@@ -12389,13 +12534,99 @@ void launch_forward_chunk_dense_128_rank8(
             beliefs.data_ptr<scalar_t>(),
             final_log_belief.data_ptr<scalar_t>());
     } else {
-        causal_machine_forward_chunk_dense_128_rank8_kernel<scalar_t, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+        causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, 8, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
             local_logits.data_ptr<scalar_t>(),
             transition_source_probs.data_ptr<float>(),
             transition_dest_probs.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
+            transition_stay_probs.data_ptr<float>(),
+            static_cast<float>(score_clamp_min),
+            static_cast<float>(score_clamp_max),
+            static_cast<int>(local_logits.size(1)),
+            static_cast<int>(chunk_start),
+            static_cast<int>(chunk_len),
+            static_cast<int>(local_logits.size(0)),
+            work_queue_counter.data_ptr<int32_t>(),
+            beliefs.data_ptr<scalar_t>(),
+            final_log_belief.data_ptr<scalar_t>());
+    }
+    if (persisting_l2_window) {
+        clear_persisting_l2_window(stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename scalar_t, bool StoreBeliefs = true>
+void launch_forward_chunk_dense_128_rank16(
+    const torch::Tensor& local_logits,
+    const torch::Tensor& transition_source_probs,
+    const torch::Tensor& transition_dest_probs,
+    const torch::Tensor& transition_context,
+    const torch::Tensor& initial_log_belief,
+    const torch::Tensor& transition_gate,
+    const torch::Tensor& transition_stay_probs,
+    double score_clamp_min,
+    double score_clamp_max,
+    int64_t chunk_start,
+    int64_t chunk_len,
+    const torch::Tensor& beliefs,
+    const torch::Tensor& final_log_belief) {
+    constexpr int kVectorizedBlockThreads = 64;
+    const bool use_pair_path = can_use_dense_128_static_rank_pair_path<scalar_t, 16>(local_logits.get_device());
+    ScanKernelLaunchConfig launch_config{
+        dim3(1),
+        dim3(static_cast<unsigned int>(use_pair_path ? kVectorizedBlockThreads : 128)),
+        8,
+        forward_dense_128_static_rank_shared_bytes<16>(),
+        local_logits.get_device(),
+        false,
+        static_cast<int>(local_logits.size(0)),
+    };
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (use_pair_path) {
+        finalize_persistent_launch_config(
+            "causal_machine_scan forward dense_128_rank16",
+            launch_config,
+            causal_machine_forward_chunk_dense_128_static_rank_pair_kernel<scalar_t, 16, StoreBeliefs>);
+    } else {
+        finalize_persistent_launch_config(
+            "causal_machine_scan forward dense_128_rank16",
+            launch_config,
+            causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, 16, StoreBeliefs>);
+    }
+    const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
+        stream,
+        launch_config.device_index,
+        {&transition_source_probs, &transition_dest_probs});
+    if (use_pair_path) {
+        causal_machine_forward_chunk_dense_128_static_rank_pair_kernel<scalar_t, 16, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+            local_logits.data_ptr<scalar_t>(),
+            transition_source_probs.data_ptr<float>(),
+            transition_dest_probs.data_ptr<float>(),
+            transition_context.data_ptr<scalar_t>(),
+            initial_log_belief.data_ptr<scalar_t>(),
+            transition_gate.data_ptr<float>(),
+            transition_stay_probs.data_ptr<float>(),
+            static_cast<float>(score_clamp_min),
+            static_cast<float>(score_clamp_max),
+            static_cast<int>(local_logits.size(1)),
+            static_cast<int>(chunk_start),
+            static_cast<int>(chunk_len),
+            static_cast<int>(local_logits.size(0)),
+            work_queue_counter.data_ptr<int32_t>(),
+            beliefs.data_ptr<scalar_t>(),
+            final_log_belief.data_ptr<scalar_t>());
+    } else {
+        causal_machine_forward_chunk_dense_128_static_rank_kernel<scalar_t, 16, StoreBeliefs><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+            local_logits.data_ptr<scalar_t>(),
+            transition_source_probs.data_ptr<float>(),
+            transition_dest_probs.data_ptr<float>(),
+            transition_context.data_ptr<scalar_t>(),
+            initial_log_belief.data_ptr<scalar_t>(),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             static_cast<float>(score_clamp_min),
             static_cast<float>(score_clamp_max),
@@ -12432,7 +12663,7 @@ void launch_forward_chunk(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     auto launch_config = make_forward_launch_config(local_logits, transition_rank);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan forward",
@@ -12448,7 +12679,7 @@ void launch_forward_chunk(
         transition_dest_probs.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -12516,7 +12747,7 @@ void launch_forward_masked_dense_chunk(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = static_cast<int>(transition_source_logits.size(1));
     auto launch_config = make_forward_masked_launch_config(local_logits);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan masked dense forward",
@@ -12532,7 +12763,7 @@ void launch_forward_masked_dense_chunk(
         transition_dest_logits.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         transition_mask.data_ptr<bool>(),
         seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
@@ -12657,7 +12888,7 @@ void launch_backward_masked_dense_chunk(
     const int total_batches = static_cast<int>(beliefs.size(0));
     const int transition_rank = static_cast<int>(transition_source_logits.size(1));
     auto launch_config = make_backward_masked_launch_config(beliefs);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan masked dense backward",
@@ -12678,7 +12909,7 @@ void launch_backward_masked_dense_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.defined() && seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         static_cast<float>(score_clamp_min),
@@ -12772,7 +13003,7 @@ void launch_forward_chunk_quantized(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_q.size(1));
     auto launch_config = make_forward_packed_launch_config(local_logits, transition_rank);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan quantized forward",
@@ -12790,7 +13021,7 @@ void launch_forward_chunk_quantized(
         transition_dest_scales.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -12828,7 +13059,7 @@ void launch_forward_chunk_fp8(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_packed.size(1));
     auto launch_config = make_forward_packed_launch_config(local_logits, transition_rank);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan fp8 forward",
@@ -12846,7 +13077,7 @@ void launch_forward_chunk_fp8(
         transition_dest_scales.data_ptr<float>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -12878,7 +13109,7 @@ void launch_forward_composable_chunk(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     auto launch_config = make_forward_launch_config(local_logits, transition_rank);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan composable forward",
@@ -12924,7 +13155,7 @@ void launch_forward_composable_chunk_summary(
     const int total_batches = static_cast<int>(local_logits.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     auto launch_config = make_forward_launch_config(local_logits, transition_rank);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan composable forward summary",
@@ -12970,7 +13201,7 @@ void launch_forward_composable_chunk_finalize(
     const int total_tasks = static_cast<int>(total_batches * num_chunks);
     auto launch_config = make_forward_launch_config(local_logits, transition_rank);
     launch_config.total_tasks = total_tasks;
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan composable forward finalize",
@@ -13021,7 +13252,7 @@ void launch_forward_sparse_chunk(
     const int seq_len = static_cast<int>(local_logits.size(1));
     const int total_batches = static_cast<int>(local_logits.size(0));
     auto launch_config = make_forward_sparse_launch_config(local_logits, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan_forward_sparse_chunk",
@@ -13038,7 +13269,7 @@ void launch_forward_sparse_chunk(
         block_col_idx.data_ptr<int32_t>(),
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         num_states,
@@ -13084,7 +13315,7 @@ void launch_forward_sparse_factor_chunk(
     const int seq_len = static_cast<int>(local_logits.size(1));
     const int total_batches = static_cast<int>(local_logits.size(0));
     auto launch_config = make_forward_sparse_launch_config(local_logits, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan_forward_sparse_factor_chunk",
@@ -13115,7 +13346,7 @@ void launch_forward_sparse_factor_chunk(
             block_mask.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -13167,7 +13398,7 @@ void launch_forward_sparse_logits_chunk(
     const int seq_len = static_cast<int>(local_logits.size(1));
     const int total_batches = static_cast<int>(local_logits.size(0));
     auto launch_config = make_forward_sparse_launch_config(local_logits, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const float* source_row_max_ptr =
         source_row_max.defined() && source_row_max.numel() > 0 ? source_row_max.data_ptr<float>() : nullptr;
@@ -13206,7 +13437,7 @@ void launch_forward_sparse_logits_chunk(
             block_mask.data_ptr<float>(),
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -13500,7 +13731,7 @@ void launch_forward_tiled_chunk(
             launch_config,
             causal_machine_forward_tiled_chunk_kernel<scalar_t, false>);
     }
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto filtered_value_cache = torch::empty(
         {launch_config.grid.x, local_logits.size(2)},
         transition_source_probs.options().dtype(torch::kFloat32));
@@ -13722,7 +13953,7 @@ void launch_forward_masked_tiled_chunk(
         use_sm90_tiled_kernel_family(local_logits.get_device())
             ? causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, true>
             : causal_machine_forward_masked_tiled_chunk_kernel<scalar_t, false>);
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto masked_transition_tile_cache = torch::empty(
         {launch_config.grid.x, local_logits.size(2), tile_size},
         transition_source_logits.options().dtype(torch::kFloat32));
@@ -14553,7 +14784,7 @@ void launch_backward_masked_tiled_chunk(
         use_sm90_tiled_kernel_family(beliefs.get_device())
             ? causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, true>
             : causal_machine_backward_masked_tiled_chunk_kernel<scalar_t, false>);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto masked_transition_tile_cache = torch::empty(
         {launch_config.grid.x, beliefs.size(2), tile_size},
         transition_source_logits.options().dtype(torch::kFloat32));
@@ -14677,7 +14908,7 @@ void launch_backward_sparse_chunk(
     const int32_t* grouped_src_block_idx_ptr =
         grouped_src_block_idx.numel() > 0 ? grouped_src_block_idx.data_ptr<int32_t>() : nullptr;
     auto launch_config = make_backward_sparse_launch_config(beliefs, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan_backward_sparse_chunk",
@@ -14701,7 +14932,7 @@ void launch_backward_sparse_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
         num_states,
@@ -14766,7 +14997,7 @@ void launch_backward_sparse_factor_chunk(
     const int32_t* grouped_src_block_idx_ptr =
         grouped_src_block_idx.numel() > 0 ? grouped_src_block_idx.data_ptr<int32_t>() : nullptr;
     auto launch_config = make_backward_sparse_launch_config(beliefs, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan_backward_sparse_factor_chunk",
@@ -14801,7 +15032,7 @@ void launch_backward_sparse_factor_chunk(
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
             beliefs.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -14873,7 +15104,7 @@ void launch_backward_sparse_logits_chunk(
     const int32_t* grouped_src_block_idx_ptr =
         grouped_src_block_idx.numel() > 0 ? grouped_src_block_idx.data_ptr<int32_t>() : nullptr;
     auto launch_config = make_backward_sparse_launch_config(beliefs, num_states);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan_backward_sparse_logits_chunk",
@@ -14908,7 +15139,7 @@ void launch_backward_sparse_logits_chunk(
             transition_context.data_ptr<scalar_t>(),
             initial_log_belief.data_ptr<scalar_t>(),
             beliefs.data_ptr<scalar_t>(),
-            transition_gate_scalar_value(transition_gate),
+            transition_gate.data_ptr<float>(),
             transition_stay_probs.data_ptr<float>(),
             seq_lens.numel() > 0 ? seq_lens.data_ptr<int64_t>() : nullptr,
             num_states,
@@ -14934,8 +15165,8 @@ void launch_backward_sparse_logits_chunk(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename scalar_t, bool DirectGradReduce = false>
-void launch_backward_chunk_dense_128_rank8(
+template <typename scalar_t, int StaticTransitionRank, bool DirectGradReduce = false>
+void launch_backward_chunk_dense_128_static_rank(
     const torch::Tensor& grad_beliefs,
     const torch::Tensor& grad_final_belief,
     const torch::Tensor& transition_source_probs,
@@ -14956,26 +15187,27 @@ void launch_backward_chunk_dense_128_rank8(
     const torch::Tensor& grad_initial_log_belief,
     const torch::Tensor& grad_transition_gate_per_batch,
     const torch::Tensor& grad_transition_stay_per_batch) {
+    static_assert(StaticTransitionRank > 0, "dense_128 static-rank backward specialization requires a positive rank");
     ScanKernelLaunchConfig launch_config{
         dim3(1),
         dim3(128),
         8,
-        backward_dense_128_rank8_shared_bytes(DirectGradReduce),
+        backward_dense_128_static_rank_shared_bytes<StaticTransitionRank>(DirectGradReduce),
         beliefs.get_device(),
         DirectGradReduce,
         static_cast<int>(beliefs.size(0)),
     };
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
-        "causal_machine_scan backward dense_128_rank8",
+        "causal_machine_scan backward dense_128_static_rank",
         launch_config,
-        causal_machine_backward_chunk_dense_128_rank8_kernel<scalar_t, DirectGradReduce>);
+        causal_machine_backward_chunk_dense_128_static_rank_kernel<scalar_t, StaticTransitionRank, DirectGradReduce>);
     const bool persisting_l2_window = try_set_persisting_l2_window_for_tensors(
         stream,
         launch_config.device_index,
         {&transition_source_probs, &transition_dest_probs});
-    causal_machine_backward_chunk_dense_128_rank8_kernel<scalar_t, DirectGradReduce><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
+    causal_machine_backward_chunk_dense_128_static_rank_kernel<scalar_t, StaticTransitionRank, DirectGradReduce><<<launch_config.grid, launch_config.block, launch_config.shared_bytes, stream>>>(
         grad_beliefs.data_ptr<scalar_t>(),
         grad_final_belief.data_ptr<scalar_t>(),
         transition_source_probs.data_ptr<float>(),
@@ -14983,7 +15215,7 @@ void launch_backward_chunk_dense_128_rank8(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -15031,7 +15263,7 @@ void launch_backward_chunk(
     const int total_batches = static_cast<int>(beliefs.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     auto launch_config = make_backward_launch_config(beliefs, transition_rank, DirectGradReduce);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan backward",
@@ -15049,7 +15281,7 @@ void launch_backward_chunk(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         static_cast<float>(score_clamp_min),
         static_cast<float>(score_clamp_max),
@@ -15137,7 +15369,7 @@ void launch_backward_composable_chunk(
     const int total_batches = static_cast<int>(grad_beliefs.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_probs.size(1));
     auto launch_config = make_backward_launch_config(grad_beliefs, transition_rank, DirectGradReduce);
-    auto work_queue_counter = make_device_work_queue_counter(grad_beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(grad_beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan composable backward",
@@ -15200,7 +15432,7 @@ void launch_backward_chunk_quantized(
     const int total_batches = static_cast<int>(beliefs.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_q.size(1));
     auto launch_config = make_backward_packed_launch_config(beliefs, transition_rank, DirectGradReduce);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan quantized backward",
@@ -15220,7 +15452,7 @@ void launch_backward_chunk_quantized(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -15270,7 +15502,7 @@ void launch_backward_chunk_fp8(
     const int total_batches = static_cast<int>(beliefs.size(0));
     const int transition_rank = StaticTransitionRank > 0 ? StaticTransitionRank : static_cast<int>(transition_source_packed.size(1));
     auto launch_config = make_backward_packed_launch_config(beliefs, transition_rank, DirectGradReduce);
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     finalize_persistent_launch_config(
         "causal_machine_scan fp8 backward",
@@ -15290,7 +15522,7 @@ void launch_backward_chunk_fp8(
         transition_context.data_ptr<scalar_t>(),
         initial_log_belief.data_ptr<scalar_t>(),
         beliefs.data_ptr<scalar_t>(),
-        transition_gate_scalar_value(transition_gate),
+        transition_gate.data_ptr<float>(),
         transition_stay_probs.data_ptr<float>(),
         launch_config.transition_rank,
         seq_len,
@@ -16091,7 +16323,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_quantized_kernel_cu
         local_logits,
         static_cast<int>(tile_size),
         static_cast<int>(split_size));
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto filtered_value_cache = torch::empty(
         {launch_config.grid.x, local_logits.size(2)},
         transition_source_scales.options().dtype(torch::kFloat32));
@@ -16222,7 +16454,7 @@ std::vector<torch::Tensor> causal_machine_scan_forward_tiled_fp8_kernel_cuda(
         local_logits,
         static_cast<int>(tile_size),
         static_cast<int>(split_size));
-    auto work_queue_counter = make_device_work_queue_counter(local_logits);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(local_logits);
     auto filtered_value_cache = torch::empty(
         {launch_config.grid.x, local_logits.size(2)},
         transition_source_scales.options().dtype(torch::kFloat32));
@@ -16820,7 +17052,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_probs_kernel_cuda(
     auto grad_transition_stay_staging = torch::zeros(
         {staging_worker_blocks, transition_stay_probs.size(0)},
         transition_stay_probs.options());
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -16940,7 +17172,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_quantized_kernel_c
     auto grad_latent_accum_staging = torch::empty({staging_worker_blocks, transition_source_q.size(1)}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_gate_staging = torch::zeros({staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_stay_staging = torch::zeros({staging_worker_blocks, beliefs.size(2)}, beliefs.options().dtype(torch::kFloat32));
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     const int64_t launch_worker_blocks = tiled_backward_launch_worker_blocks(
         beliefs.get_device(), runtime_config.launch_batch_size, runtime_config.staging_worker_blocks);
     const int64_t launch_chunk_len = std::min<int64_t>(std::max<int64_t>(chunk_size, 1), seq_len);
@@ -17100,7 +17332,7 @@ std::vector<torch::Tensor> causal_machine_scan_backward_tiled_fp8_kernel_cuda(
     auto grad_latent_accum_staging = torch::empty({staging_worker_blocks, transition_source_packed.size(1)}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_gate_staging = torch::zeros({staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32));
     auto grad_transition_stay_staging = torch::zeros({staging_worker_blocks, beliefs.size(2)}, beliefs.options().dtype(torch::kFloat32));
-    auto work_queue_counter = make_device_work_queue_counter(beliefs);
+    auto work_queue_counter = get_or_create_scan_work_queue_counter(beliefs);
     const int64_t launch_worker_blocks = tiled_backward_launch_worker_blocks(
         beliefs.get_device(), runtime_config.launch_batch_size, runtime_config.staging_worker_blocks);
     const int64_t launch_chunk_len = std::min<int64_t>(std::max<int64_t>(chunk_size, 1), seq_len);
@@ -17582,7 +17814,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -17624,22 +17855,39 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
                                 final_log_belief);
                         }
                         break;
-                case 16:
-                    launch_forward_chunk<scalar_t, 16>(
-                        local_logits,
-                        transition_source_probs,
-                        transition_dest_probs,
-                        transition_context,
-                        initial_log_belief,
-                        transition_gate,
-                        transition_stay_probs,
-                        score_clamp_min,
-                        score_clamp_max,
-                        0,
-                        scheduler.launch_chunk_size,
-                        beliefs,
-                        final_log_belief);
-                    break;
+                    case 16:
+                        if (local_logits.size(2) == 128) {
+                            launch_forward_chunk_dense_128_rank16<scalar_t>(
+                                local_logits,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                beliefs,
+                                final_log_belief);
+                        } else {
+                            launch_forward_chunk<scalar_t, 16>(
+                                local_logits,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                beliefs,
+                                final_log_belief);
+                        }
+                        break;
                 case 32:
                     launch_forward_chunk<scalar_t, 32>(
                         local_logits,
@@ -17730,7 +17978,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     }
     auto beliefs = torch::empty_like(local_logits);
     auto final_log_belief = torch::empty_like(initial_log_belief);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto transition_rank = transition_source_logits.size(1);
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -17791,7 +18038,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits_cuda(
         return {beliefs, final_log_belief};
     }
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -17900,7 +18146,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_cuda(
     }
 
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -18022,7 +18267,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_workspace_
     }
 
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
@@ -18139,7 +18383,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -18289,7 +18532,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_factors_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     auto padded_source_probs = transition_source_probs.contiguous();
     auto padded_dest_probs = transition_dest_probs.contiguous();
     if (padded_states != transition_source_probs.size(0)) {
@@ -18364,7 +18606,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_sparse_logits_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(local_logits.size(1), chunk_size);
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half,
@@ -19106,6 +19347,207 @@ std::vector<torch::Tensor> causal_machine_scan_materialize_sparse_blocks_fp8_cud
         block_size);
 }
 
+template <typename scalar_t>
+CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS __global__ void causal_machine_decode_belief_projection_kernel(
+    const scalar_t* __restrict__ state_log_beliefs,
+    const float* __restrict__ belief_out_weight,
+    scalar_t* __restrict__ output,
+    int num_tokens,
+    int num_states,
+    int out_dim) {
+    __shared__ float shared_probs[kMaxNumStates];
+    const int token_idx = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (token_idx >= num_tokens) {
+        return;
+    }
+    const int belief_offset = token_idx * num_states;
+    for (int state_idx = tid; state_idx < num_states; state_idx += blockDim.x) {
+        shared_probs[state_idx] = fast_exp(load_as_float(state_log_beliefs + belief_offset + state_idx));
+    }
+    __syncthreads();
+    const int output_offset = token_idx * out_dim;
+    for (int out_idx = tid; out_idx < out_dim; out_idx += blockDim.x) {
+        const float* weight_row = belief_out_weight + (out_idx * num_states);
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int state_idx = 0; state_idx < num_states; ++state_idx) {
+            acc += shared_probs[state_idx] * weight_row[state_idx];
+        }
+        output[output_offset + out_idx] = store_from_float<scalar_t>(acc);
+    }
+}
+
+template <typename scalar_t>
+CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS __global__ void causal_machine_decode_belief_projection_backward_input_kernel(
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ state_log_beliefs,
+    const float* __restrict__ belief_out_weight,
+    scalar_t* __restrict__ grad_input,
+    int num_tokens,
+    int num_states,
+    int out_dim) {
+    __shared__ float shared_probs[kMaxNumStates];
+    const int token_idx = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (token_idx >= num_tokens) {
+        return;
+    }
+    const int belief_offset = token_idx * num_states;
+    for (int state_idx = tid; state_idx < num_states; state_idx += blockDim.x) {
+        shared_probs[state_idx] = fast_exp(load_as_float(state_log_beliefs + belief_offset + state_idx));
+    }
+    __syncthreads();
+    const int grad_output_offset = token_idx * out_dim;
+    for (int state_idx = tid; state_idx < num_states; state_idx += blockDim.x) {
+        float acc = 0.0f;
+        for (int out_idx = 0; out_idx < out_dim; ++out_idx) {
+            acc += load_as_float(grad_output + grad_output_offset + out_idx)
+                * belief_out_weight[(out_idx * num_states) + state_idx];
+        }
+        grad_input[belief_offset + state_idx] = store_from_float<scalar_t>(shared_probs[state_idx] * acc);
+    }
+}
+
+template <typename scalar_t>
+CAUSAL_MACHINE_SMALL_LAUNCH_BOUNDS __global__ void causal_machine_decode_belief_projection_backward_weight_kernel(
+    const scalar_t* __restrict__ grad_output,
+    const scalar_t* __restrict__ state_log_beliefs,
+    float* __restrict__ grad_weight,
+    int num_tokens,
+    int num_states,
+    int out_dim) {
+    const int out_idx = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x);
+    if (out_idx >= out_dim) {
+        return;
+    }
+    for (int state_idx = tid; state_idx < num_states; state_idx += blockDim.x) {
+        float acc = 0.0f;
+        for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+            const float grad_value = load_as_float(grad_output + (token_idx * out_dim) + out_idx);
+            const float belief_value = fast_exp(load_as_float(state_log_beliefs + (token_idx * num_states) + state_idx));
+            acc += grad_value * belief_value;
+        }
+        grad_weight[(out_idx * num_states) + state_idx] = acc;
+    }
+}
+
+torch::Tensor causal_machine_decode_belief_projection_cuda(
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight) {
+    c10::cuda::CUDAGuard device_guard(state_log_beliefs.device());
+    const int64_t batch_size = state_log_beliefs.size(0);
+    const int64_t seq_len = state_log_beliefs.size(1);
+    const int64_t num_states = state_log_beliefs.size(2);
+    const int64_t out_dim = belief_out_weight.size(0);
+    auto output = torch::empty({batch_size, seq_len, out_dim}, state_log_beliefs.options());
+    if (batch_size == 0 || seq_len == 0 || num_states == 0 || out_dim == 0) {
+        return output;
+    }
+    constexpr int kBeliefDecodeThreads = kMaxNumStates;
+    const int64_t num_tokens = batch_size * seq_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        state_log_beliefs.scalar_type(),
+        "causal_machine_decode_belief_projection",
+        [&] {
+            causal_machine_decode_belief_projection_kernel<scalar_t><<<
+                static_cast<unsigned int>(num_tokens),
+                kBeliefDecodeThreads,
+                0,
+                stream>>>(
+                    state_log_beliefs.data_ptr<scalar_t>(),
+                    belief_out_weight.data_ptr<float>(),
+                    output.data_ptr<scalar_t>(),
+                    static_cast<int>(num_tokens),
+                    static_cast<int>(num_states),
+                    static_cast<int>(out_dim));
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return output;
+}
+
+torch::Tensor causal_machine_decode_belief_projection_backward_input_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight) {
+    c10::cuda::CUDAGuard device_guard(state_log_beliefs.device());
+    const int64_t batch_size = state_log_beliefs.size(0);
+    const int64_t seq_len = state_log_beliefs.size(1);
+    const int64_t num_states = state_log_beliefs.size(2);
+    const int64_t out_dim = belief_out_weight.size(0);
+    auto grad_input = torch::empty_like(state_log_beliefs);
+    if (batch_size == 0 || seq_len == 0 || num_states == 0 || out_dim == 0) {
+        return grad_input;
+    }
+    constexpr int kBeliefDecodeThreads = kMaxNumStates;
+    const int64_t num_tokens = batch_size * seq_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        state_log_beliefs.scalar_type(),
+        "causal_machine_decode_belief_projection_backward_input",
+        [&] {
+            causal_machine_decode_belief_projection_backward_input_kernel<scalar_t><<<
+                static_cast<unsigned int>(num_tokens),
+                kBeliefDecodeThreads,
+                0,
+                stream>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    state_log_beliefs.data_ptr<scalar_t>(),
+                    belief_out_weight.data_ptr<float>(),
+                    grad_input.data_ptr<scalar_t>(),
+                    static_cast<int>(num_tokens),
+                    static_cast<int>(num_states),
+                    static_cast<int>(out_dim));
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad_input;
+}
+
+torch::Tensor causal_machine_decode_belief_projection_backward_weight_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs) {
+    c10::cuda::CUDAGuard device_guard(state_log_beliefs.device());
+    const int64_t batch_size = state_log_beliefs.size(0);
+    const int64_t seq_len = state_log_beliefs.size(1);
+    const int64_t num_states = state_log_beliefs.size(2);
+    const int64_t out_dim = grad_output.size(2);
+    auto grad_weight = torch::zeros(
+        {out_dim, num_states},
+        torch::TensorOptions().device(state_log_beliefs.device()).dtype(torch::kFloat32));
+    if (batch_size == 0 || seq_len == 0 || num_states == 0 || out_dim == 0) {
+        return grad_weight;
+    }
+    constexpr int kBeliefDecodeThreads = kMaxNumStates;
+    const int64_t num_tokens = batch_size * seq_len;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        state_log_beliefs.scalar_type(),
+        "causal_machine_decode_belief_projection_backward_weight",
+        [&] {
+            causal_machine_decode_belief_projection_backward_weight_kernel<scalar_t><<<
+                static_cast<unsigned int>(out_dim),
+                kBeliefDecodeThreads,
+                0,
+                stream>>>(
+                    grad_output.data_ptr<scalar_t>(),
+                    state_log_beliefs.data_ptr<scalar_t>(),
+                    grad_weight.data_ptr<float>(),
+                    static_cast<int>(num_tokens),
+                    static_cast<int>(num_states),
+                    static_cast<int>(out_dim));
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad_weight;
+}
+
 std::vector<torch::Tensor> causal_machine_scan_forward_composable_logits_cuda(
     torch::Tensor local_logits,
     torch::Tensor transition_source_logits,
@@ -19313,55 +19755,190 @@ std::vector<torch::Tensor> causal_machine_scan_backward_workspace_cuda(
             [&] {
                 switch (transition_rank) {
                     case 8:
-                        // Keep rank-8 backward on the generic kernel, but avoid
-                        // the direct shared-memory reduction path. That reduction
-                        // mode is the remaining unstable path on the competition
-                        // 128-state configuration after the dedicated dense fast
-                        // kernel is bypassed.
-                        launch_backward_chunk<scalar_t, 8, false>(
-                            grad_beliefs,
-                            carry,
-                            transition_source_probs,
-                            transition_dest_probs,
-                            transition_context,
-                            initial_log_belief,
-                            beliefs,
-                            transition_gate,
-                            transition_stay_probs,
-                            score_clamp_min,
-                            score_clamp_max,
-                            0,
-                            scheduler.launch_chunk_size,
-                            grad_local_logits,
-                            grad_transition_source_per_batch,
-                            grad_transition_dest_per_batch,
-                            grad_transition_context,
-                            grad_initial_log_belief,
-                            grad_transition_gate_per_batch,
-                            grad_transition_stay_per_batch);
+                        if (num_states == 128) {
+                            if (direct_small_rank_grad) {
+                                launch_backward_chunk_dense_128_static_rank<scalar_t, 8, true>(
+                                    grad_beliefs,
+                                    carry,
+                                    transition_source_probs,
+                                    transition_dest_probs,
+                                    transition_context,
+                                    initial_log_belief,
+                                    beliefs,
+                                    transition_gate,
+                                    transition_stay_probs,
+                                    score_clamp_min,
+                                    score_clamp_max,
+                                    0,
+                                    scheduler.launch_chunk_size,
+                                    grad_local_logits,
+                                    grad_transition_source_per_batch,
+                                    grad_transition_dest_per_batch,
+                                    grad_transition_context,
+                                    grad_initial_log_belief,
+                                    grad_transition_gate_per_batch,
+                                    grad_transition_stay_per_batch);
+                            } else {
+                                launch_backward_chunk_dense_128_static_rank<scalar_t, 8, false>(
+                                    grad_beliefs,
+                                    carry,
+                                    transition_source_probs,
+                                    transition_dest_probs,
+                                    transition_context,
+                                    initial_log_belief,
+                                    beliefs,
+                                    transition_gate,
+                                    transition_stay_probs,
+                                    score_clamp_min,
+                                    score_clamp_max,
+                                    0,
+                                    scheduler.launch_chunk_size,
+                                    grad_local_logits,
+                                    grad_transition_source_per_batch,
+                                    grad_transition_dest_per_batch,
+                                    grad_transition_context,
+                                    grad_initial_log_belief,
+                                    grad_transition_gate_per_batch,
+                                    grad_transition_stay_per_batch);
+                            }
+                        } else if (direct_small_rank_grad) {
+                            launch_backward_chunk<scalar_t, 8, true>(
+                                grad_beliefs,
+                                carry,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                beliefs,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                grad_local_logits,
+                                grad_transition_source_per_batch,
+                                grad_transition_dest_per_batch,
+                                grad_transition_context,
+                                grad_initial_log_belief,
+                                grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        } else {
+                            launch_backward_chunk<scalar_t, 8, false>(
+                                grad_beliefs,
+                                carry,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                beliefs,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                grad_local_logits,
+                                grad_transition_source_per_batch,
+                                grad_transition_dest_per_batch,
+                                grad_transition_context,
+                                grad_initial_log_belief,
+                                grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        }
                         break;
                     case 16:
-                        launch_backward_chunk<scalar_t, 16, false>(
-                            grad_beliefs,
-                            carry,
-                            transition_source_probs,
-                            transition_dest_probs,
-                            transition_context,
-                            initial_log_belief,
-                            beliefs,
-                            transition_gate,
-                            transition_stay_probs,
-                            score_clamp_min,
-                            score_clamp_max,
-                            0,
-                            scheduler.launch_chunk_size,
-                            grad_local_logits,
-                            grad_transition_source_per_batch,
-                            grad_transition_dest_per_batch,
-                            grad_transition_context,
-                            grad_initial_log_belief,
-                            grad_transition_gate_per_batch,
-                            grad_transition_stay_per_batch);
+                        if (num_states == 128) {
+                            if (direct_small_rank_grad) {
+                                launch_backward_chunk_dense_128_static_rank<scalar_t, 16, true>(
+                                    grad_beliefs,
+                                    carry,
+                                    transition_source_probs,
+                                    transition_dest_probs,
+                                    transition_context,
+                                    initial_log_belief,
+                                    beliefs,
+                                    transition_gate,
+                                    transition_stay_probs,
+                                    score_clamp_min,
+                                    score_clamp_max,
+                                    0,
+                                    scheduler.launch_chunk_size,
+                                    grad_local_logits,
+                                    grad_transition_source_per_batch,
+                                    grad_transition_dest_per_batch,
+                                    grad_transition_context,
+                                    grad_initial_log_belief,
+                                    grad_transition_gate_per_batch,
+                                    grad_transition_stay_per_batch);
+                            } else {
+                                launch_backward_chunk_dense_128_static_rank<scalar_t, 16, false>(
+                                    grad_beliefs,
+                                    carry,
+                                    transition_source_probs,
+                                    transition_dest_probs,
+                                    transition_context,
+                                    initial_log_belief,
+                                    beliefs,
+                                    transition_gate,
+                                    transition_stay_probs,
+                                    score_clamp_min,
+                                    score_clamp_max,
+                                    0,
+                                    scheduler.launch_chunk_size,
+                                    grad_local_logits,
+                                    grad_transition_source_per_batch,
+                                    grad_transition_dest_per_batch,
+                                    grad_transition_context,
+                                    grad_initial_log_belief,
+                                    grad_transition_gate_per_batch,
+                                    grad_transition_stay_per_batch);
+                            }
+                        } else if (direct_small_rank_grad) {
+                            launch_backward_chunk<scalar_t, 16, true>(
+                                grad_beliefs,
+                                carry,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                beliefs,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                grad_local_logits,
+                                grad_transition_source_per_batch,
+                                grad_transition_dest_per_batch,
+                                grad_transition_context,
+                                grad_initial_log_belief,
+                                grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        } else {
+                            launch_backward_chunk<scalar_t, 16, false>(
+                                grad_beliefs,
+                                carry,
+                                transition_source_probs,
+                                transition_dest_probs,
+                                transition_context,
+                                initial_log_belief,
+                                beliefs,
+                                transition_gate,
+                                transition_stay_probs,
+                                score_clamp_min,
+                                score_clamp_max,
+                                0,
+                                scheduler.launch_chunk_size,
+                                grad_local_logits,
+                                grad_transition_source_per_batch,
+                                grad_transition_dest_per_batch,
+                                grad_transition_context,
+                                grad_initial_log_belief,
+                                grad_transition_gate_per_batch,
+                                grad_transition_stay_per_batch);
+                        }
                         break;
                     case 32:
                         if (direct_small_rank_grad) {
@@ -19606,7 +20183,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_cuda(
     auto grad_transition_gate_per_batch = direct_small_rank_grad
         ? torch::zeros({direct_staging_worker_blocks}, beliefs.options().dtype(torch::kFloat32))
         : torch::zeros({batch_size}, beliefs.options().dtype(torch::kFloat32));
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     return causal_machine_scan_backward_workspace_cuda(
         grad_beliefs,
         grad_final_belief,
@@ -19659,7 +20235,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits_workspace_cuda(
         static_cast<int>(transition_dest_logits.size(1)),
         transition_dest_probs.data_ptr<float>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     auto grads = causal_machine_scan_backward_workspace_cuda(
         grad_beliefs,
         grad_final_belief,
@@ -19965,7 +20540,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized_cuda(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     {
         AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -20038,7 +20612,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8_cuda_impl(
         final_log_belief.copy_(initial_log_belief);
         return {beliefs, final_log_belief};
     }
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size);
     {
         AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -20175,7 +20748,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized_cuda(
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
     auto carry = grad_final_belief.contiguous();
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     if (seq_len == 0) {
         grad_initial_log_belief.copy_(grad_final_belief);
     } else {
@@ -20335,7 +20907,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8_cuda_impl(
     auto grad_initial_log_belief = torch::zeros_like(initial_log_belief);
     auto carry = grad_final_belief.contiguous();
     const auto scheduler = make_scan_chunk_scheduler(seq_len, chunk_size, true);
-    const double transition_gate_value = static_cast<double>(transition_gate_scalar_value(transition_gate));
     if (seq_len == 0) {
         grad_initial_log_belief.copy_(grad_final_belief);
     } else {
@@ -20670,7 +21241,8 @@ void causal_machine_scan_read_paged_latest_tensor_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
+template <int StaticTransitionRank>
+std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_static_rank_cuda(
     torch::Tensor paged_log_beliefs,
     torch::Tensor paged_latent_states,
     torch::Tensor paged_page_table,
@@ -20704,14 +21276,14 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
         at::ScalarType::Half,
         at::ScalarType::BFloat16,
         local_logits.scalar_type(),
-        "causal_machine_scan_paged_step_dense_128_rank8_cuda",
+        "causal_machine_scan_paged_step_dense_128_static_rank_cuda",
         ([&] {
-            const bool use_pair_path = can_use_dense_128_rank8_pair_path<scalar_t>(local_logits.get_device());
+            const bool use_pair_path = can_use_dense_128_static_rank_pair_path<scalar_t, StaticTransitionRank>(local_logits.get_device());
             if (use_pair_path) {
-                paged_step_dense_128_rank8_pair_kernel<scalar_t><<<
+                paged_step_dense_128_static_rank_pair_kernel<scalar_t, StaticTransitionRank><<<
                     static_cast<unsigned int>(batch_size),
                     64,
-                    forward_dense_128_rank8_shared_bytes(),
+                    forward_dense_128_static_rank_shared_bytes<StaticTransitionRank>(),
                     stream>>>(
                         paged_log_beliefs.data_ptr<scalar_t>(),
                         has_paged_latent_states ? paged_latent_states.data_ptr<scalar_t>() : nullptr,
@@ -20722,7 +21294,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
                         transition_dest_probs.data_ptr<float>(),
                         transition_context.data_ptr<scalar_t>(),
                         transition_stay_probs.data_ptr<float>(),
-                        transition_gate_scalar_value(transition_gate),
+                        transition_gate.data_ptr<float>(),
                         static_cast<float>(score_clamp_min),
                         static_cast<float>(score_clamp_max),
                         batch_size,
@@ -20733,10 +21305,10 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
                         beliefs.data_ptr<scalar_t>(),
                         final_log_belief.data_ptr<float>());
             } else {
-                paged_step_dense_128_rank8_kernel<scalar_t><<<
+                paged_step_dense_128_static_rank_kernel<scalar_t, StaticTransitionRank><<<
                     static_cast<unsigned int>(batch_size),
                     128,
-                    forward_dense_128_rank8_shared_bytes(),
+                    forward_dense_128_static_rank_shared_bytes<StaticTransitionRank>(),
                     stream>>>(
                         paged_log_beliefs.data_ptr<scalar_t>(),
                         has_paged_latent_states ? paged_latent_states.data_ptr<scalar_t>() : nullptr,
@@ -20747,7 +21319,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
                         transition_dest_probs.data_ptr<float>(),
                         transition_context.data_ptr<scalar_t>(),
                         transition_stay_probs.data_ptr<float>(),
-                        transition_gate_scalar_value(transition_gate),
+                        transition_gate.data_ptr<float>(),
                         static_cast<float>(score_clamp_min),
                         static_cast<float>(score_clamp_max),
                         batch_size,
@@ -20761,6 +21333,62 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
         }));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {beliefs, final_log_belief};
+}
+
+std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
+    torch::Tensor paged_log_beliefs,
+    torch::Tensor paged_latent_states,
+    torch::Tensor paged_page_table,
+    torch::Tensor paged_lengths,
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_probs,
+    torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor transition_gate,
+    double score_clamp_min,
+    double score_clamp_max) {
+    return causal_machine_scan_paged_step_dense_128_static_rank_cuda<8>(
+        paged_log_beliefs,
+        paged_latent_states,
+        paged_page_table,
+        paged_lengths,
+        local_logits,
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context,
+        transition_stay_probs,
+        transition_gate,
+        score_clamp_min,
+        score_clamp_max);
+}
+
+std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank16_cuda(
+    torch::Tensor paged_log_beliefs,
+    torch::Tensor paged_latent_states,
+    torch::Tensor paged_page_table,
+    torch::Tensor paged_lengths,
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_probs,
+    torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor transition_gate,
+    double score_clamp_min,
+    double score_clamp_max) {
+    return causal_machine_scan_paged_step_dense_128_static_rank_cuda<16>(
+        paged_log_beliefs,
+        paged_latent_states,
+        paged_page_table,
+        paged_lengths,
+        local_logits,
+        transition_source_probs,
+        transition_dest_probs,
+        transition_context,
+        transition_stay_probs,
+        transition_gate,
+        score_clamp_min,
+        score_clamp_max);
 }
 
 template <typename packed_t, PackedTransitionFormat Format>
@@ -20826,7 +21454,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -20854,7 +21482,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -20882,7 +21510,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -20910,7 +21538,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -20938,7 +21566,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,
@@ -20966,7 +21594,7 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_packed_cuda_impl(
                             transition_dest_scales.data_ptr<float>(),
                             transition_context.data_ptr<scalar_t>(),
                             transition_stay_probs.data_ptr<float>(),
-                            transition_gate_scalar_value(transition_gate),
+                            transition_gate.data_ptr<float>(),
                             static_cast<int>(transition_rank),
                             batch_size,
                             num_states,

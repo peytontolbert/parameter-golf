@@ -56,10 +56,13 @@ That script builds:
   - `fp8_e4m3`
   - `fp8_e5m2`
 - `USE_CAUSAL_MACHINE_CUDA_SCAN=1`, `USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN=1`, and `USE_MUON_CUDA=1` are the active defaults
+- `USE_MUON_FOR_STATE_SPACE_MATRICES=1` is the competition default so state-space matrix params stay on the custom Muon lane
 
 Kernel/backend inspection hooks:
 
 - block SSM path: `StateSpaceBlock.attn.last_kernel_info`
+- block SSM path/timing summary in train logs: `PROFILE_STATE_SPACE_BLOCKS=1`
+- whole-block comparison summary in train logs: `block_runtime: ...`
 - global causal-machine path: `GPT.last_causal_machine_kernel_info`
 - paged recurrent-cache writes: `CausalMachineCache.last_paged_write_backend`
 - Muon optimizer step routing: `Muon.last_step_stats`
@@ -89,6 +92,8 @@ torchrun --standalone --nproc_per_node=2 train_gpt.py
 
 Use explicit paths and keep the submission self-contained:
 
+The `MAX_WALLCLOCK_SECONDS=600` setting here is the training-side budget used by this script. Competition evaluation is a separate 10-minute window, so keep training validation disabled and treat `FINAL_EVAL_MAX_SEQS` as an offline/debug knob rather than part of the timed train loop.
+
 ```bash
 cd /data/parametergolf/peytontolbert-parameter-golf
 
@@ -108,9 +113,11 @@ TRAIN_SEQ_LEN=1024 \
 EVAL_SEQ_LEN=2048 \
 TRAIN_BATCH_TOKENS=524288 \
 GRAD_ACCUM_STEPS=1 \
+ENABLE_TORCH_COMPILE=1 \
+USE_CUDA_GRAPHS=1 \
 VAL_LOSS_EVERY=0 \
 VAL_MAX_SEQS=0 \
-FINAL_EVAL_MAX_SEQS=32 \
+FINAL_EVAL_MAX_SEQS=0 \
 TRAIN_LOG_EVERY=50 \
 USE_OUTPUT_LOGIT_BIAS=0 \
 USE_CAUSAL_MACHINE_BACKBONE=1 \
@@ -118,6 +125,7 @@ USE_CAUSAL_MACHINE_OUTPUT_BIAS=0 \
 BLOCK_PATTERN=attn,attn,attn,attn,ssm,ssm,ssm,ssm,attn,attn \
 CAUSAL_MACHINE_NUM_STATES=128 \
 CAUSAL_MACHINE_HIDDEN_RANK=64 \
+CAUSAL_MACHINE_TRANSITION_RANK=16 \
 CAUSAL_MACHINE_LATENT_MODE=replace \
 CAUSAL_MACHINE_LATENT_RANK=16 \
 CAUSAL_MACHINE_LATENT_DECAY_MIN=0.995 \
@@ -137,6 +145,10 @@ REGRESSION_STOP_PATIENCE=0 \
 torchrun --standalone --nproc_per_node=8 \
 records/track_10min_16mb/2026-03-26_StateSpace_CausalMachine/train_gpt.py
 ```
+
+Competition-mode DDP uses full-step CUDA graph capture with Muon by default. Partial-step graph fallback is not competition-safe and is rejected when `COMPETITION_MODE=1`.
+
+`CAUSAL_MACHINE_LATENT_RANK` only controls the latent replace/additive subspace. It does not change the structured scan rank. Set `CAUSAL_MACHINE_TRANSITION_RANK` explicitly when benchmarking scan kernels.
 
 Optional packed scan setting:
 

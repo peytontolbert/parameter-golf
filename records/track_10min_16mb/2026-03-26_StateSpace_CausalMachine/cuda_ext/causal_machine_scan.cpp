@@ -22,6 +22,19 @@ std::vector<torch::Tensor> causal_machine_scan_forward_cuda(
     double score_clamp_min = -std::numeric_limits<double>::infinity(),
     double score_clamp_max = std::numeric_limits<double>::infinity());
 
+torch::Tensor causal_machine_decode_belief_projection_cuda(
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight);
+
+torch::Tensor causal_machine_decode_belief_projection_backward_input_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight);
+
+torch::Tensor causal_machine_decode_belief_projection_backward_weight_cuda(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs);
+
 std::vector<torch::Tensor> causal_machine_scan_forward_logits_cuda(
     torch::Tensor local_logits,
     torch::Tensor transition_source_logits,
@@ -783,6 +796,19 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank8_cuda(
     torch::Tensor transition_gate,
     double score_clamp_min,
     double score_clamp_max);
+std::vector<torch::Tensor> causal_machine_scan_paged_step_dense_128_rank16_cuda(
+    torch::Tensor paged_log_beliefs,
+    torch::Tensor paged_latent_states,
+    torch::Tensor paged_page_table,
+    torch::Tensor paged_lengths,
+    torch::Tensor local_logits,
+    torch::Tensor transition_source_probs,
+    torch::Tensor transition_dest_probs,
+    torch::Tensor transition_context,
+    torch::Tensor transition_stay_probs,
+    torch::Tensor transition_gate,
+    double score_clamp_min,
+    double score_clamp_max);
 std::vector<torch::Tensor> causal_machine_scan_paged_step_quantized_cuda(
     torch::Tensor paged_log_beliefs,
     torch::Tensor paged_latent_states,
@@ -1501,13 +1527,14 @@ py::dict causal_machine_scan_select_dense_runtime_policy(
         needs_grad);
     const int64_t capability_major = causal_machine_scan_cached_capability_major_cuda(device_index);
     const bool exact_dense_128_rank8 = (num_states == 128 && transition_rank == 8);
+    const bool exact_dense_128_rank16 = (num_states == 128 && transition_rank == 16);
     const bool optimized_rank = bool(info[py::str("optimized_rank")].cast<bool>());
     const bool direct_grad_reduce = bool(info[py::str("direct_grad_reduce")].cast<bool>());
     const int64_t shared_bytes = info[py::str("shared_bytes")].cast<int64_t>();
     const bool uses_persisting_l2 = bool(info[py::str("uses_persisting_l2_window")].cast<bool>());
 
     info["selected"] = true;
-    info["candidate_count"] = exact_dense_128_rank8 ? 3 : (optimized_rank ? 2 : 1);
+    info["candidate_count"] = (exact_dense_128_rank8 || exact_dense_128_rank16) ? 3 : (optimized_rank ? 2 : 1);
     info["supports_async_pipeline"] = capability_major >= 8;
     info["block_threads"] = num_states;
     info["items_per_thread"] = (!needs_grad && seq_len >= 1024) ? 2 : 1;
@@ -1539,6 +1566,18 @@ py::dict causal_machine_scan_select_dense_runtime_policy(
         }
         if (!needs_grad && seq_len == 1) {
             score += 12000;
+        }
+    } else if (exact_dense_128_rank16) {
+        info["kernel_family"] = needs_grad ? "dense_128_rank16_train" : "dense_128_rank16_eval";
+        info["backward_kernel_family"] = "dense_128_rank16_backward";
+        info["rank_unroll"] = 16;
+        info["state_unroll"] = 4;
+        info["selection_reason"] = needs_grad
+            ? "exact_shape_dense_128_rank16_train"
+            : "exact_shape_dense_128_rank16_eval";
+        score += 120000;
+        if (needs_grad && direct_grad_reduce) {
+            score += 6000;
         }
     } else if (optimized_rank) {
         info["kernel_family"] = "small_state_static_rank";
@@ -2637,7 +2676,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_masked_logits(
 
     const auto num_states = local_logits.size(2);
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
-    const auto gate_value = transition_gate_value_from_tensor(transition_gate_f32, local_logits);
     const bool native_score_filtering = std::isfinite(score_threshold) || score_topk > 0;
     if (is_supported_specialized_num_states(num_states) && is_optional_tensor_defined(transition_mask)) {
         TORCH_CHECK(
@@ -4615,23 +4653,39 @@ std::vector<torch::Tensor> causal_machine_scan_paged_step_(
     if (
         !use_packed
         && num_states == kSpecializedNumStates
-        && transition_source_probs.size(1) == 8
         && paged_log_beliefs.scalar_type() == local_logits.scalar_type()
         && (!is_optional_tensor_defined(paged_latent_states) || paged_latent_states.scalar_type() == local_logits.scalar_type())
     ) {
-        return causal_machine_scan_paged_step_dense_128_rank8_cuda(
-            paged_log_beliefs,
-            paged_latent_states,
-            paged_page_table,
-            paged_lengths,
-            local_logits,
-            transition_source_probs,
-            transition_dest_probs,
-            transition_context,
-            transition_stay_probs,
-            transition_gate_f32,
-            score_clamp_min,
-            score_clamp_max);
+        if (transition_source_probs.size(1) == 8) {
+            return causal_machine_scan_paged_step_dense_128_rank8_cuda(
+                paged_log_beliefs,
+                paged_latent_states,
+                paged_page_table,
+                paged_lengths,
+                local_logits,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context,
+                transition_stay_probs,
+                transition_gate_f32,
+                score_clamp_min,
+                score_clamp_max);
+        }
+        if (transition_source_probs.size(1) == 16) {
+            return causal_machine_scan_paged_step_dense_128_rank16_cuda(
+                paged_log_beliefs,
+                paged_latent_states,
+                paged_page_table,
+                paged_lengths,
+                local_logits,
+                transition_source_probs,
+                transition_dest_probs,
+                transition_context,
+                transition_stay_probs,
+                transition_gate_f32,
+                score_clamp_min,
+                score_clamp_max);
+        }
     }
     if (use_packed && packed_kind == 0) {
         return causal_machine_scan_paged_step_quantized_cuda(
@@ -4781,7 +4835,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_logits(
         "initial_log_belief must match local_logits dtype"
     );
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -4932,7 +4985,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward(
         "initial_log_belief must match local_logits dtype"
     );
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
-    const auto transition_gate_value = transition_gate_value_from_tensor(transition_gate_f32, local_logits);
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -5020,7 +5072,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_quantized(
         "initial_log_belief must match local_logits dtype"
     );
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -5135,7 +5186,6 @@ std::vector<torch::Tensor> causal_machine_scan_forward_fp8(
     );
     TORCH_CHECK(fp8_format == 0 || fp8_format == 1, "fp8_format must be 0 (e4m3) or 1 (e5m2)");
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, local_logits);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (local_logits.size(0) == 0 || local_logits.size(1) == 0) {
         auto beliefs = torch::empty_like(local_logits);
@@ -5726,7 +5776,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_masked_logits_bound_work
     int64_t score_topk) {
     const auto num_states = beliefs.size(2);
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
-    const auto gate_value = transition_gate_value_from_tensor(transition_gate_f32, beliefs);
     if (num_states <= kSpecializedNumStates) {
         return causal_machine_scan_backward_masked_logits(
             grad_beliefs,
@@ -6295,7 +6344,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_logits(
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6420,7 +6468,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_quantized(
     TORCH_CHECK(transition_context.scalar_type() == beliefs.scalar_type(), "transition_context must match beliefs dtype");
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6550,7 +6597,6 @@ std::vector<torch::Tensor> causal_machine_scan_backward_fp8(
     TORCH_CHECK(initial_log_belief.scalar_type() == beliefs.scalar_type(), "initial_log_belief must match beliefs dtype");
     TORCH_CHECK(fp8_format == 0 || fp8_format == 1, "fp8_format must be 0 (e4m3) or 1 (e5m2)");
     auto transition_gate_f32 = normalize_transition_gate_tensor(transition_gate, beliefs);
-    const auto transition_gate_value = static_cast<double>(transition_gate_f32.item<float>());
     TORCH_CHECK(chunk_size > 0, "chunk_size must be positive");
     if (beliefs.size(0) == 0 || beliefs.size(1) == 0) {
         return {
@@ -6712,8 +6758,94 @@ std::vector<torch::Tensor> causal_machine_scan_backward_composable_logits(
                 initial_log_belief,
                 beliefs,
                 transition_stay_probs,
-                chunk_size);
+            chunk_size);
         });
+}
+
+torch::Tensor causal_machine_decode_belief_projection(
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight) {
+    check_cuda_activation(state_log_beliefs, "state_log_beliefs");
+    check_cuda_float32(belief_out_weight, "belief_out_weight");
+    TORCH_CHECK(state_log_beliefs.dim() == 3, "state_log_beliefs must have shape [B, L, N]");
+    TORCH_CHECK(belief_out_weight.dim() == 2, "belief_out_weight must have shape [D, N]");
+    TORCH_CHECK(
+        belief_out_weight.size(1) == state_log_beliefs.size(2),
+        "belief_out_weight second dim must match state_log_beliefs last dim"
+    );
+    TORCH_CHECK(
+        state_log_beliefs.size(2) > 0 && state_log_beliefs.size(2) <= 128,
+        "fused belief decode supports num_states in [1, 128]"
+    );
+    check_same_cuda_device(belief_out_weight, state_log_beliefs, "belief_out_weight");
+    return causal_machine_decode_belief_projection_cuda(
+        state_log_beliefs.contiguous(),
+        belief_out_weight.contiguous());
+}
+
+torch::Tensor causal_machine_decode_belief_projection_backward_input(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs,
+    torch::Tensor belief_out_weight) {
+    check_cuda_activation(grad_output, "grad_output");
+    check_cuda_activation(state_log_beliefs, "state_log_beliefs");
+    check_cuda_float32(belief_out_weight, "belief_out_weight");
+    TORCH_CHECK(grad_output.dim() == 3, "grad_output must have shape [B, L, D]");
+    TORCH_CHECK(state_log_beliefs.dim() == 3, "state_log_beliefs must have shape [B, L, N]");
+    TORCH_CHECK(belief_out_weight.dim() == 2, "belief_out_weight must have shape [D, N]");
+    TORCH_CHECK(
+        grad_output.size(0) == state_log_beliefs.size(0)
+            && grad_output.size(1) == state_log_beliefs.size(1),
+        "grad_output must match state_log_beliefs batch and sequence dimensions"
+    );
+    TORCH_CHECK(
+        grad_output.size(2) == belief_out_weight.size(0),
+        "grad_output last dim must match belief_out_weight first dim"
+    );
+    TORCH_CHECK(
+        belief_out_weight.size(1) == state_log_beliefs.size(2),
+        "belief_out_weight second dim must match state_log_beliefs last dim"
+    );
+    TORCH_CHECK(
+        state_log_beliefs.size(2) > 0 && state_log_beliefs.size(2) <= 128,
+        "fused belief decode supports num_states in [1, 128]"
+    );
+    TORCH_CHECK(
+        grad_output.scalar_type() == state_log_beliefs.scalar_type(),
+        "grad_output must match state_log_beliefs dtype"
+    );
+    check_same_cuda_device(state_log_beliefs, grad_output, "state_log_beliefs");
+    check_same_cuda_device(belief_out_weight, grad_output, "belief_out_weight");
+    return causal_machine_decode_belief_projection_backward_input_cuda(
+        grad_output.contiguous(),
+        state_log_beliefs.contiguous(),
+        belief_out_weight.contiguous());
+}
+
+torch::Tensor causal_machine_decode_belief_projection_backward_weight(
+    torch::Tensor grad_output,
+    torch::Tensor state_log_beliefs) {
+    check_cuda_activation(grad_output, "grad_output");
+    check_cuda_activation(state_log_beliefs, "state_log_beliefs");
+    TORCH_CHECK(grad_output.dim() == 3, "grad_output must have shape [B, L, D]");
+    TORCH_CHECK(state_log_beliefs.dim() == 3, "state_log_beliefs must have shape [B, L, N]");
+    TORCH_CHECK(
+        grad_output.size(0) == state_log_beliefs.size(0)
+            && grad_output.size(1) == state_log_beliefs.size(1),
+        "grad_output must match state_log_beliefs batch and sequence dimensions"
+    );
+    TORCH_CHECK(
+        state_log_beliefs.size(2) > 0 && state_log_beliefs.size(2) <= 128,
+        "fused belief decode supports num_states in [1, 128]"
+    );
+    TORCH_CHECK(
+        grad_output.scalar_type() == state_log_beliefs.scalar_type(),
+        "grad_output must match state_log_beliefs dtype"
+    );
+    check_same_cuda_device(state_log_beliefs, grad_output, "state_log_beliefs");
+    return causal_machine_decode_belief_projection_backward_weight_cuda(
+        grad_output.contiguous(),
+        state_log_beliefs.contiguous());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -6849,6 +6981,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Describe the masked tiled structured scan launch/runtime config (CUDA)");
     m.def("describe_device_runtime_config", &causal_machine_scan_describe_device_runtime_config, "Describe device architecture/runtime capabilities for structured scan CUDA backends");
     m.def("describe_scan_workspace_config", &causal_machine_scan_describe_workspace_config, "Describe explicit workspace tensor requirements for structured scan CUDA kernels");
+    m.def("decode_belief_projection", &causal_machine_decode_belief_projection, "Fuse belief exp plus output projection for state-space decode (CUDA)");
+    m.def("decode_belief_projection_backward_input", &causal_machine_decode_belief_projection_backward_input, "Backward-input kernel for fused state-space belief decode (CUDA)");
+    m.def("decode_belief_projection_backward_weight", &causal_machine_decode_belief_projection_backward_weight, "Backward-weight kernel for fused state-space belief decode (CUDA)");
     m.def("create_scan_workspace", &causal_machine_scan_create_workspace, "Create explicit reusable workspace tensors for structured scan CUDA kernels");
     m.def("record_paged_step_", &causal_machine_scan_record_paged_step_, "Append one recurrent belief step into the paged CUDA cache");
     m.def("record_paged_sequence_", &causal_machine_scan_record_paged_sequence_, "Append a recurrent belief sequence into the paged CUDA cache");
