@@ -25,7 +25,7 @@ import zlib
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -111,6 +111,20 @@ _MUON_CUDA_WARNED_FAILURE_KEYS: set[str] = set()
 
 def _allow_cuda_training_kernels(allow_training: bool) -> bool:
     return (not torch.is_grad_enabled()) or bool(allow_training)
+
+
+def _resolve_token_loader_prefetch_depth(
+    base_depth: int,
+    *,
+    cuda_graph_capture_mode: str = "disabled",
+) -> int:
+    depth = max(int(base_depth), 0)
+    if str(cuda_graph_capture_mode) != "full_step":
+        return depth
+    override = os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH_FULL_STEP_CUDA_GRAPH", "").strip()
+    if override:
+        return max(int(override), 0)
+    return 0
 
 
 def _start_state_space_runtime_profile(device: torch.device) -> dict[str, object] | None:
@@ -6634,7 +6648,6 @@ def autotune_structured_scan_kernel_config(
         needs_grad=bool(needs_grad),
         runtime_config=runtime_config,
     )
-    runtime_config.backend_policy = policy
     chunk_size = max(int(policy.chunk_size), 1)
     tile_size = max(int(policy.tile_size), 1)
     split_size = max(int(policy.split_size), 1)
@@ -6696,6 +6709,13 @@ def autotune_structured_scan_kernel_config(
             runtime_config=runtime_config,
         )
     )
+    native_filtering_requires_custom_tiled_backward = (
+        _native_structured_score_filtering_requires_custom_tiled_backward(
+            runtime_config,
+            num_states=int(num_states),
+            needs_grad=bool(needs_grad),
+        )
+    )
     if allow_cuda_tiled:
         tiled_kernel_config = _resolve_structured_scan_tiled_kernel_config(
             device,
@@ -6710,12 +6730,17 @@ def autotune_structured_scan_kernel_config(
         )
         if tiled_kernel_config is not None:
             tile_size, split_size = tiled_kernel_config
+        elif native_filtering_requires_custom_tiled_backward:
+            allow_cuda_tiled = False
     allow_python_tiled = (
         num_states > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
         and transition_rank > 0
         and transition_rank <= num_states
         and _structured_runtime_supports_tiled_backend(runtime_config)
     )
+    if native_filtering_requires_custom_tiled_backward and not allow_cuda_tiled:
+        policy = replace(policy, name="native_filtering_tiled_backward_fallback")
+    runtime_config.backend_policy = policy
     backend = "cuda" if allow_cuda else ("cuda_tiled" if allow_cuda_tiled else ("python_tiled" if allow_python_tiled else "python"))
     if runtime_config is not None and runtime_config.backend not in {"", "auto"}:
         backend = str(runtime_config.backend).strip().lower()
@@ -7131,6 +7156,19 @@ def _has_native_structured_score_filtering(
     threshold = _resolve_native_structured_score_threshold(runtime_config)
     topk = _resolve_native_structured_score_topk(runtime_config, num_states=num_states)
     return math.isfinite(threshold) or topk > 0
+
+
+def _native_structured_score_filtering_requires_custom_tiled_backward(
+    runtime_config: StructuredScanRuntimeConfig | None,
+    *,
+    num_states: int,
+    needs_grad: bool,
+) -> bool:
+    return (
+        bool(needs_grad)
+        and int(num_states) > _MAX_SPECIALIZED_STRUCTURED_SCAN_NUM_STATES
+        and _has_native_structured_score_filtering(runtime_config, num_states=int(num_states))
+    )
 
 
 def _apply_native_structured_score_mod_inputs(
@@ -11289,7 +11327,9 @@ class DistributedTokenLoader:
         self._prepare_lock = threading.Lock()
         self.last_batch_info: dict[str, object] = {}
         self.prefetch_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        self.prefetch_depth = max(int(os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH", "2")), 1)
+        self.prefetch_depth = _resolve_token_loader_prefetch_depth(
+            int(os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH", "2"))
+        )
         self._prefetched_batches: deque[dict[str, object]] = deque()
         self._pinned_token_buffer_ring_size = max(self.prefetch_depth + 1, 2)
         self._pinned_token_buffers: dict[tuple[tuple[int, ...], torch.dtype], list[Tensor]] = {}
@@ -11314,6 +11354,17 @@ class DistributedTokenLoader:
         for _kind, _request, future in self._prepared_batches:
             future.cancel()
         self._prepared_batches.clear()
+
+    def configure_runtime_prefetch(self, *, cuda_graph_capture_mode: str) -> None:
+        target_depth = _resolve_token_loader_prefetch_depth(
+            int(os.environ.get("TOKEN_LOADER_PREFETCH_DEPTH", "2")),
+            cuda_graph_capture_mode=cuda_graph_capture_mode,
+        )
+        if target_depth == self.prefetch_depth:
+            return
+        self._clear_prefetch_pipeline()
+        self.prefetch_depth = target_depth
+        self._pinned_token_buffer_ring_size = max(self.prefetch_depth + 1, 2)
 
     def _prepare_batch(
         self,
@@ -11491,10 +11542,21 @@ class DistributedTokenLoader:
         self._submit_prepared_batch(kind, global_tokens, seq_len, grad_accum_steps)
         self._try_launch_prefetch_copy()
         if not self._prefetched_batches:
-            queued_kind, request, future = self._prepared_batches.popleft()
-            prepared = future.result()
-            prepared["kind"] = queued_kind
-            prepared["request"] = request
+            if self._prepared_batches:
+                queued_kind, request, future = self._prepared_batches.popleft()
+                prepared = future.result()
+                prepared["kind"] = queued_kind
+                prepared["request"] = request
+            else:
+                request = (global_tokens, seq_len, grad_accum_steps)
+                prepared = self._prepare_batch(
+                    global_tokens,
+                    seq_len,
+                    grad_accum_steps,
+                    kind == "packed",
+                )
+                prepared["kind"] = kind
+                prepared["request"] = request
             self._prefetched_batches.append(self._copy_prepared_batch_to_device(prepared))
         batch = self._prefetched_batches.popleft()
         if self.prefetch_stream is not None:
@@ -16482,6 +16544,14 @@ def main() -> None:
         f"cuda_graph_partial_step:{int(cuda_graph_capture_mode == 'partial_step')} "
         f"cuda_graph_reason:{cuda_graph_disable_reason}"
     )
+    train_loader.configure_runtime_prefetch(cuda_graph_capture_mode=cuda_graph_capture_mode)
+    if cuda_graph_capture_mode == "full_step" and train_loader.prefetch_depth == 0:
+        log0(
+            "token_loader_notice:"
+            " full_step_cuda_graph_disables_extra_device_prefetch"
+            " to_preserve_graph_pool_headroom",
+            console=False,
+        )
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     finalization_reserve_ms = max(float(args.wallclock_finalization_reserve_ms), 0.0)
@@ -16636,7 +16706,6 @@ def main() -> None:
     def build_train_cuda_graph(
         sample_batches: Sequence[tuple[Tensor, Tensor, Tensor | None]],
         *,
-        ema_active: bool,
         captures_full_step: bool,
     ) -> dict[str, object]:
         if not sample_batches:
@@ -16681,8 +16750,6 @@ def main() -> None:
             if captures_full_step:
                 for opt in graph_step_optimizers:
                     opt.step()
-                if ema_active and ema_state is not None:
-                    update_ema_state(ema_state, base_model, args.ema_decay)
                 for opt in graph_step_optimizers:
                     opt.zero_grad(set_to_none=False)
         if graph_execution_stream is not None:
@@ -16694,7 +16761,6 @@ def main() -> None:
             "static_loss": static_loss,
             "static_grad_norm": static_grad_norm,
             "graph_runtime": graph_runtime,
-            "ema_active": bool(ema_active) if captures_full_step else False,
             "captures_full_step": bool(captures_full_step),
             "num_microbatches": int(len(static_batches)),
         }
@@ -16777,6 +16843,7 @@ def main() -> None:
             seed=args.seed,
             debug_static_shapes=args.debug_static_shapes,
         )
+        train_loader.configure_runtime_prefetch(cuda_graph_capture_mode=cuda_graph_capture_mode)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -16986,10 +17053,6 @@ def main() -> None:
         graph_runner_invalid = (
             cuda_graph_runner is None
             or bool(cuda_graph_runner.get("captures_full_step", False)) != bool(captures_full_step)
-            or (
-                captures_full_step
-                and bool(cuda_graph_runner.get("ema_active", False)) != bool(ema_active)
-            )
             or int(cuda_graph_runner.get("num_microbatches", 0)) != len(step_batches)
         )
         if graph_step_active:
@@ -16997,15 +17060,12 @@ def main() -> None:
                 try:
                     cuda_graph_runner = build_train_cuda_graph(
                         step_batches,
-                        ema_active=ema_active,
                         captures_full_step=captures_full_step,
                     )
                     cuda_graph_runner_fake_quant_bits = fake_quant_bits
                     cuda_graph_retry_step = step
                     used_cuda_graph = True
                     train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-                    if captures_full_step:
-                        ema_state_updated = ema_state_updated or ema_active
                 except Exception as exc:
                     cuda_graph_disable_reason = f"capture_failed:{type(exc).__name__}"
                     cuda_graph_retry_step = step + max(args.val_loss_every, 16, 1)
@@ -17028,8 +17088,6 @@ def main() -> None:
                     torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
                 used_cuda_graph = True
                 train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
-                if captures_full_step:
-                    ema_state_updated = ema_state_updated or ema_active
 
         if not used_cuda_graph:
             eager_train_context = torch.cuda.stream(graph_execution_stream) if graph_execution_stream is not None else nullcontext()
@@ -17051,6 +17109,9 @@ def main() -> None:
                 torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
         elif not captures_full_step:
             finalize_training_step_after_backward(step, ema_active=ema_active, keep_graph_grad_buffers=True)
+        elif ema_active and ema_state is not None:
+            update_ema_state(ema_state, base_model, args.ema_decay)
+            ema_state_updated = True
 
         train_loss_value = float(train_loss.item())
 
