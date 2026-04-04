@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import gc
 import glob
 import importlib.util
 import io
@@ -125,6 +126,92 @@ def _resolve_token_loader_prefetch_depth(
     if override:
         return max(int(override), 0)
     return 0
+
+
+def _maybe_trim_cuda_allocator_cache(
+    device: torch.device,
+    *,
+    free_bytes_floor: int,
+    reclaimable_bytes_floor: int,
+) -> dict[str, int] | None:
+    if device.type != "cuda":
+        return None
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+    except Exception:
+        return None
+    free_before, total_before = torch.cuda.mem_get_info(device)
+    reserved_before = torch.cuda.memory_reserved(device)
+    allocated_before = torch.cuda.memory_allocated(device)
+    reclaimable_before = max(int(reserved_before - allocated_before), 0)
+    if int(free_before) >= int(free_bytes_floor) or reclaimable_before < int(reclaimable_bytes_floor):
+        return None
+    torch.cuda.synchronize(device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    free_after, total_after = torch.cuda.mem_get_info(device)
+    reserved_after = torch.cuda.memory_reserved(device)
+    allocated_after = torch.cuda.memory_allocated(device)
+    return {
+        "free_before": int(free_before),
+        "free_after": int(free_after),
+        "total_before": int(total_before),
+        "total_after": int(total_after),
+        "reserved_before": int(reserved_before),
+        "reserved_after": int(reserved_after),
+        "allocated_before": int(allocated_before),
+        "allocated_after": int(allocated_after),
+        "reclaimable_before": int(reclaimable_before),
+        "reclaimable_after": max(int(reserved_after - allocated_after), 0),
+    }
+
+
+def _cuda_memory_snapshot(device: torch.device) -> dict[str, int] | None:
+    if device.type != "cuda":
+        return None
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    reserved_bytes = torch.cuda.memory_reserved(device)
+    allocated_bytes = torch.cuda.memory_allocated(device)
+    reclaimable_bytes = max(int(reserved_bytes - allocated_bytes), 0)
+    return {
+        "free": int(free_bytes),
+        "total": int(total_bytes),
+        "reserved": int(reserved_bytes),
+        "allocated": int(allocated_bytes),
+        "reclaimable": int(reclaimable_bytes),
+    }
+
+
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "out of memory" in message or "cudaerrormemoryallocation" in message
+
+
+def _release_cuda_graph_runner(
+    runner: dict[str, object] | None,
+    *,
+    device: torch.device,
+) -> None:
+    if runner is None:
+        return
+    graph_runtime = runner.get("graph_runtime")
+    if isinstance(graph_runtime, StructuredScanGraphRuntime):
+        graph_runtime.static_buffers.clear()
+    static_batches = runner.get("static_batches")
+    if isinstance(static_batches, list):
+        static_batches.clear()
+    runner.clear()
+    if device.type != "cuda":
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        return
+    torch.cuda.synchronize(device)
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _start_state_space_runtime_profile(device: torch.device) -> dict[str, object] | None:
@@ -16104,21 +16191,42 @@ def main() -> None:
         )
     if enable_model_compile:
         pass
+    attention_blocks_present = any(not isinstance(block, StateSpaceBlock) for block in base_model.blocks) or bool(
+        len(base_model.shared_blocks) > 0
+    )
+    fa3_attention_blocks_present = any(
+        getattr(getattr(block, "attn", None), "use_flash_attn_3", False)
+        for block in list(base_model.blocks) + list(base_model.shared_blocks)
+    )
+    cuda_graph_model_supported = not attention_blocks_present
     allow_ddp_full_step_cuda_graphs = _env_enabled(
         "ALLOW_DDP_FULL_STEP_CUDA_GRAPHS",
         default=_competition_mode_enabled(),
     )
+    if not cuda_graph_model_supported and args.use_cuda_graphs:
+        graph_reason = "fa3_attention_blocks_present" if fa3_attention_blocks_present else "attention_blocks_present"
+        log0(
+            "cuda_graph_notice:"
+            f" disabled_for_model_topology:{graph_reason}"
+            " full_step_graphs_are_reserved_for_all_ssm_runs",
+        )
     use_muon_for_state_space_matrices = bool(
         args.use_muon and _env_enabled("USE_MUON_FOR_STATE_SPACE_MATRICES", default=_competition_mode_enabled())
     )
-    ddp_static_graph = bool(distributed and allow_ddp_full_step_cuda_graphs)
+    ddp_static_graph = bool(distributed and allow_ddp_full_step_cuda_graphs and cuda_graph_model_supported)
     graph_execution_stream: torch.cuda.Stream | None = (
         torch.cuda.Stream(device=device)
-        if distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs
+        if distributed and allow_ddp_full_step_cuda_graphs and cuda_graph_model_supported and args.use_cuda_graphs
         else None
     )
     compile_options: dict[str, object] | None = None
-    if enable_model_compile and distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs:
+    if (
+        enable_model_compile
+        and distributed
+        and allow_ddp_full_step_cuda_graphs
+        and cuda_graph_model_supported
+        and args.use_cuda_graphs
+    ):
         # Inductor's pad_mm benchmark launches real GPU work during compile. That
         # is incompatible with the first-call-inside-capture pattern used by the
         # DDP full-step graph experiment.
@@ -16208,7 +16316,9 @@ def main() -> None:
     optimizer_state_space_matrix: torch.optim.Optimizer | None = None
     optimizer_state_space_scalar: torch.optim.Optimizer | None = None
     optimizer_other_matrix: torch.optim.Optimizer | None = None
-    optimizer_capturable = bool(args.use_cuda_graphs and (not distributed or allow_ddp_full_step_cuda_graphs))
+    optimizer_capturable = bool(
+        args.use_cuda_graphs and cuda_graph_model_supported and (not distributed or allow_ddp_full_step_cuda_graphs)
+    )
     optimizer_tok = torch.optim.Adam(
         [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
@@ -16221,6 +16331,7 @@ def main() -> None:
     muon_optimizers: list[torch.optim.Optimizer] = []
     muon_graph_capture_enabled = bool(
         args.use_cuda_graphs
+        and cuda_graph_model_supported
         and (not distributed or allow_ddp_full_step_cuda_graphs)
         and args.muon_cuda_graph_mode != "off"
     )
@@ -16428,11 +16539,11 @@ def main() -> None:
         muon_graph_capture_ready = False
     muon_graph_capture_forced_off = bool(muon_optimizers) and args.muon_cuda_graph_mode == "off"
     muon_graph_capture_forced_on = bool(muon_optimizers) and args.muon_cuda_graph_mode == "on"
-    graph_full_step_supported = (not distributed or allow_ddp_full_step_cuda_graphs) and (
+    graph_full_step_supported = cuda_graph_model_supported and (not distributed or allow_ddp_full_step_cuda_graphs) and (
         not muon_optimizers or (muon_graph_capture_ready and not muon_graph_capture_forced_off)
     )
     graph_step_optimizers = list(optimizers) if graph_full_step_supported else [opt for opt in optimizers if not isinstance(opt, Muon)]
-    partial_cuda_graph_supported = bool(args.use_cuda_graphs)
+    partial_cuda_graph_supported = bool(args.use_cuda_graphs and cuda_graph_model_supported)
 
     def _prepare_graphable_optimizers() -> None:
         if not graph_full_step_supported:
@@ -16478,7 +16589,13 @@ def main() -> None:
             "unset ALLOW_DDP_PARTIAL_CUDA_GRAPHS and use the full-step path"
         )
     effective_cuda_graph_warmup_steps = max(int(args.cuda_graph_warmup_steps), 0)
-    if distributed and allow_ddp_full_step_cuda_graphs and args.use_cuda_graphs and enable_model_compile:
+    if (
+        distributed
+        and allow_ddp_full_step_cuda_graphs
+        and cuda_graph_model_supported
+        and args.use_cuda_graphs
+        and enable_model_compile
+    ):
         if effective_cuda_graph_warmup_steps == 0:
             effective_cuda_graph_warmup_steps = 1
             log0(
@@ -16490,6 +16607,13 @@ def main() -> None:
     if not args.use_cuda_graphs:
         cuda_graph_capture_mode = "disabled"
         cuda_graph_disable_reason = "disabled"
+    elif not cuda_graph_model_supported:
+        cuda_graph_capture_mode = "disabled"
+        cuda_graph_disable_reason = (
+            "disabled:fa3_attention_blocks_present"
+            if fa3_attention_blocks_present
+            else "disabled:attention_blocks_present"
+        )
     elif graph_full_step_supported:
         cuda_graph_capture_mode = "full_step"
         cuda_graph_disable_reason = "eligible_full_step"
@@ -16521,6 +16645,7 @@ def main() -> None:
         competition_mode
         and distributed
         and args.use_cuda_graphs
+        and cuda_graph_model_supported
         and args.enable_torch_compile
         and args.use_muon
         and cuda_graph_capture_mode != "full_step"
@@ -16552,6 +16677,28 @@ def main() -> None:
             " to_preserve_graph_pool_headroom",
             console=False,
         )
+    cuda_allocator_trim_free_mb = max(int(os.environ.get("CUDA_ALLOCATOR_TRIM_FREE_MB", "2048")), 0)
+    cuda_allocator_trim_cache_mb = max(int(os.environ.get("CUDA_ALLOCATOR_TRIM_CACHE_MB", "1024")), 0)
+    cuda_allocator_trim_free_bytes = cuda_allocator_trim_free_mb * 1024 * 1024
+    cuda_allocator_trim_cache_bytes = cuda_allocator_trim_cache_mb * 1024 * 1024
+    enable_cuda_allocator_trim = bool(
+        device.type == "cuda"
+        and cuda_graph_capture_mode == "full_step"
+        and args.use_flash_attn_3
+        and (cuda_allocator_trim_free_bytes > 0 or cuda_allocator_trim_cache_bytes > 0)
+    )
+    cuda_graph_min_free_mb_default = 4096 if args.use_flash_attn_3 and attention_blocks_present else 0
+    cuda_graph_min_free_mb = max(int(os.environ.get("CUDA_GRAPH_MIN_FREE_MB", str(cuda_graph_min_free_mb_default))), 0)
+    cuda_graph_min_free_bytes = cuda_graph_min_free_mb * 1024 * 1024
+    cuda_graph_headroom_check_every = max(int(os.environ.get("CUDA_GRAPH_HEADROOM_CHECK_EVERY", "16")), 1)
+    enable_cuda_graph_headroom_guard = bool(
+        device.type == "cuda"
+        and cuda_graph_capture_mode == "full_step"
+        and cuda_graph_min_free_bytes > 0
+        and args.use_flash_attn_3
+        and attention_blocks_present
+    )
+    last_cuda_allocator_trim_step = -1
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     finalization_reserve_ms = max(float(args.wallclock_finalization_reserve_ms), 0.0)
@@ -16844,6 +16991,22 @@ def main() -> None:
             debug_static_shapes=args.debug_static_shapes,
         )
         train_loader.configure_runtime_prefetch(cuda_graph_capture_mode=cuda_graph_capture_mode)
+    if enable_cuda_allocator_trim:
+        trim_info = _maybe_trim_cuda_allocator_cache(
+            device,
+            free_bytes_floor=cuda_allocator_trim_free_bytes,
+            reclaimable_bytes_floor=cuda_allocator_trim_cache_bytes,
+        )
+        if trim_info is not None:
+            log0(
+                "cuda_allocator_trim:"
+                f" phase:post_warmup"
+                f" free_before_mb:{trim_info['free_before'] / (1024 * 1024):.0f}"
+                f" free_after_mb:{trim_info['free_after'] / (1024 * 1024):.0f}"
+                f" reclaimable_before_mb:{trim_info['reclaimable_before'] / (1024 * 1024):.0f}"
+                f" reclaimable_after_mb:{trim_info['reclaimable_after'] / (1024 * 1024):.0f}",
+                console=False,
+            )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -16863,6 +17026,7 @@ def main() -> None:
     cuda_graph_runner: dict[str, object] | None = None
     cuda_graph_runner_fake_quant_bits: int | None = None
     cuda_graph_retry_step = effective_cuda_graph_warmup_steps
+    last_cuda_memory_snapshot_step = -1
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     optimizer_step_time_ms_total = 0.0
@@ -16875,6 +17039,53 @@ def main() -> None:
     sanitized_grad_events_total = 0
     sanitized_grad_values_total = 0
     last_validation_time_ms = 0.0
+
+    def _disable_cuda_graph_training_path(
+        *,
+        reason: str,
+        step: int,
+        snapshot: dict[str, int] | None = None,
+    ) -> None:
+        nonlocal cuda_graph_runner
+        nonlocal cuda_graph_runner_fake_quant_bits
+        nonlocal cuda_graph_eligible
+        nonlocal cuda_graph_capture_mode
+        nonlocal cuda_graph_disable_reason
+        _release_cuda_graph_runner(cuda_graph_runner, device=device)
+        cuda_graph_runner = None
+        cuda_graph_runner_fake_quant_bits = None
+        cuda_graph_eligible = False
+        cuda_graph_capture_mode = "disabled"
+        cuda_graph_disable_reason = reason
+        if snapshot is None:
+            snapshot = _cuda_memory_snapshot(device)
+        if snapshot is not None:
+            log0(
+                "cuda_graph_guard:"
+                f" step:{step}"
+                f" reason:{reason}"
+                f" free_mb:{snapshot['free'] / (1024 * 1024):.0f}"
+                f" allocated_mb:{snapshot['allocated'] / (1024 * 1024):.0f}"
+                f" reserved_mb:{snapshot['reserved'] / (1024 * 1024):.0f}"
+                f" reclaimable_mb:{snapshot['reclaimable'] / (1024 * 1024):.0f}"
+                " action:disable_full_step_graph",
+            )
+        else:
+            log0(f"cuda_graph_guard: step:{step} reason:{reason} action:disable_full_step_graph")
+
+    def _maybe_disable_cuda_graph_for_low_headroom(*, step: int) -> None:
+        if not enable_cuda_graph_headroom_guard or cuda_graph_runner is None:
+            return
+        snapshot = _cuda_memory_snapshot(device)
+        if snapshot is None:
+            return
+        if snapshot["free"] >= cuda_graph_min_free_bytes:
+            return
+        _disable_cuda_graph_training_path(
+            reason=f"disabled:low_headroom_below_{cuda_graph_min_free_mb}mb",
+            step=step,
+            snapshot=snapshot,
+        )
 
     def finalize_training_step_after_backward(step: int, *, ema_active: bool, keep_graph_grad_buffers: bool) -> None:
         nonlocal optimizer_step_time_ms_total
@@ -17030,12 +17241,8 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         fake_quant_bits = args.fake_quant_bits if fake_quant_active(args, step, elapsed_ms, scale) else 0
         base_model.set_fake_quant(fake_quant_bits)
-        graph_step_active = (
-            cuda_graph_eligible
-            and step >= effective_cuda_graph_warmup_steps
-            and step >= cuda_graph_retry_step
-        )
         if cuda_graph_runner is not None and cuda_graph_runner_fake_quant_bits != fake_quant_bits:
+            _release_cuda_graph_runner(cuda_graph_runner, device=device)
             cuda_graph_runner = None
             cuda_graph_runner_fake_quant_bits = None
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -17045,7 +17252,31 @@ def main() -> None:
                 _set_group_scalar(group, "momentum", muon_momentum)
         apply_optimizer_schedule(step, scale)
 
-        step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
+        should_check_graph_headroom = (
+            enable_cuda_graph_headroom_guard
+            and cuda_graph_runner is not None
+            and (step <= 8 or step % cuda_graph_headroom_check_every == 0)
+        )
+        if should_check_graph_headroom:
+            _maybe_disable_cuda_graph_for_low_headroom(step=step)
+
+        step_batches: list[tuple[Tensor, Tensor, Tensor | None]]
+        try:
+            step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
+        except RuntimeError as exc:
+            if _is_cuda_oom_error(exc) and cuda_graph_runner is not None and cuda_graph_capture_mode == "full_step":
+                _disable_cuda_graph_training_path(
+                    reason="disabled:oom_during_batch_fetch",
+                    step=step,
+                )
+                step_batches = [next_train_microbatch() for _ in range(grad_accum_steps)]
+            else:
+                raise
+        graph_step_active = (
+            cuda_graph_eligible
+            and step >= effective_cuda_graph_warmup_steps
+            and step >= cuda_graph_retry_step
+        )
         used_cuda_graph = False
         train_loss = torch.zeros((), device=device)
         ema_active = ema_state is not None and step + 1 >= args.ema_start_step
@@ -17058,6 +17289,10 @@ def main() -> None:
         if graph_step_active:
             if graph_runner_invalid:
                 try:
+                    if cuda_graph_runner is not None:
+                        _release_cuda_graph_runner(cuda_graph_runner, device=device)
+                        cuda_graph_runner = None
+                        cuda_graph_runner_fake_quant_bits = None
                     cuda_graph_runner = build_train_cuda_graph(
                         step_batches,
                         captures_full_step=captures_full_step,
@@ -17065,10 +17300,30 @@ def main() -> None:
                     cuda_graph_runner_fake_quant_bits = fake_quant_bits
                     cuda_graph_retry_step = step
                     used_cuda_graph = True
-                    train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
+                    train_loss = cuda_graph_runner["static_loss"].clone()  # type: ignore[assignment]
+                    if enable_cuda_allocator_trim:
+                        trim_info = _maybe_trim_cuda_allocator_cache(
+                            device,
+                            free_bytes_floor=cuda_allocator_trim_free_bytes,
+                            reclaimable_bytes_floor=cuda_allocator_trim_cache_bytes,
+                        )
+                        if trim_info is not None:
+                            log0(
+                                "cuda_allocator_trim:"
+                                f" phase:post_capture"
+                                f" step:{step}"
+                                f" free_before_mb:{trim_info['free_before'] / (1024 * 1024):.0f}"
+                                f" free_after_mb:{trim_info['free_after'] / (1024 * 1024):.0f}"
+                                f" reclaimable_before_mb:{trim_info['reclaimable_before'] / (1024 * 1024):.0f}"
+                                f" reclaimable_after_mb:{trim_info['reclaimable_after'] / (1024 * 1024):.0f}",
+                                console=False,
+                            )
+                            last_cuda_allocator_trim_step = step
+                    _maybe_disable_cuda_graph_for_low_headroom(step=step)
                 except Exception as exc:
                     cuda_graph_disable_reason = f"capture_failed:{type(exc).__name__}"
                     cuda_graph_retry_step = step + max(args.val_loss_every, 16, 1)
+                    _release_cuda_graph_runner(cuda_graph_runner, device=device)
                     cuda_graph_runner = None
                     cuda_graph_runner_fake_quant_bits = None
                     zero_grad_all()
@@ -17087,7 +17342,9 @@ def main() -> None:
                 if graph_execution_stream is not None:
                     torch.cuda.current_stream(device=device).wait_stream(graph_execution_stream)
                 used_cuda_graph = True
-                train_loss = cuda_graph_runner["static_loss"]  # type: ignore[assignment]
+                train_loss = cuda_graph_runner["static_loss"].clone()  # type: ignore[assignment]
+                if should_check_graph_headroom:
+                    _maybe_disable_cuda_graph_for_low_headroom(step=step)
 
         if not used_cuda_graph:
             eager_train_context = torch.cuda.stream(graph_execution_stream) if graph_execution_stream is not None else nullcontext()
@@ -17113,7 +17370,31 @@ def main() -> None:
             update_ema_state(ema_state, base_model, args.ema_decay)
             ema_state_updated = True
 
+        step_batches.clear()
         train_loss_value = float(train_loss.item())
+        if enable_cuda_allocator_trim:
+            should_check_allocator = (
+                step <= 8
+                or step % max(args.train_log_every, 25, 1) == 0
+            )
+            if should_check_allocator and step != last_cuda_allocator_trim_step:
+                trim_info = _maybe_trim_cuda_allocator_cache(
+                    device,
+                    free_bytes_floor=cuda_allocator_trim_free_bytes,
+                    reclaimable_bytes_floor=cuda_allocator_trim_cache_bytes,
+                )
+                if trim_info is not None:
+                    log0(
+                        "cuda_allocator_trim:"
+                        f" phase:steady_state"
+                        f" step:{step}"
+                        f" free_before_mb:{trim_info['free_before'] / (1024 * 1024):.0f}"
+                        f" free_after_mb:{trim_info['free_after'] / (1024 * 1024):.0f}"
+                        f" reclaimable_before_mb:{trim_info['reclaimable_before'] / (1024 * 1024):.0f}"
+                        f" reclaimable_after_mb:{trim_info['reclaimable_after'] / (1024 * 1024):.0f}",
+                        console=False,
+                    )
+                    last_cuda_allocator_trim_step = step
 
         step += 1
         approx_wallclock_ms = end_to_end_wallclock_ms()
@@ -17121,6 +17402,19 @@ def main() -> None:
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        if device.type == "cuda" and should_log_train and step != last_cuda_memory_snapshot_step:
+            memory_snapshot = _cuda_memory_snapshot(device)
+            if memory_snapshot is not None:
+                log0(
+                    "cuda_mem:"
+                    f" step:{step}"
+                    f" free_mb:{memory_snapshot['free'] / (1024 * 1024):.0f}"
+                    f" allocated_mb:{memory_snapshot['allocated'] / (1024 * 1024):.0f}"
+                    f" reserved_mb:{memory_snapshot['reserved'] / (1024 * 1024):.0f}"
+                    f" reclaimable_mb:{memory_snapshot['reclaimable'] / (1024 * 1024):.0f}",
+                    console=False,
+                )
+                last_cuda_memory_snapshot_step = step
         if should_log_train:
             muon_log_suffix = ""
             if sanitized_grad_events_total > 0:
