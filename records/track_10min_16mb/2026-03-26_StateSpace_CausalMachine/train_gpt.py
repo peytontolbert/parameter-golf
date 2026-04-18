@@ -86,6 +86,10 @@ USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN = bool(int(os.environ.get("USE_CAUSAL_MACHIN
 ALLOW_CAUSAL_MACHINE_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_CUDA_TRAINING", "1")))
 ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_LATENT_CUDA_TRAINING", "1")))
 USE_MUON_CUDA = bool(int(os.environ.get("USE_MUON_CUDA", "1")))
+USE_CAUSAL_MACHINE_BLOCK_OPS_CUDA = bool(int(os.environ.get("USE_CAUSAL_MACHINE_BLOCK_OPS_CUDA", "1")))
+ALLOW_CAUSAL_MACHINE_BLOCK_OPS_TRAINING = bool(int(os.environ.get("ALLOW_CAUSAL_MACHINE_BLOCK_OPS_TRAINING", "1")))
+USE_CAUSAL_MACHINE_CUBLASLT_LINEAR = bool(int(os.environ.get("USE_CAUSAL_MACHINE_CUBLASLT_LINEAR", "0")))
+USE_CAUSAL_MACHINE_PACKED_QKV = bool(int(os.environ.get("USE_CAUSAL_MACHINE_PACKED_QKV", "0")))
 PROFILE_MUON_STEP = bool(int(os.environ.get("PROFILE_MUON_STEP", "0")))
 PROFILE_STATE_SPACE_BLOCKS = bool(int(os.environ.get("PROFILE_STATE_SPACE_BLOCKS", "0")))
 MUON_CUDA_BUCKET_POLICY = os.environ.get("MUON_CUDA_BUCKET_POLICY", "auto").strip().lower()
@@ -107,6 +111,8 @@ _CAUSAL_MACHINE_LATENT_SCAN_CUDA = None
 _CAUSAL_MACHINE_LATENT_SCAN_CUDA_ERROR: Exception | None = None
 _MUON_CUDA = None
 _MUON_CUDA_ERROR: Exception | None = None
+_CAUSAL_MACHINE_BLOCK_OPS_CUDA = None
+_CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR: Exception | None = None
 _MUON_CUDA_WARNED_FAILURE_KEYS: set[str] = set()
 
 
@@ -594,6 +600,22 @@ def _load_muon_cuda_extension(source_dir: Path, build_dir: Path):
     )
 
 
+def _load_causal_machine_block_ops_cuda_extension(source_dir: Path, build_dir: Path):
+    extra_cuda_cflags = ["-O3", "--use_fast_math", "-std=c++17", *_causal_machine_cuda_arch_flags()]
+    return load_cpp_extension(
+        name="causal_machine_block_ops_cuda_ext",
+        sources=[
+            str(source_dir / "block_ops.cpp"),
+            str(source_dir / "block_ops_kernel.cu"),
+        ],
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=["-lcublasLt"],
+        build_directory=str(build_dir),
+        verbose=False,
+    )
+
+
 def load_causal_machine_scan_cuda():
     global _CAUSAL_MACHINE_SCAN_CUDA
     global _CAUSAL_MACHINE_SCAN_CUDA_ERROR
@@ -841,6 +863,85 @@ def load_muon_cuda():
 
     _MUON_CUDA_ERROR = last_exc
     raise RuntimeError("muon_cuda is unavailable after retries") from last_exc
+
+
+def load_causal_machine_block_ops_cuda():
+    global _CAUSAL_MACHINE_BLOCK_OPS_CUDA
+    global _CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR
+    if _CAUSAL_MACHINE_BLOCK_OPS_CUDA is not None:
+        return _CAUSAL_MACHINE_BLOCK_OPS_CUDA
+    if _CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR is not None:
+        raise RuntimeError("causal_machine_block_ops_cuda is unavailable") from _CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR
+    source_dir = Path(__file__).resolve().parent / "cuda_ext"
+    build_dirs = _extension_candidate_build_dirs(source_dir, "build/causal_machine_block_ops_cuda")
+    build_dir = build_dirs[0]
+    build_dir.mkdir(parents=True, exist_ok=True)
+    existing = _load_prebuilt_cuda_extension_or_none(
+        "causal_machine_block_ops_cuda_ext",
+        "causal_machine_block_ops_cuda",
+        build_dirs,
+        (
+            source_dir / "block_ops.cpp",
+            source_dir / "block_ops_kernel.cu",
+        ),
+    )
+    if existing is not None:
+        _CAUSAL_MACHINE_BLOCK_OPS_CUDA = existing
+        return _CAUSAL_MACHINE_BLOCK_OPS_CUDA
+    last_exc: Exception | None = None
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    attempts = 4 if distributed else 2
+    if not distributed:
+        try:
+            _CAUSAL_MACHINE_BLOCK_OPS_CUDA = _load_causal_machine_block_ops_cuda_extension(source_dir, build_dir)
+            return _CAUSAL_MACHINE_BLOCK_OPS_CUDA
+        except Exception as exc:
+            _CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR = exc
+            raise RuntimeError("causal_machine_block_ops_cuda is unavailable") from exc
+
+    sync_device = torch.device("cuda", torch.cuda.current_device())
+    for attempt in range(attempts):
+        local_exc: Exception | None = None
+        leader_success = torch.zeros(1, device=sync_device, dtype=torch.int32)
+        try:
+            if rank == 0:
+                if _CAUSAL_MACHINE_BLOCK_OPS_CUDA is None:
+                    _CAUSAL_MACHINE_BLOCK_OPS_CUDA = _load_causal_machine_block_ops_cuda_extension(source_dir, build_dir)
+                leader_success.fill_(1)
+        except Exception as exc:
+            local_exc = exc
+            if rank == 0:
+                _CAUSAL_MACHINE_BLOCK_OPS_CUDA = None
+            leader_success.zero_()
+
+        dist.broadcast(leader_success, src=0)
+
+        if int(leader_success.item()) == 1:
+            try:
+                if rank != 0 and _CAUSAL_MACHINE_BLOCK_OPS_CUDA is None:
+                    _CAUSAL_MACHINE_BLOCK_OPS_CUDA = _load_causal_machine_block_ops_cuda_extension(source_dir, build_dir)
+            except Exception as exc:
+                local_exc = exc
+                _CAUSAL_MACHINE_BLOCK_OPS_CUDA = None
+
+            load_ok = torch.tensor([0 if local_exc is not None else 1], device=sync_device, dtype=torch.int32)
+            dist.all_reduce(load_ok, op=dist.ReduceOp.MIN)
+            if int(load_ok.item()) == 1:
+                return _CAUSAL_MACHINE_BLOCK_OPS_CUDA
+
+        if local_exc is None:
+            local_exc = RuntimeError(
+                f"causal_machine_block_ops_cuda leader build failed on rank 0 during attempt {attempt + 1}/{attempts}"
+            )
+        last_exc = local_exc
+        _CAUSAL_MACHINE_BLOCK_OPS_CUDA = None
+        if attempt + 1 < attempts:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+
+    _CAUSAL_MACHINE_BLOCK_OPS_CUDA_ERROR = last_exc
+    raise RuntimeError("causal_machine_block_ops_cuda is unavailable after retries") from last_exc
 
 
 class _CausalMachineScanCudaFn(torch.autograd.Function):
@@ -6932,6 +7033,8 @@ def _get_precomputed_structured_scan_kernel_config(
 def _preload_compiled_runtime_extensions(args: Any) -> None:
     if not bool(getattr(args, "enable_torch_compile", False)):
         return
+    if USE_CAUSAL_MACHINE_BLOCK_OPS_CUDA:
+        load_causal_machine_block_ops_cuda()
     if USE_CAUSAL_MACHINE_CUDA_SCAN:
         load_causal_machine_scan_cuda()
     if USE_CAUSAL_MACHINE_LATENT_CUDA_SCAN and int(getattr(args, "causal_machine_latent_rank", 0)) > 0:
@@ -6946,14 +7049,16 @@ def _prime_compiled_structured_scan_kernel_configs(
     train_seq_len: int,
     eval_seq_len: int,
     device: torch.device,
+    include_eval_seq: bool = True,
 ) -> None:
     if device.type != "cuda":
         return
-    seq_specs = (
+    seq_specs = [
         (max(int(train_seq_len), 1), True),
         (1, False),
-        (max(int(eval_seq_len), 1), False),
-    )
+    ]
+    if include_eval_seq:
+        seq_specs.append((max(int(eval_seq_len), 1), False))
     for module in model.modules():
         if all(hasattr(module, name) for name in ("num_states", "transition_rank", "filter_chunk_size")):
             num_states = int(getattr(module, "num_states"))
@@ -7672,7 +7777,7 @@ class Hyperparameters:
     runtime_policy = os.environ.get("RUNTIME_POLICY", "compiled").strip().lower()
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     wallclock_finalization_reserve_ms = float(
-        os.environ.get("WALLCLOCK_FINALIZATION_RESERVE_MS", "30000" if competition_mode else "0")
+        os.environ.get("WALLCLOCK_FINALIZATION_RESERVE_MS", "0")
     )
     wallclock_validation_reserve_ms = float(
         os.environ.get("WALLCLOCK_VALIDATION_RESERVE_MS", "120000" if competition_mode else "0")
@@ -7790,12 +7895,12 @@ class Hyperparameters:
     orthogonal_init = bool(int(os.environ.get("ORTHOGONAL_INIT", "1")))
     mup_proj_init = bool(int(os.environ.get("MUP_PROJ_INIT", "1")))
     export_quant_bits = int(os.environ.get("EXPORT_QUANT_BITS", "5"))
-    export_codec = os.environ.get("EXPORT_CODEC", "zstd").strip().lower()
+    export_codec = os.environ.get("EXPORT_CODEC", "auto" if competition_mode else "zstd").strip().lower()
     export_zstd_level = int(os.environ.get("EXPORT_ZSTD_LEVEL", "22"))
     export_high_precision_bits = int(os.environ.get("EXPORT_HIGH_PRECISION_BITS", "8"))
     save_raw_debug_model = bool(int(os.environ.get("SAVE_RAW_DEBUG_MODEL", "0" if competition_mode else "1")))
-    run_final_quant_eval = bool(int(os.environ.get("RUN_FINAL_QUANT_EVAL", "0" if competition_mode else "1")))
-    verify_export_roundtrip = bool(int(os.environ.get("VERIFY_EXPORT_ROUNDTRIP", "0" if competition_mode else "1")))
+    run_final_quant_eval = bool(int(os.environ.get("RUN_FINAL_QUANT_EVAL", "1")))
+    verify_export_roundtrip = bool(int(os.environ.get("VERIFY_EXPORT_ROUNDTRIP", "1")))
     export_high_precision_budget_bytes = int(os.environ.get("EXPORT_HIGH_PRECISION_BUDGET_BYTES", "300000"))
     export_high_precision_max_tensors = int(os.environ.get("EXPORT_HIGH_PRECISION_MAX_TENSORS", "4"))
     export_high_precision_min_numel = int(os.environ.get("EXPORT_HIGH_PRECISION_MIN_NUMEL", "65536"))
@@ -8530,33 +8635,24 @@ def _largest_grad_abs_info(module: nn.Module) -> tuple[str, str, float] | None:
 
 
 def _stable_clip_grad_norm_noncapturable_(module: nn.Module, max_norm: float) -> Tensor:
-    total_norm_sq: Tensor | None = None
-    grad_tensors: list[Tensor] = []
-    grad_devices: list[tuple[torch.device, torch.dtype]] = []
-    fallback_device: torch.device | None = None
-    for param in module.parameters():
-        grad = param.grad
-        if grad is None:
-            continue
-        grad_detached = grad.detach()
-        fallback_device = grad_detached.device
-        if not torch.isfinite(grad_detached).all():
-            return torch.full((), float("nan"), device=grad_detached.device, dtype=torch.float32)
-        local_norm = torch.linalg.vector_norm(grad_detached, ord=2, dtype=torch.float64)
-        local_norm_sq = local_norm * local_norm
-        total_norm_sq = local_norm_sq if total_norm_sq is None else total_norm_sq + local_norm_sq
-        grad_tensors.append(grad)
-        grad_devices.append((grad.device, grad.dtype))
-    if total_norm_sq is None:
-        return torch.zeros((), device=fallback_device or torch.device("cpu"), dtype=torch.float32)
-    total_norm = total_norm_sq.sqrt()
-    if torch.isfinite(total_norm):
-        clip_scale = torch.clamp(
-            torch.as_tensor(max_norm, device=total_norm.device, dtype=torch.float64) / (total_norm + 1e-6),
-            max=1.0,
+    params = [param for param in module.parameters() if param.grad is not None]
+    if not params:
+        return torch.zeros((), device=torch.device("cpu"), dtype=torch.float32)
+    try:
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm,
+            norm_type=2.0,
+            error_if_nonfinite=False,
+            foreach=True,
         )
-        for grad, (device, dtype) in zip(grad_tensors, grad_devices, strict=True):
-            grad.mul_(clip_scale.to(device=device, dtype=dtype))
+    except Exception:
+        total_norm = torch.nn.utils.clip_grad_norm_(
+            params,
+            max_norm,
+            norm_type=2.0,
+            error_if_nonfinite=False,
+        )
     return total_norm.to(dtype=torch.float32)
 
 
@@ -10507,6 +10603,8 @@ def select_default_export_candidate(
 
 def compress_blob(payload: bytes, codec: str, zstd_level: int) -> tuple[bytes, str]:
     normalized = codec.strip().lower()
+    if normalized in {"", "auto"}:
+        return zlib.compress(payload, level=6), "zlib"
     if normalized == "zstd" and HAS_ZSTD:
         return zstandard.ZstdCompressor(level=zstd_level).compress(payload), "zstd"
     return zlib.compress(payload, level=9), "zlib"
@@ -11726,13 +11824,19 @@ class CastedLinear(nn.Linear):
         super().__init__(*args, **kwargs)
         self.fake_quant_bits = 0
 
-    def forward(self, x: Tensor) -> Tensor:
+    def effective_weight_bias(self) -> tuple[Tensor, Tensor | None]:
         weight = self.weight
         if self.fake_quant_bits > 0:
             weight = fake_quantize_tensor(weight, self.fake_quant_bits)
         bias = self.bias
+        return weight, bias
+
+    def forward(self, x: Tensor) -> Tensor:
+        weight, bias = self.effective_weight_bias()
         # Let autocast handle compute dtype promotion so we do not allocate a fresh
         # casted weight tensor on every forward and fragment CUDA memory over time.
+        if bool(USE_CAUSAL_MACHINE_CUBLASLT_LINEAR) and x.is_cuda:
+            return _cublaslt_linear_cuda(x, weight, bias)
         if torch.is_autocast_enabled():
             return F.linear(x, weight, bias)
         if weight.dtype != x.dtype:
@@ -11830,6 +11934,462 @@ def _normalized_resid_mix(mix_param: Tensor, *, dtype: torch.dtype) -> Tensor:
     fallback[0].fill_(1.0)
     mix = torch.where(denom > 1.0e-6, mix / denom.clamp_min(1.0e-6), fallback)
     return mix.to(dtype=dtype)
+
+
+def _block_ops_cuda_enabled() -> bool:
+    return bool(USE_CAUSAL_MACHINE_BLOCK_OPS_CUDA) and _allow_cuda_training_kernels(ALLOW_CAUSAL_MACHINE_BLOCK_OPS_TRAINING)
+
+
+def _block_ops_cuda_module_or_none():
+    if not _block_ops_cuda_enabled():
+        return None
+    try:
+        return load_causal_machine_block_ops_cuda()
+    except Exception:
+        return None
+
+
+def _reference_branch_prep(
+    x: Tensor,
+    x0: Tensor,
+    mix_param: Tensor,
+    *,
+    eps: float,
+    norm_scale: float,
+) -> tuple[Tensor, Tensor]:
+    mix = _normalized_resid_mix(mix_param, dtype=x.dtype)
+    mixed = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
+    normed = F.rms_norm(mixed, (mixed.size(-1),), eps=eps) * float(norm_scale)
+    return mixed, normed
+
+
+def _reference_branch_update(
+    x: Tensor,
+    update: Tensor,
+    scale_param: Tensor,
+    *,
+    residual_alpha: float,
+) -> Tensor:
+    scale = _bounded_signed_control_tensor(scale_param, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)
+    return _sanitize_residual_stream_tensor(x * float(residual_alpha) + scale[None, None, :] * update)
+
+
+def _reference_partial_rotary_pair(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    scale: Tensor | None,
+    *,
+    rope_dims: int,
+    inverse_scale_k: bool,
+) -> tuple[Tensor, Tensor]:
+    q_out = apply_partial_rotary_emb(q, cos, sin, rope_dims, scale=scale, inverse_scale=False)
+    k_out = apply_partial_rotary_emb(k, cos, sin, rope_dims, scale=scale, inverse_scale=inverse_scale_k)
+    return q_out, k_out
+
+
+class _CausalMachineBranchPrepFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, x0: Tensor, mix_param: Tensor, eps: float, norm_scale: float) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_block_ops_cuda()
+        mix = _normalized_resid_mix(mix_param, dtype=x.dtype).contiguous()
+        mixed, normed = ext.branch_prep(
+            x.contiguous(),
+            x0.contiguous(),
+            mix,
+            float(eps),
+            float(_RESIDUAL_STREAM_CLAMP_ABS),
+            float(norm_scale),
+        )
+        ctx.save_for_backward(x, x0, mix_param, mix)
+        ctx.eps = float(eps)
+        ctx.norm_scale = float(norm_scale)
+        return mixed, normed
+
+    @staticmethod
+    def backward(ctx, grad_mixed: Tensor, grad_normed: Tensor):
+        x, x0, mix_param, mix = ctx.saved_tensors
+        ext = load_causal_machine_block_ops_cuda()
+        grad_x, grad_x0, grad_mix_weights = ext.branch_prep_backward(
+            grad_mixed.contiguous(),
+            grad_normed.contiguous(),
+            x.contiguous(),
+            x0.contiguous(),
+            mix.contiguous(),
+            float(ctx.eps),
+            float(_RESIDUAL_STREAM_CLAMP_ABS),
+            float(ctx.norm_scale),
+        )
+        grad_x_out = grad_x if ctx.needs_input_grad[0] else None
+        grad_x0_out = grad_x0 if ctx.needs_input_grad[1] else None
+        grad_mix_param_out = None
+        if ctx.needs_input_grad[2]:
+            with torch.enable_grad():
+                mix_ref = mix_param.detach().requires_grad_(True)
+                normalized = _normalized_resid_mix(mix_ref, dtype=torch.float32)
+                grad_mix_param_out = torch.autograd.grad(
+                    normalized,
+                    mix_ref,
+                    grad_mix_weights.to(dtype=torch.float32),
+                    allow_unused=False,
+                )[0]
+                grad_mix_param_out = grad_mix_param_out.to(dtype=mix_param.dtype)
+        return grad_x_out, grad_x0_out, grad_mix_param_out, None, None
+
+
+class _CausalMachineBranchUpdateFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, update: Tensor, scale_param: Tensor, residual_alpha: float) -> Tensor:
+        ext = load_causal_machine_block_ops_cuda()
+        scale = _bounded_signed_control_tensor(scale_param, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype).contiguous()
+        out = ext.branch_update(
+            x.contiguous(),
+            update.contiguous(),
+            scale,
+            float(residual_alpha),
+            float(_RESIDUAL_STREAM_CLAMP_ABS),
+        )
+        ctx.save_for_backward(x, update, scale_param)
+        ctx.residual_alpha = float(residual_alpha)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x, update, scale_param = ctx.saved_tensors
+        ext = load_causal_machine_block_ops_cuda()
+        scale = _bounded_signed_control_tensor(scale_param, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype).contiguous()
+        grad_x, grad_update, grad_scale_bounded = ext.branch_update_backward(
+            grad_output.contiguous(),
+            x.contiguous(),
+            update.contiguous(),
+            scale,
+            float(ctx.residual_alpha),
+            float(_RESIDUAL_STREAM_CLAMP_ABS),
+        )
+        grad_x_out = grad_x if ctx.needs_input_grad[0] else None
+        grad_update_out = grad_update if ctx.needs_input_grad[1] else None
+        grad_scale_out = None
+        if ctx.needs_input_grad[2]:
+            clamp_abs = float(_CONTROL_SCALE_CLAMP_ABS)
+            if clamp_abs > 0.0:
+                scale_fp32 = _bounded_signed_control_tensor(scale_param, clamp_abs, dtype=torch.float32)
+                local_jacobian = (1.0 - (scale_fp32 / clamp_abs).square()).to(dtype=torch.float32)
+            else:
+                local_jacobian = torch.ones_like(scale_param, dtype=torch.float32)
+            grad_scale_out = (grad_scale_bounded.to(dtype=torch.float32) * local_jacobian).to(dtype=scale_param.dtype)
+        return grad_x_out, grad_update_out, grad_scale_out, None
+
+
+class _CausalMachinePartialRotaryPairFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        scale: Tensor | None,
+        rope_dims: int,
+        inverse_scale_k: bool,
+    ) -> tuple[Tensor, Tensor]:
+        ext = load_causal_machine_block_ops_cuda()
+        scale_tensor = scale.contiguous() if scale is not None else None
+        q_out, k_out = ext.partial_rotary_pair(
+            q.contiguous(),
+            k.contiguous(),
+            cos.contiguous(),
+            sin.contiguous(),
+            scale_tensor,
+            int(rope_dims),
+            bool(inverse_scale_k),
+        )
+        ctx.save_for_backward(
+            q,
+            k,
+            cos,
+            sin,
+            scale if scale is not None else torch.empty(0, device=q.device, dtype=q.dtype),
+        )
+        ctx.has_scale = scale is not None
+        ctx.rope_dims = int(rope_dims)
+        ctx.inverse_scale_k = bool(inverse_scale_k)
+        return q_out, k_out
+
+    @staticmethod
+    def backward(ctx, grad_q: Tensor, grad_k: Tensor):
+        q, k, cos, sin, scale = ctx.saved_tensors
+        scale_ref = scale if ctx.has_scale else None
+        if not any(ctx.needs_input_grad[2:5]):
+            ext = load_causal_machine_block_ops_cuda()
+            grad_q_in, grad_k_in = ext.partial_rotary_pair_backward(
+                grad_q.contiguous(),
+                grad_k.contiguous(),
+                cos.contiguous(),
+                sin.contiguous(),
+                scale_ref.contiguous() if scale_ref is not None else None,
+                int(ctx.rope_dims),
+                bool(ctx.inverse_scale_k),
+            )
+            return (
+                grad_q_in if ctx.needs_input_grad[0] else None,
+                grad_k_in if ctx.needs_input_grad[1] else None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        with torch.enable_grad():
+            q_ref = q.detach().requires_grad_(ctx.needs_input_grad[0])
+            k_ref = k.detach().requires_grad_(ctx.needs_input_grad[1])
+            cos_ref = cos.detach().requires_grad_(ctx.needs_input_grad[2])
+            sin_ref = sin.detach().requires_grad_(ctx.needs_input_grad[3])
+            if scale_ref is not None:
+                scale_ref = scale_ref.detach().requires_grad_(ctx.needs_input_grad[4])
+            q_out, k_out = _reference_partial_rotary_pair(
+                q_ref,
+                k_ref,
+                cos_ref,
+                sin_ref,
+                scale_ref,
+                rope_dims=ctx.rope_dims,
+                inverse_scale_k=ctx.inverse_scale_k,
+            )
+            inputs: list[Tensor] = []
+            input_ids: list[int] = []
+            refs = (q_ref, k_ref, cos_ref, sin_ref, scale_ref)
+            for idx, ref in enumerate(refs):
+                if ref is not None and ref.requires_grad:
+                    inputs.append(ref)
+                    input_ids.append(idx)
+            grads = torch.autograd.grad(
+                (q_out, k_out),
+                tuple(inputs),
+                (grad_q, grad_k),
+                allow_unused=True,
+            )
+        full_grads: list[Tensor | None] = [None, None, None, None, None]
+        for idx, grad in zip(input_ids, grads, strict=True):
+            full_grads[idx] = grad
+        return full_grads[0], full_grads[1], full_grads[2], full_grads[3], full_grads[4], None, None
+
+
+class _CausalMachineReluSquareFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor) -> Tensor:
+        ext = load_causal_machine_block_ops_cuda()
+        out = ext.relu_square(x.contiguous())
+        ctx.save_for_backward(x)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (x,) = ctx.saved_tensors
+        ext = load_causal_machine_block_ops_cuda()
+        grad_input = ext.relu_square_backward(grad_output.contiguous(), x.contiguous())
+        return grad_input
+
+
+class _CausalMachineLinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        ext = load_causal_machine_block_ops_cuda()
+        x_cast = x.contiguous()
+        weight_cast = weight.to(dtype=x.dtype).contiguous()
+        bias_cast = None if bias is None else bias.to(device=x.device, dtype=x.dtype).contiguous()
+        out = ext.linear(x_cast, weight_cast, bias_cast)
+        ctx.save_for_backward(x_cast, weight_cast)
+        ctx.has_bias = bias is not None
+        ctx.weight_dtype = weight.dtype
+        ctx.bias_dtype = None if bias is None else bias.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x, weight = ctx.saved_tensors
+        grad_out_2d = grad_output.reshape(-1, grad_output.size(-1)).float()
+        x_2d = x.reshape(-1, x.size(-1)).float()
+        grad_input = grad_out_2d.matmul(weight.float()).view_as(x).to(dtype=x.dtype)
+        grad_weight = grad_out_2d.t().matmul(x_2d).to(dtype=ctx.weight_dtype)
+        grad_bias = None
+        if ctx.has_bias:
+            grad_bias = grad_out_2d.sum(dim=0).to(dtype=ctx.bias_dtype)
+        return grad_input, grad_weight, grad_bias
+
+
+class _CausalMachinePackedQkvFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: Tensor,
+        q_weight: Tensor,
+        k_weight: Tensor,
+        v_weight: Tensor,
+        q_bias: Tensor | None,
+        k_bias: Tensor | None,
+        v_bias: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        ext = load_causal_machine_block_ops_cuda()
+        x_cast = x.contiguous()
+        q_w_cast = q_weight.to(dtype=x.dtype).contiguous()
+        k_w_cast = k_weight.to(dtype=x.dtype).contiguous()
+        v_w_cast = v_weight.to(dtype=x.dtype).contiguous()
+        q_b_cast = None if q_bias is None else q_bias.to(device=x.device, dtype=x.dtype).contiguous()
+        k_b_cast = None if k_bias is None else k_bias.to(device=x.device, dtype=x.dtype).contiguous()
+        v_b_cast = None if v_bias is None else v_bias.to(device=x.device, dtype=x.dtype).contiguous()
+        q, k, v = ext.qkv_projection(x_cast, q_w_cast, q_b_cast, k_w_cast, k_b_cast, v_w_cast, v_b_cast)
+        ctx.save_for_backward(x_cast, q_w_cast, k_w_cast, v_w_cast)
+        ctx.q_weight_dtype = q_weight.dtype
+        ctx.k_weight_dtype = k_weight.dtype
+        ctx.v_weight_dtype = v_weight.dtype
+        ctx.q_bias_dtype = None if q_bias is None else q_bias.dtype
+        ctx.k_bias_dtype = None if k_bias is None else k_bias.dtype
+        ctx.v_bias_dtype = None if v_bias is None else v_bias.dtype
+        return q, k, v
+
+    @staticmethod
+    def backward(ctx, grad_q: Tensor, grad_k: Tensor, grad_v: Tensor):
+        x, q_weight, k_weight, v_weight = ctx.saved_tensors
+        x_2d = x.reshape(-1, x.size(-1)).float()
+        grad_q_2d = grad_q.reshape(-1, grad_q.size(-1)).float()
+        grad_k_2d = grad_k.reshape(-1, grad_k.size(-1)).float()
+        grad_v_2d = grad_v.reshape(-1, grad_v.size(-1)).float()
+        grad_input = (
+            grad_q_2d.matmul(q_weight.float())
+            + grad_k_2d.matmul(k_weight.float())
+            + grad_v_2d.matmul(v_weight.float())
+        ).view_as(x).to(dtype=x.dtype)
+        grad_q_weight = grad_q_2d.t().matmul(x_2d).to(dtype=ctx.q_weight_dtype)
+        grad_k_weight = grad_k_2d.t().matmul(x_2d).to(dtype=ctx.k_weight_dtype)
+        grad_v_weight = grad_v_2d.t().matmul(x_2d).to(dtype=ctx.v_weight_dtype)
+        grad_q_bias = None if ctx.q_bias_dtype is None else grad_q_2d.sum(dim=0).to(dtype=ctx.q_bias_dtype)
+        grad_k_bias = None if ctx.k_bias_dtype is None else grad_k_2d.sum(dim=0).to(dtype=ctx.k_bias_dtype)
+        grad_v_bias = None if ctx.v_bias_dtype is None else grad_v_2d.sum(dim=0).to(dtype=ctx.v_bias_dtype)
+        return grad_input, grad_q_weight, grad_k_weight, grad_v_weight, grad_q_bias, grad_k_bias, grad_v_bias
+
+
+def _branch_prep_cuda(x: Tensor, x0: Tensor, mix_param: Tensor, *, eps: float, norm_scale: float) -> tuple[Tensor, Tensor]:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not x.is_cuda or not x0.is_cuda:
+        return _reference_branch_prep(x, x0, mix_param, eps=eps, norm_scale=norm_scale)
+    return _CausalMachineBranchPrepFn.apply(x, x0, mix_param, float(eps), float(norm_scale))
+
+
+def _branch_update_cuda(x: Tensor, update: Tensor, scale_param: Tensor, *, residual_alpha: float) -> Tensor:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not x.is_cuda or not update.is_cuda:
+        return _reference_branch_update(x, update, scale_param, residual_alpha=residual_alpha)
+    return _CausalMachineBranchUpdateFn.apply(x, update, scale_param, float(residual_alpha))
+
+
+def _partial_rotary_pair_cuda(
+    q: Tensor,
+    k: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    scale: Tensor | None,
+    *,
+    rope_dims: int,
+    inverse_scale_k: bool,
+) -> tuple[Tensor, Tensor]:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not q.is_cuda or not k.is_cuda:
+        return _reference_partial_rotary_pair(
+            q,
+            k,
+            cos,
+            sin,
+            scale,
+            rope_dims=rope_dims,
+            inverse_scale_k=inverse_scale_k,
+        )
+    return _CausalMachinePartialRotaryPairFn.apply(
+        q,
+        k,
+        cos,
+        sin,
+        scale,
+        int(rope_dims),
+        bool(inverse_scale_k),
+    )
+
+
+def _relu_square_cuda(x: Tensor) -> Tensor:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not x.is_cuda:
+        y = torch.relu(x)
+        return y.square()
+    return _CausalMachineReluSquareFn.apply(x)
+
+
+def _cublaslt_linear_cuda(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not x.is_cuda or not bool(USE_CAUSAL_MACHINE_CUBLASLT_LINEAR):
+        return F.linear(x, weight if weight.dtype == x.dtype else weight.to(dtype=x.dtype), None if bias is None else bias.to(dtype=x.dtype))
+    return _CausalMachineLinearFn.apply(x, weight, bias)
+
+
+def _packed_qkv_projection_cuda(
+    x: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    v_weight: Tensor,
+    q_bias: Tensor | None = None,
+    k_bias: Tensor | None = None,
+    v_bias: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    ext = _block_ops_cuda_module_or_none()
+    if ext is None or not x.is_cuda or not bool(USE_CAUSAL_MACHINE_PACKED_QKV):
+        return (
+            F.linear(x, q_weight if q_weight.dtype == x.dtype else q_weight.to(dtype=x.dtype), None if q_bias is None else q_bias.to(dtype=x.dtype)),
+            F.linear(x, k_weight if k_weight.dtype == x.dtype else k_weight.to(dtype=x.dtype), None if k_bias is None else k_bias.to(dtype=x.dtype)),
+            F.linear(x, v_weight if v_weight.dtype == x.dtype else v_weight.to(dtype=x.dtype), None if v_bias is None else v_bias.to(dtype=x.dtype)),
+        )
+    return _CausalMachinePackedQkvFn.apply(x, q_weight, k_weight, v_weight, q_bias, k_bias, v_bias)
+
+
+def _prepare_branch_inputs(
+    x: Tensor,
+    norm_module: nn.Module,
+    *,
+    norm_scale: float,
+    norm_condition: Tensor | None = None,
+    x0: Tensor | None = None,
+    mix_param: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    if x0 is not None and mix_param is not None:
+        mix = _normalized_resid_mix(mix_param, dtype=x.dtype)
+        mixed = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
+    else:
+        mixed = x
+    if isinstance(norm_module, AdaptiveRMSNorm):
+        normed = norm_module(mixed, condition=norm_condition)
+        return mixed, normed * float(norm_scale)
+    eps = getattr(norm_module, "eps", None)
+    if eps is None:
+        eps = torch.finfo(x.dtype).eps
+    if x0 is None or mix_param is None:
+        identity_mix = torch.stack(
+            (
+                torch.ones((x.size(-1),), device=x.device, dtype=x.dtype),
+                torch.zeros((x.size(-1),), device=x.device, dtype=x.dtype),
+            )
+        )
+        return _branch_prep_cuda(
+            mixed,
+            mixed,
+            identity_mix,
+            eps=float(eps),
+            norm_scale=float(norm_scale),
+        )
+    return _branch_prep_cuda(
+        x,
+        x0,
+        mix_param,
+        eps=float(eps),
+        norm_scale=float(norm_scale),
+    )
 
 
 class Rotary(nn.Module):
@@ -12034,16 +12594,33 @@ class CausalSelfAttention(nn.Module):
 
     def _project_qkv(self, x: Tensor, q_gain_delta: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, _dim = x.shape
-        q_proj = self.c_q(x)
+        q_weight, q_bias = self.c_q.effective_weight_bias()
+        k_weight, k_bias = self.c_k.effective_weight_bias()
+        v_weight, v_bias = self.c_v.effective_weight_bias()
+        q_proj, k_proj, v_proj = _packed_qkv_projection_cuda(
+            x,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_bias,
+            k_bias,
+            v_bias,
+        )
         q = q_proj.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v_proj = self.c_v(x)
+        k = k_proj.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v_proj.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin, scale = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
-        k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
+        q, k = _partial_rotary_pair_cuda(
+            q,
+            k,
+            cos,
+            sin,
+            scale,
+            rope_dims=self.rope_dims,
+            inverse_scale_k=True,
+        )
         q_gain = _bounded_positive_control_tensor(
             self.q_gain,
             _Q_GAIN_MIN,
@@ -12076,18 +12653,38 @@ class CausalSelfAttention(nn.Module):
         if x.size(1) != 1:
             raise ValueError(f"_project_qkv_step expects seq_len=1, got {tuple(x.shape)}")
         bsz, _seqlen, dim = x.shape
-        q_proj = self.c_q(x)
+        del dim
+        q_weight, q_bias = self.c_q.effective_weight_bias()
+        k_weight, k_bias = self.c_k.effective_weight_bias()
+        v_weight, v_bias = self.c_v.effective_weight_bias()
+        q_proj, k_proj, v_proj = _packed_qkv_projection_cuda(
+            x,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_bias,
+            k_bias,
+            v_bias,
+        )
         q = q_proj.reshape(bsz, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v_proj = self.c_v(x)
+        k = k_proj.reshape(bsz, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v_proj.reshape(bsz, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin, scale = self.rotary(position + 1, x.device, q.dtype)
         cos = cos[..., position : position + 1, :]
         sin = sin[..., position : position + 1, :]
-        q = apply_partial_rotary_emb(q, cos, sin, self.rope_dims, scale=scale)
-        k = apply_partial_rotary_emb(k, cos, sin, self.rope_dims, scale=scale, inverse_scale=True)
+        if scale is not None:
+            scale = scale[..., position : position + 1, :]
+        q, k = _partial_rotary_pair_cuda(
+            q,
+            k,
+            cos,
+            sin,
+            scale,
+            rope_dims=self.rope_dims,
+            inverse_scale_k=True,
+        )
         q_gain = _bounded_positive_control_tensor(
             self.q_gain,
             _Q_GAIN_MIN,
@@ -12175,8 +12772,9 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        x = self.fc(x)
+        x = _relu_square_cuda(x)
+        return self.proj(x)
 
 
 class Block(nn.Module):
@@ -12236,22 +12834,34 @@ class Block(nn.Module):
         norm_condition: Tensor | None = None,
     ) -> Tensor:
         block_runtime_profile = _start_state_space_runtime_profile(x.device)
-        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
-        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
-        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
-        attn_normed = attn_normed * norm_scale
+        norm_scale = float(self.norm_scale_buffer.item())
+        x, attn_normed = _prepare_branch_inputs(
+            x,
+            self.attn_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+            x0=x0,
+            mix_param=self.resid_mix,
+        )
         attn_out = self.attn.forward_simple(attn_normed, q_gain_delta=q_gain_delta)
         _mark_state_space_runtime_profile(block_runtime_profile, "after_core")
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        x = _branch_update_cuda(
+            x,
+            attn_out,
+            self.attn_scale,
+            residual_alpha=self.residual_alpha,
         )
-        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
-        mlp_normed = mlp_normed * norm_scale
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        _, mlp_normed = _prepare_branch_inputs(
+            x,
+            self.mlp_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+        )
+        x = _branch_update_cuda(
+            x,
+            self.mlp(mlp_normed),
+            self.mlp_scale,
+            residual_alpha=self.residual_alpha,
         )
         _mark_state_space_runtime_profile(block_runtime_profile, "total_end")
         if block_runtime_profile is not None:
@@ -12274,26 +12884,38 @@ class Block(nn.Module):
             raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
         if cache.attention_cache is None:
             cache.attention_cache = AttentionStepCache()
-        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
-        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
-        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
-        attn_normed = attn_normed * norm_scale
+        norm_scale = float(self.norm_scale_buffer.item())
+        x, attn_normed = _prepare_branch_inputs(
+            x,
+            self.attn_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+            x0=x0,
+            mix_param=self.resid_mix,
+        )
         attn_out = self.attn.forward_step(
             attn_normed,
             cache=cache.attention_cache,
             position=position,
             q_gain_delta=q_gain_delta,
         )
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        x = _branch_update_cuda(
+            x,
+            attn_out,
+            self.attn_scale,
+            residual_alpha=self.residual_alpha,
         )
-        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
-        mlp_normed = mlp_normed * norm_scale
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        _, mlp_normed = _prepare_branch_inputs(
+            x,
+            self.mlp_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+        )
+        x = _branch_update_cuda(
+            x,
+            self.mlp(mlp_normed),
+            self.mlp_scale,
+            residual_alpha=self.residual_alpha,
         )
         return x
 
@@ -13590,23 +14212,35 @@ class StateSpaceBlock(nn.Module):
     ) -> Tensor:
         del q_gain_delta
         block_runtime_profile = _start_state_space_runtime_profile(x.device)
-        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
-        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
-        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
-        attn_normed = attn_normed * norm_scale
+        norm_scale = float(self.norm_scale_buffer.item())
+        x, attn_normed = _prepare_branch_inputs(
+            x,
+            self.attn_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+            x0=x0,
+            mix_param=self.resid_mix,
+        )
         attn_out = self.attn.forward_simple(attn_normed)
         self.last_aux = dict(self.attn.last_aux)
         _mark_state_space_runtime_profile(block_runtime_profile, "after_core")
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        x = _branch_update_cuda(
+            x,
+            attn_out,
+            self.attn_scale,
+            residual_alpha=self.residual_alpha,
         )
-        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
-        mlp_normed = mlp_normed * norm_scale
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        _, mlp_normed = _prepare_branch_inputs(
+            x,
+            self.mlp_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+        )
+        x = _branch_update_cuda(
+            x,
+            self.mlp(mlp_normed),
+            self.mlp_scale,
+            residual_alpha=self.residual_alpha,
         )
         self.last_aux["block_hidden"] = x
         _mark_state_space_runtime_profile(block_runtime_profile, "total_end")
@@ -13634,22 +14268,34 @@ class StateSpaceBlock(nn.Module):
             raise ValueError(f"forward_simple_step expects seq_len=1, got {tuple(x.shape)}")
         if cache.state_cache is None:
             cache.state_cache = CausalMachineCache()
-        mix = _normalized_resid_mix(self.resid_mix, dtype=x.dtype)
-        norm_scale = self.norm_scale_buffer.to(device=x.device, dtype=x.dtype)
-        x = _sanitize_residual_stream_tensor(mix[0][None, None, :] * x + mix[1][None, None, :] * x0)
-        attn_normed = self.attn_norm(x, condition=norm_condition) if isinstance(self.attn_norm, AdaptiveRMSNorm) else self.attn_norm(x)
-        attn_normed = attn_normed * norm_scale
+        norm_scale = float(self.norm_scale_buffer.item())
+        x, attn_normed = _prepare_branch_inputs(
+            x,
+            self.attn_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+            x0=x0,
+            mix_param=self.resid_mix,
+        )
         attn_out = self.attn.forward_step(attn_normed, cache.state_cache)
         self.last_aux = {}
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.attn_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * attn_out
+        x = _branch_update_cuda(
+            x,
+            attn_out,
+            self.attn_scale,
+            residual_alpha=self.residual_alpha,
         )
-        mlp_normed = self.mlp_norm(x, condition=norm_condition) if isinstance(self.mlp_norm, AdaptiveRMSNorm) else self.mlp_norm(x)
-        mlp_normed = mlp_normed * norm_scale
-        x = _sanitize_residual_stream_tensor(
-            x * self.residual_alpha
-            + _bounded_signed_control_tensor(self.mlp_scale, _CONTROL_SCALE_CLAMP_ABS, dtype=x.dtype)[None, None, :] * self.mlp(mlp_normed)
+        _, mlp_normed = _prepare_branch_inputs(
+            x,
+            self.mlp_norm,
+            norm_scale=norm_scale,
+            norm_condition=norm_condition,
+        )
+        x = _branch_update_cuda(
+            x,
+            self.mlp(mlp_normed),
+            self.mlp_scale,
+            residual_alpha=self.residual_alpha,
         )
         return x
 
@@ -15917,7 +16563,8 @@ def main() -> None:
     global BOS_ID, zeropower_via_newtonschulz5
 
     process_started_at = time.perf_counter()
-    code = Path(__file__).read_text(encoding="utf-8")
+    script_path = Path(__file__)
+    script_size_bytes = int(script_path.stat().st_size)
     args = Hyperparameters()
     validate_causal_machine_objective_config(args)
     configure_runtime_export(args)
@@ -15993,7 +16640,9 @@ def main() -> None:
     def end_to_end_wallclock_ms() -> float:
         return 1000.0 * (time.perf_counter() - process_started_at)
 
-    log0(code, console=False)
+    log_source_to_file = _env_enabled("LOG_SOURCE_TO_FILE", default=not _competition_mode_enabled())
+    if log_source_to_file:
+        log0(script_path.read_text(encoding="utf-8"), console=False)
 
     # -----------------------------
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -16038,11 +16687,17 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    total_train_tokens = count_total_train_tokens(args.train_files)
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     eval_seq_len = get_eval_seq_len(args)
-    val_tokens_eval = val_tokens if eval_seq_len == args.train_seq_len else load_validation_tokens(args.val_files, eval_seq_len)
-    log0(f"tokenizer:{tokenizer_kind} dataset:{dataset_name} train_tokens:{total_train_tokens}")
+    count_total_train_tokens_enabled = _env_enabled("COUNT_TOTAL_TRAIN_TOKENS", default=not _competition_mode_enabled())
+    total_train_tokens = count_total_train_tokens(args.train_files) if count_total_train_tokens_enabled else -1
+    needs_validation_tokens = bool((not _competition_mode_enabled() and args.val_loss_every > 0) or args.run_final_quant_eval)
+    val_tokens = torch.empty((0,), dtype=torch.int32)
+    val_tokens_eval = val_tokens
+    if needs_validation_tokens:
+        val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+        val_tokens_eval = val_tokens if eval_seq_len == args.train_seq_len else load_validation_tokens(args.val_files, eval_seq_len)
+    train_tokens_text = str(total_train_tokens) if total_train_tokens >= 0 else "skipped"
+    log0(f"tokenizer:{tokenizer_kind} dataset:{dataset_name} train_tokens:{train_tokens_text}")
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
@@ -16156,9 +16811,12 @@ def main() -> None:
         )
     )
     if should_prime_block_backend_sample:
+        prime_batch_size = int(local_train_batch_size)
+        if _competition_mode_enabled() and not PROFILE_STATE_SPACE_BLOCKS:
+            prime_batch_size = min(prime_batch_size, max(int(os.environ.get("BLOCK_BACKEND_PRIME_BATCH_SIZE", "4")), 1))
         _prime_block_runtime_profile_sample(
             base_model,
-            batch_size=local_train_batch_size,
+            batch_size=prime_batch_size,
             seq_len=int(args.train_seq_len),
             vocab_size=int(args.vocab_size),
             device=device,
@@ -16188,6 +16846,7 @@ def main() -> None:
             train_seq_len=int(args.train_seq_len),
             eval_seq_len=int(args.eval_seq_len),
             device=device,
+            include_eval_seq=bool((not _competition_mode_enabled() and args.val_loss_every > 0) or args.run_final_quant_eval),
         )
     if enable_model_compile:
         pass
@@ -16213,7 +16872,9 @@ def main() -> None:
     use_muon_for_state_space_matrices = bool(
         args.use_muon and _env_enabled("USE_MUON_FOR_STATE_SPACE_MATRICES", default=_competition_mode_enabled())
     )
-    ddp_static_graph = bool(distributed and allow_ddp_full_step_cuda_graphs and cuda_graph_model_supported)
+    ddp_static_graph = bool(
+        distributed and _env_enabled("USE_DDP_STATIC_GRAPH", default=_competition_mode_enabled())
+    )
     graph_execution_stream: torch.cuda.Stream | None = (
         torch.cuda.Stream(device=device)
         if distributed and allow_ddp_full_step_cuda_graphs and cuda_graph_model_supported and args.use_cuda_graphs
@@ -16479,7 +17140,10 @@ def main() -> None:
                 f" does_not_change_structured_scan_transition_rank:{int(args.causal_machine_transition_rank)}"
                 " set CAUSAL_MACHINE_TRANSITION_RANK explicitly to benchmark a different scan rank",
             )
-        if _competition_mode_enabled() and (not bool(args.enable_torch_compile) or not bool(args.use_cuda_graphs)):
+        if _competition_mode_enabled() and (
+            not bool(args.enable_torch_compile)
+            or (cuda_graph_model_supported and not bool(args.use_cuda_graphs))
+        ):
             log0(
                 "causal_machine_notice:"
                 f" compile:{int(bool(args.enable_torch_compile))}"
@@ -16577,6 +17241,10 @@ def main() -> None:
             group[name] = float(value)
 
     competition_mode = _competition_mode_enabled()
+    finite_param_check_interval = max(
+        int(os.environ.get("FINITE_PARAM_CHECK_INTERVAL", "50" if competition_mode else "1")),
+        0,
+    )
     allow_ddp_partial_cuda_graphs = _env_enabled("ALLOW_DDP_PARTIAL_CUDA_GRAPHS", default=False)
     if competition_mode and args.use_causal_machine_backbone and args.use_muon and state_space_matrix_params and not use_muon_for_state_space_matrices:
         raise RuntimeError(
@@ -16667,7 +17335,8 @@ def main() -> None:
         f"cuda_graph_mode:{cuda_graph_capture_mode} "
         f"cuda_graph_full_step:{int(cuda_graph_capture_mode == 'full_step')} "
         f"cuda_graph_partial_step:{int(cuda_graph_capture_mode == 'partial_step')} "
-        f"cuda_graph_reason:{cuda_graph_disable_reason}"
+        f"cuda_graph_reason:{cuda_graph_disable_reason} "
+        f"finite_param_check_interval:{finite_param_check_interval}"
     )
     train_loader.configure_runtime_prefetch(cuda_graph_capture_mode=cuda_graph_capture_mode)
     if cuda_graph_capture_mode == "full_step" and train_loader.prefetch_depth == 0:
@@ -16701,7 +17370,8 @@ def main() -> None:
     last_cuda_allocator_trim_step = -1
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
-    finalization_reserve_ms = max(float(args.wallclock_finalization_reserve_ms), 0.0)
+    # Competition evaluation has a separate 10-minute budget from training.
+    finalization_reserve_ms = 0.0 if competition_mode else max(float(args.wallclock_finalization_reserve_ms), 0.0)
     validation_reserve_floor_ms = (
         0.0 if competition_mode else max(float(args.wallclock_validation_reserve_ms), 0.0)
     )
@@ -17129,9 +17799,14 @@ def main() -> None:
         optimizer_step_started_at = time.perf_counter()
         for opt in optimizers:
             opt.step()
-        first_bad_param = _first_nonfinite_param_name(base_model)
-        if first_bad_param is not None:
-            raise RuntimeError(f"non-finite parameter detected after optimizer step {step}: {first_bad_param}")
+        should_check_finite_params = bool(
+            finite_param_check_interval > 0
+            and (step < 10 or step % finite_param_check_interval == 0)
+        )
+        if should_check_finite_params:
+            first_bad_param = _first_nonfinite_param_name(base_model)
+            if first_bad_param is not None:
+                raise RuntimeError(f"non-finite parameter detected after optimizer step {step}: {first_bad_param}")
         optimizer_step_time_ms_total += (time.perf_counter() - optimizer_step_started_at) * 1000.0
         if PROFILE_MUON_STEP:
             for opt in muon_optimizers:
@@ -17474,59 +18149,81 @@ def main() -> None:
     if master_process and args.save_raw_debug_model:
         torch.save(base_model.state_dict(), raw_model_path)
         model_bytes = os.path.getsize(raw_model_path)
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Raw debug size: {model_bytes + code_bytes} bytes")
+        log0(f"Raw debug size: {model_bytes + script_size_bytes} bytes")
 
-    export_state_dict = canonicalize_state_dict_for_export(base_model.state_dict())
-    if args.export_quant_bits < 8:
-        quant_obj, mixed_stats, mixed_precision_info = quantize_state_dict_mixed_precision(
-            export_state_dict, bits=args.export_quant_bits
-        )
-        quant_stats = {
-            "param_count": mixed_stats["param_count"],
-            "num_tensors": mixed_stats["num_tensors"],
-            "num_float_tensors": mixed_stats["num_float_tensors"],
-            "num_nonfloat_tensors": mixed_stats["num_nonfloat_tensors"],
-            "baseline_tensor_bytes": mixed_stats["baseline_tensor_bytes"],
-            "int8_payload_bytes": mixed_stats["payload_bytes"],
-            "auto_keep_count": mixed_stats["high_precision_tensor_count"],
-            "auto_keep_extra_bytes": mixed_stats["high_precision_extra_bytes"],
-            "auto_keep_row_group_count": 0,
-            "auto_keep_row_group_extra_bytes": 0,
-            "block_pruned_tensor_count": mixed_stats["block_pruned_tensor_count"],
-            "block_prune_estimated_bytes_saved": mixed_stats["block_prune_estimated_bytes_saved"],
-        }
-        auto_keep_info = {**mixed_precision_info, "row_groups": {}}
-    else:
-        quant_obj, quant_stats, auto_keep_info = quantize_state_dict_int8(export_state_dict)
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob, used_codec = compress_blob(quant_raw, args.export_codec, args.export_zstd_level)
-    quant_raw_bytes = len(quant_raw)
+    should_reload_quant_artifact = bool(args.verify_export_roundtrip or args.run_final_quant_eval)
+    requested_export_codec = str(args.export_codec).strip().lower()
+    used_codec = "zlib"
+    quant_raw_bytes = 0
     submission_over_limit = False
     quant_file_bytes = None
     total_submission_bytes = None
-    if master_process:
-        with open(quant_model_path, "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize(quant_model_path)
-        code_bytes = len(code.encode("utf-8"))
-        total_submission_bytes = quant_file_bytes + code_bytes
-        log0(f"Total submission size: {total_submission_bytes} bytes")
-        submission_over_limit = total_submission_bytes > args.submission_size_limit_bytes
+    if master_process or should_reload_quant_artifact:
+        export_state_dict = canonicalize_state_dict_for_export(base_model.state_dict())
+        if args.export_quant_bits < 8:
+            quant_obj, mixed_stats, mixed_precision_info = quantize_state_dict_mixed_precision(
+                export_state_dict, bits=args.export_quant_bits
+            )
+            quant_stats = {
+                "param_count": mixed_stats["param_count"],
+                "num_tensors": mixed_stats["num_tensors"],
+                "num_float_tensors": mixed_stats["num_float_tensors"],
+                "num_nonfloat_tensors": mixed_stats["num_nonfloat_tensors"],
+                "baseline_tensor_bytes": mixed_stats["baseline_tensor_bytes"],
+                "int8_payload_bytes": mixed_stats["payload_bytes"],
+                "auto_keep_count": mixed_stats["high_precision_tensor_count"],
+                "auto_keep_extra_bytes": mixed_stats["high_precision_extra_bytes"],
+                "auto_keep_row_group_count": 0,
+                "auto_keep_row_group_extra_bytes": 0,
+                "block_pruned_tensor_count": mixed_stats["block_pruned_tensor_count"],
+                "block_prune_estimated_bytes_saved": mixed_stats["block_prune_estimated_bytes_saved"],
+            }
+            auto_keep_info = {**mixed_precision_info, "row_groups": {}}
+        else:
+            quant_obj, quant_stats, auto_keep_info = quantize_state_dict_int8(export_state_dict)
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob, used_codec = compress_blob(quant_raw, args.export_codec, args.export_zstd_level)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            quant_file_bytes = len(quant_blob)
+            total_submission_bytes = quant_file_bytes + script_size_bytes
+            if (
+                requested_export_codec in {"", "auto"}
+                and total_submission_bytes > args.submission_size_limit_bytes
+                and HAS_ZSTD
+            ):
+                quant_blob, used_codec = compress_blob(quant_raw, "zstd", args.export_zstd_level)
+                quant_file_bytes = len(quant_blob)
+                total_submission_bytes = quant_file_bytes + script_size_bytes
+                log0(
+                    "export_codec_notice:"
+                    f" auto_fallback_to:{used_codec}"
+                    f" submission_bytes:{total_submission_bytes}",
+                    console=False,
+                )
+            with open(quant_model_path, "wb") as f:
+                f.write(quant_blob)
+            log0(f"Total submission size: {total_submission_bytes} bytes")
+            submission_over_limit = total_submission_bytes > args.submission_size_limit_bytes
 
+    if distributed:
+        codec_payload = [str(used_codec)]
+        dist.broadcast_object_list(codec_payload, src=0)
+        used_codec = str(codec_payload[0])
     if distributed:
         over_limit_tensor = torch.tensor(int(submission_over_limit), device=device)
         dist.all_reduce(over_limit_tensor, op=dist.ReduceOp.MAX)
         submission_over_limit = bool(over_limit_tensor.item())
     if submission_over_limit:
+        if distributed:
+            dist.destroy_process_group()
         raise RuntimeError(
             "Final int8+zlib artifact exceeds SUBMISSION_SIZE_LIMIT_BYTES; "
             "adjust model/code size or quantization settings."
         )
 
-    should_reload_quant_artifact = bool(args.verify_export_roundtrip or args.run_final_quant_eval)
     if distributed:
         dist.barrier()
     if should_reload_quant_artifact:
@@ -17572,14 +18269,13 @@ def main() -> None:
             )
         torch.cuda.synchronize()
     final_wallclock_ms = end_to_end_wallclock_ms()
-    if max_wallclock_ms is not None and final_wallclock_ms > max_wallclock_ms:
+    if distributed:
+        dist.destroy_process_group()
+    if max_wallclock_ms is not None and not competition_mode and final_wallclock_ms > max_wallclock_ms:
         raise RuntimeError(
             f"End-to-end wallclock budget exceeded: final_wallclock_ms={final_wallclock_ms:.0f} "
             f"> max_wallclock_ms={max_wallclock_ms:.0f}. Reduce startup, training, or finalization work."
         )
-
-    if distributed:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
